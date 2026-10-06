@@ -7,6 +7,8 @@ dependencies = ["akshare", "openai", "python-dotenv"]
 
 [project.scripts]
 corpcom = "corpcom.cli:main"
+corpcom-sandbox = "corpcom.sandbox:main"
+corpcom-ptc = "corpcom.ptc:main"
 
 [build-system]
 requires = ["hatchling"]

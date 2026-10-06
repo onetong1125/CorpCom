@@ -1,0 +1,9 @@
+FROM python:3.11-slim
+
+RUN pip install --no-cache-dir akshare==1.19.1
+
+COPY src/corpcom/__init__.py /opt/corpcom/corpcom/__init__.py
+COPY src/corpcom/market.py /opt/corpcom/corpcom/market.py
+
+ENV PYTHONPATH=/opt/corpcom PYTHONDONTWRITEBYTECODE=1
+WORKDIR /workspace

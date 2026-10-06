@@ -27,3 +27,20 @@ NO_PROXY=web.ifzq.gtimg.cn,proxy.finance.qq.com \
 no_proxy=web.ifzq.gtimg.cn,proxy.finance.qq.com \
 uv run corpcom 600519 000858 2025-01-01 2025-03-31
 ```
+
+## Docker PTC 验证
+
+先构建只包含行情工具的镜像，再运行固定脚本确认容器内的数据链路：
+
+```bash
+docker build -f Dockerfile.sandbox -t corpcom-sandbox:local .
+uv run corpcom-sandbox examples/fixed_compare.py
+```
+
+固定脚本通过后，运行模型生成代码的 PTC 链路：
+
+```bash
+uv run corpcom-ptc 600519 000858 2025-01-01 2025-03-31
+```
+
+模型生成的 Python 保存在 `runs/<运行编号>/analysis.py`，在 Docker 内调用同一个 `get_price_history`，写出 `result.json`。宿主程序只将结果摘要或执行错误返回模型，不回传完整日线。每次执行只挂载对应的 `runs/<运行编号>` 目录；`.env` 不进入镜像或容器。运行目录被 Git 忽略，可在本机检查生成的代码和结果。
