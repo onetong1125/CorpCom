@@ -1,6 +1,8 @@
 # CorpCom
 
-聚焦沪深 A 股两家公司股价对比的 Python Agent。当前第一阶段只运行普通工具调用：模型向 `get_price_history` 请求真实日线，工具返回数据，模型生成对比结论。PTC、沙箱、前后端尚未接入。
+围绕投资假设持续积累研究的 Python Agent 项目：一个研究目标对应一个 Workspace，保存会话、偏好、证据和报告，并支持后续更新。
+
+当前已跑通沪深 A 股股价对比的普通工具调用与 Docker PTC。Workspace、多会话、经营研究报告、新闻更新、定时任务及前后端尚未接入。首个已确认案例与下一批设计见 [持续研究设计](docs/research-workspace.md)；经营数据接口的实测与复跑方式见 [验证记录](docs/financial-data-validation.md)。
 
 ## 首阶段验收
 
