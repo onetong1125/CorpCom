@@ -1,0 +1,13 @@
+[project]
+name = "corpcom"
+version = "0.1.0"
+description = "A-share company comparison agent"
+requires-python = ">=3.11"
+dependencies = ["akshare", "openai", "python-dotenv"]
+
+[project.scripts]
+corpcom = "corpcom.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
