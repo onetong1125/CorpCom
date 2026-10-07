@@ -76,14 +76,15 @@ def main() -> None:
         with WorkspaceStore(args.data_dir) as store:
             match args.command:
                 case "create":
-                    result = store.create_workspace(
+                    workspace = store.create_workspace(
                         args.title, args.goal, args.scope, args.observation_period,
                         args.hypothesis, args.preferences,
                     )
+                    result = store.get_workspace_detail(workspace.id)
                 case "list":
                     result = store.list_workspaces()
                 case "show":
-                    result = store.get_workspace(args.workspace_id)
+                    result = store.get_workspace_detail(args.workspace_id)
                 case "set-preferences":
                     result = store.set_preferences(args.workspace_id, args.preferences)
                 case "thread-create":
@@ -100,8 +101,12 @@ def main() -> None:
         # Report input/file errors on stderr and exit nonzero, without a success payload.
         parser.exit(1, f"error: {exc}\n")
 
-    # Successful results go to stdout for both terminal reading and scripted parsing.
-    print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+    # Convert typed records only at the output boundary, including datetime and Path fields.
+    payload = (
+        [item.model_dump(mode="json") for item in result]
+        if isinstance(result, list) else result.model_dump(mode="json")
+    )
+    print(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":

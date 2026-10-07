@@ -93,3 +93,21 @@ uv run python -m unittest discover -s tests -v
 - 已登记文件丢失时明确失败。
 
 当前只保存初始假设，尚无假设修订版本、Agent 上下文读取、自动报告、Run 管理或调度。下一批接入 Agent 时，再验证它实际利用已有研究继续分析。
+
+## 7. 代码中的数据对象
+
+`src/corpcom/workspace_models.py` 定义 Pydantic 数据对象；`WorkspaceStore` 负责数据库事务、文件保存与归属检查，CLI 负责将返回对象转换为 JSON。
+
+| 对象 | 用途 |
+| --- | --- |
+| `Workspace` | 研究本体：目标、范围、周期、初始假设、偏好与时间 |
+| `Thread` / `Message` | 会话元信息与单条消息，通过 ID 关联 |
+| `Artifact` | 文件索引，保存相对数据目录的路径 |
+| `WorkspaceSummary` | `list` 使用的简短字段集合 |
+| `WorkspaceDetail` | 研究本体加会话和文件索引，供 `show` 使用 |
+| `ThreadDetail` | 会话加按写入顺序排列的消息 |
+| `ArtifactFile` | 文件索引加实际绝对路径，供打开文件使用 |
+
+Python 调用 `store.get_workspace(workspace_id)` 得到 `Workspace`，可以通过 `workspace.goal`、`workspace.preferences` 访问字段；需要关联索引时调用 `store.get_workspace_detail(workspace_id)`。时间字段是 `datetime`，实际文件路径是 `Path`。修改返回对象的属性不会自动写回数据库，持久化仍由存储方法完成。
+
+存储层将数据库行转换为数据对象，并按需组合详情，内部传递已有实例；命令行输出时使用 `model_dump(mode="json")` 转换。SQLite 表结构、已有数据、CLI 命令及 JSON 字段保持兼容，时间仍按 UTC 毫秒格式输出。本次重构验证了修改前创建的数据库和文件可继续读取，列表、研究详情、会话历史和文件信息的 JSON 内容与修改前一致。

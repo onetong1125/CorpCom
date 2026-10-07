@@ -3,7 +3,7 @@ name = "corpcom"
 version = "0.1.0"
 description = "A-share company comparison agent"
 requires-python = ">=3.11"
-dependencies = ["akshare", "openai", "python-dotenv"]
+dependencies = ["akshare", "openai", "python-dotenv", "pydantic>=2,<3"]
 
 [project.scripts]
 corpcom = "corpcom.cli:main"

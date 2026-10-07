@@ -6,6 +6,13 @@ import shutil
 import sqlite3
 from uuid import uuid4
 
+from pydantic import JsonValue
+
+from corpcom.workspace_models import (
+    Artifact, ArtifactFile, Message, Thread, ThreadDetail,
+    Workspace, WorkspaceDetail, WorkspaceSummary,
+)
+
 
 # Threads and files belong to a workspace; messages belong through their thread.
 # Preferences are JSON text. Artifact rows index files; their contents stay on disk.
@@ -75,8 +82,8 @@ class WorkspaceStore:
     def __exit__(self, exc_type, exc_value, traceback):
         self.db.close()
 
-    def _workspace(self, workspace_id: str) -> dict:
-        """Read workspace fields and decode stored preferences into a dictionary."""
+    def get_workspace(self, workspace_id: str) -> Workspace:
+        """Decode a stored row into typed metadata without loading related records."""
         row = self.db.execute(
             "SELECT * FROM workspaces WHERE id = ?", (workspace_id,)
         ).fetchone()
@@ -84,9 +91,9 @@ class WorkspaceStore:
             raise ValueError(f"workspace not found: {workspace_id}")
         workspace = dict(row)
         workspace["preferences"] = json.loads(workspace["preferences"])
-        return workspace
+        return Workspace.model_validate(workspace)
 
-    def _thread(self, workspace_id: str, thread_id: str) -> dict:
+    def _thread(self, workspace_id: str, thread_id: str) -> Thread:
         # Check ownership before reading or adding messages, not just the thread ID.
         row = self.db.execute(
             "SELECT * FROM threads WHERE workspace_id = ? AND id = ?",
@@ -94,7 +101,7 @@ class WorkspaceStore:
         ).fetchone()
         if row is None:
             raise ValueError(f"thread not found in workspace: {thread_id}")
-        return dict(row)
+        return Thread.model_validate(dict(row))
 
     def _touch(self, workspace_id: str) -> None:
         """Update the workspace timestamp inside the caller's transaction without committing."""
@@ -105,8 +112,8 @@ class WorkspaceStore:
 
     def create_workspace(
         self, title: str, goal: str, scope: str, observation_period: str,
-        initial_hypothesis: str, preferences: dict,
-    ) -> dict:
+        initial_hypothesis: str, preferences: dict[str, JsonValue],
+    ) -> Workspace:
         """Create research with free-text scope and period, without fixed companies or metrics."""
         _require_text(title=title, goal=goal, initial_hypothesis=initial_hypothesis)
         workspace_id = uuid4().hex
@@ -121,37 +128,37 @@ class WorkspaceStore:
             )
         return self.get_workspace(workspace_id)
 
-    def list_workspaces(self) -> list[dict]:
+    def list_workspaces(self) -> list[WorkspaceSummary]:
         rows = self.db.execute(
             "SELECT id, title, goal, created_at, updated_at FROM workspaces ORDER BY rowid"
         )
-        return [dict(row) for row in rows]
+        return [WorkspaceSummary.model_validate(dict(row)) for row in rows]
 
-    def get_workspace(self, workspace_id: str) -> dict:
+    def get_workspace_detail(self, workspace_id: str) -> WorkspaceDetail:
         """Return workspace details and indexes; messages and file contents are read separately."""
-        workspace = self._workspace(workspace_id)
-        workspace["threads"] = [dict(row) for row in self.db.execute(
+        workspace = self.get_workspace(workspace_id)
+        threads = [Thread.model_validate(dict(row)) for row in self.db.execute(
             "SELECT * FROM threads WHERE workspace_id = ? ORDER BY rowid", (workspace_id,)
         )]
-        workspace["artifacts"] = [dict(row) for row in self.db.execute(
+        artifacts = [Artifact.model_validate(dict(row)) for row in self.db.execute(
             "SELECT * FROM artifacts WHERE workspace_id = ? ORDER BY rowid", (workspace_id,)
         )]
-        return workspace
+        return WorkspaceDetail(**workspace.model_dump(), threads=threads, artifacts=artifacts)
 
-    def set_preferences(self, workspace_id: str, preferences: dict) -> dict:
+    def set_preferences(self, workspace_id: str, preferences: dict[str, JsonValue]) -> Workspace:
         """Replace preferences with explicit user input; do not merge keys. An empty object clears them."""
-        self._workspace(workspace_id)
+        self.get_workspace(workspace_id)
         with self.db:
             self.db.execute(
                 "UPDATE workspaces SET preferences = ? WHERE id = ?",
                 (json.dumps(preferences, ensure_ascii=False, allow_nan=False), workspace_id),
             )
             self._touch(workspace_id)
-        return self._workspace(workspace_id)
+        return self.get_workspace(workspace_id)
 
-    def create_thread(self, workspace_id: str, title: str) -> dict:
+    def create_thread(self, workspace_id: str, title: str) -> Thread:
         """Create an empty conversation sharing workspace details without copying old messages."""
-        self._workspace(workspace_id)
+        self.get_workspace(workspace_id)
         _require_text(title=title)
         thread_id = uuid4().hex
         with self.db:
@@ -162,16 +169,16 @@ class WorkspaceStore:
             self._touch(workspace_id)
         return self._thread(workspace_id, thread_id)
 
-    def get_thread(self, workspace_id: str, thread_id: str) -> dict:
+    def get_thread(self, workspace_id: str, thread_id: str) -> ThreadDetail:
         """Return a conversation with history messages."""
         thread = self._thread(workspace_id, thread_id)
         # Message IDs preserve insertion order even when timestamps share a millisecond.
-        thread["messages"] = [dict(row) for row in self.db.execute(
+        messages = [Message.model_validate(dict(row)) for row in self.db.execute(
             "SELECT * FROM messages WHERE thread_id = ? ORDER BY id", (thread_id,)
         )]
-        return thread
+        return ThreadDetail(**thread.model_dump(), messages=messages)
 
-    def add_message(self, workspace_id: str, thread_id: str, role: str, content: str) -> dict:
+    def add_message(self, workspace_id: str, thread_id: str, role: str, content: str) -> Message:
         """Save supplied message text without calling a model or generating a reply."""
         self._thread(workspace_id, thread_id)
         _require_text(content=content)
@@ -181,13 +188,13 @@ class WorkspaceStore:
                 (thread_id, role, content),
             )
             self._touch(workspace_id)
-        return dict(self.db.execute(
+        return Message.model_validate(dict(self.db.execute(
             "SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)
-        ).fetchone())
+        ).fetchone()))
 
-    def import_file(self, workspace_id: str, source: Path, kind: str) -> dict:
+    def import_file(self, workspace_id: str, source: Path, kind: str) -> ArtifactFile:
         """Copy and index a file; separate imports preserve copies with the same name."""
-        self._workspace(workspace_id)
+        self.get_workspace(workspace_id)
         _require_text(kind=kind)
         source = source.resolve(strict=True)
         if not source.is_file():
@@ -215,7 +222,7 @@ class WorkspaceStore:
             raise
         return self.get_file(workspace_id, artifact_id)
 
-    def get_file(self, workspace_id: str, artifact_id: str) -> dict:
+    def get_file(self, workspace_id: str, artifact_id: str) -> ArtifactFile:
         """Check ownership and return file metadata and an absolute path, without reading contents."""
         row = self.db.execute(
             "SELECT * FROM artifacts WHERE workspace_id = ? AND id = ?",
@@ -228,5 +235,4 @@ class WorkspaceStore:
         # An index row does not guarantee the file still exists after manual deletion.
         if not path.is_file():
             raise FileNotFoundError(f"stored file is missing: {path}")
-        artifact["path"] = str(path)
-        return artifact
+        return ArtifactFile(**artifact, path=path)
