@@ -2,7 +2,11 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
+
+from dotenv import load_dotenv
+from openai import OpenAI
 
 from corpcom.workspace import WorkspaceStore
 
@@ -59,6 +63,11 @@ def main() -> None:
     message.add_argument("--role", choices=("user", "assistant"), default="user")
     message.add_argument("--content", required=True)
 
+    ask = commands.add_parser("ask", help="ask the model in a saved conversation")
+    ask.add_argument("workspace_id")
+    ask.add_argument("thread_id")
+    ask.add_argument("--question", required=True)
+
     # Imports create independent copies; file-show returns a path for opening in an editor.
     file_add = commands.add_parser("file-add", help="copy a local file into a workspace")
     file_add.add_argument("workspace_id")
@@ -93,6 +102,15 @@ def main() -> None:
                     result = store.get_thread(args.workspace_id, args.thread_id)
                 case "message-add":
                     result = store.add_message(args.workspace_id, args.thread_id, args.role, args.content)
+                case "ask":
+                    from corpcom.workspace_agent import ask_workspace
+
+                    load_dotenv()
+                    ask_workspace(
+                        store, OpenAI(), os.environ["CORPCOM_MODEL"],
+                        args.workspace_id, args.thread_id, args.question,
+                    )
+                    result = store.get_thread(args.workspace_id, args.thread_id).messages[-1]
                 case "file-add":
                     result = store.import_file(args.workspace_id, args.source, args.kind)
                 case "file-show":

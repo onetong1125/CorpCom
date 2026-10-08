@@ -2,7 +2,7 @@
 
 围绕投资假设持续积累研究的 Python Agent 项目：一个研究目标对应一个 Workspace，保存会话、偏好、证据和报告，并支持后续更新。
 
-当前已跑通沪深 A 股股价对比的普通工具调用与 Docker PTC，并实现 Workspace、多会话消息和文件的本地持久化。Agent 尚未接入 Workspace；经营研究报告、新闻更新、定时任务及前后端尚未实现。首个已确认案例与设计见 [持续研究设计](docs/research-workspace.md)；经营数据接口的实测与复跑方式见 [验证记录](docs/financial-data-validation.md)。
+当前已跑通沪深 A 股股价对比的普通工具调用与 Docker PTC，并实现 Workspace、多会话消息、文件的本地持久化及基于 Workspace 的模型对话。经营研究报告、新闻更新、定时任务及前后端尚未实现。首个已确认案例与设计见 [持续研究设计](docs/research-workspace.md)；经营数据接口的实测与复跑方式见 [验证记录](docs/financial-data-validation.md)。
 
 ## Workspace 本地验收
 
@@ -18,7 +18,17 @@ uv run corpcom-workspace create \
   --preferences '{"关注指标":["营收","归母净利润","经营现金流"],"报告语言":"中文"}'
 ```
 
-命令返回 JSON。复制其中的 `id`，按 [Workspace 操作与验收](docs/workspace-local.md) 继续创建会话、保存消息与文件、退出后恢复。本批是存储与读取，不调用模型；不需要模型密钥、Docker 或网络。研究范围是自由文本，不限定两家公司。
+命令返回 JSON。复制其中的 `id`，按 [Workspace 操作与验收](docs/workspace-local.md) 继续创建会话、保存消息与文件、退出后恢复。上述存储命令不调用模型，不需要模型密钥、Docker 或网络。研究范围是自由文本，不限定两家公司。
+
+创建会话后，可在同一 Workspace 中向模型提问：
+
+```bash
+uv run corpcom-workspace thread-create "$workspace_id" --title '继续研究'
+thread_id="替换为会话创建结果中的 id"
+uv run corpcom-workspace ask "$workspace_id" "$thread_id" --question '继续上次的研究，先说明已知证据和待核对的问题。'
+```
+
+`ask` 使用 `.env` 中已配置的模型，返回并保存助手消息；旧会话和文件按需由模型通过只读工具读取。详细行为见 [Workspace 操作与验收](docs/workspace-local.md#8-模型接入与跨会话续接)。
 
 默认数据保存于运行命令时当前目录下的 `data/`（已被 Git 忽略）。在项目根目录运行即可复用同一份数据；从其他位置运行时，用 `--data-dir /绝对路径` 指向已有数据目录。
 
