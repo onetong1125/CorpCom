@@ -63,7 +63,7 @@ class Artifact(BaseModel):
 
 
 class WorkspaceSummary(BaseModel):
-    """The fields shown by the workspace list command."""
+    """The fields returned by the workspace listing."""
 
     id: str
     title: str
@@ -72,7 +72,7 @@ class WorkspaceSummary(BaseModel):
     updated_at: Timestamp
 
 
-# Detail views extend records to preserve the existing flat CLI JSON structure.
+# Detail views extend records to keep metadata and related indexes in one JSON object.
 class WorkspaceDetail(Workspace):
     """Workspace metadata plus indexes, without message history or file contents."""
 

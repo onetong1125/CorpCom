@@ -2,35 +2,28 @@
 
 围绕投资假设持续积累研究的 Python Agent 项目：一个研究目标对应一个 Workspace，保存会话、偏好、证据和报告，并支持后续更新。
 
-当前已跑通沪深 A 股股价对比的普通工具调用与 Docker PTC，并实现 Workspace、多会话消息、文件的本地持久化及基于 Workspace 的模型对话。经营研究报告、新闻更新、定时任务及前后端尚未实现。首个已确认案例与设计见 [持续研究设计](docs/research-workspace.md)；经营数据接口的实测与复跑方式见 [验证记录](docs/financial-data-validation.md)。
+当前已跑通沪深 A 股股价对比的普通工具调用与 Docker PTC，并实现 Workspace、多会话消息、文件的本地持久化及基于 Workspace 的模型对话。后端 HTTP 接口已支持研究管理、对话和文件上传下载；经营研究报告、新闻更新、定时任务及前端尚未实现。首个已确认案例与设计见 [持续研究设计](docs/research-workspace.md)；经营数据接口的实测与复跑方式见 [验证记录](docs/financial-data-validation.md)。
 
-## Workspace 本地验收
+## 启动后端
 
 ```bash
 uv sync
-uv run corpcom-workspace --help
-uv run corpcom-workspace create \
-  --title '白酒经营韧性研究' \
-  --goal '持续检验贵州茅台与五粮液的经营韧性' \
-  --scope '贵州茅台（600519）、五粮液（000858）' \
-  --observation-period '未来三个月' \
-  --hypothesis '贵州茅台的经营韧性更强' \
-  --preferences '{"关注指标":["营收","归母净利润","经营现金流"],"报告语言":"中文"}'
+uv run uvicorn corpcom.api:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
-命令返回 JSON。复制其中的 `id`，按 [Workspace 操作与验收](docs/workspace-local.md) 继续创建会话、保存消息与文件、退出后恢复。上述存储命令不调用模型，不需要模型密钥、Docker 或网络。研究范围是自由文本，不限定两家公司。
+打开 [接口调试页面](http://127.0.0.1:8000/docs) 创建 Workspace、会话并发送消息。后端沿用本机 `.env` 模型配置和 `data/` 存储，前端只需调用 HTTP 接口。完整接口、错误响应和前端示例见 [后端接口文档](docs/backend-api.md)。
 
-创建会话后，可在同一 Workspace 中向模型提问：
+## Workspace 本地验收
+
+Workspace 的创建、会话、偏好和文件操作统一使用 [后端 HTTP 接口](docs/backend-api.md)。存储接口不需要模型密钥、Docker 或网络；发送消息需要配置模型。
 
 ```bash
-uv run corpcom-workspace thread-create "$workspace_id" --title '继续研究'
-thread_id="替换为会话创建结果中的 id"
-uv run corpcom-workspace ask "$workspace_id" "$thread_id" --question '继续上次的研究，先说明已知证据和待核对的问题。'
+uv run python -m unittest discover -s tests -v
 ```
 
-`ask` 使用 `.env` 中已配置的模型，返回并保存助手消息；旧会话和文件按需由模型通过只读工具读取。详细行为见 [Workspace 操作与验收](docs/workspace-local.md#8-模型接入与跨会话续接)。
+测试使用临时数据目录，覆盖持久化恢复、Workspace 隔离、文件副本、Agent 对话和 HTTP 行为。存储结构与框架执行说明见 [本地存储与验收](docs/workspace-local.md)。
 
-默认数据保存于运行命令时当前目录下的 `data/`（已被 Git 忽略）。在项目根目录运行即可复用同一份数据；从其他位置运行时，用 `--data-dir /绝对路径` 指向已有数据目录。
+默认数据保存于服务启动目录下的 `data/`（已被 Git 忽略）；从其他位置启动时，通过 `CORPCOM_DATA_DIR` 指向已有数据目录。行情与 Docker PTC 命令保留为独立开发验收工具。
 
 ## 首阶段验收
 

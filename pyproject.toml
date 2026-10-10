@@ -3,13 +3,22 @@ name = "corpcom"
 version = "0.1.0"
 description = "A-share company comparison agent"
 requires-python = ">=3.11"
-dependencies = ["akshare", "openai", "python-dotenv", "pydantic>=2,<3"]
+dependencies = [
+    "akshare",
+    "openai",
+    "python-dotenv",
+    "pydantic>=2,<3",
+    "langchain>=1,<2",
+    "langchain-openai>=1,<2",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+    "python-multipart>=0.0.18,<1",
+]
 
 [project.scripts]
 corpcom = "corpcom.cli:main"
 corpcom-sandbox = "corpcom.sandbox:main"
 corpcom-ptc = "corpcom.ptc:main"
-corpcom-workspace = "corpcom.workspace_cli:main"
 
 [build-system]
 requires = ["hatchling"]

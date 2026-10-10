@@ -55,7 +55,7 @@ class WorkspaceModelTests(unittest.TestCase):
                 self.assertIsInstance(file.path, Path)
                 self.assertEqual(file.path.read_text(), "Research plan")
 
-                # Nested records, datetime values and Paths must all reach valid CLI JSON.
+                # Nested records, datetime values and Paths must all serialize to valid JSON.
                 payload = json.loads(json.dumps(detail.model_dump(mode="json"), allow_nan=False))
                 self.assertEqual(payload["threads"][0]["id"], thread.id)
                 self.assertEqual(payload["artifacts"][0]["relative_path"], artifact.relative_path)

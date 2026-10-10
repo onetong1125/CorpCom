@@ -2,41 +2,16 @@
 
 import json
 
-from openai import OpenAI
+from langchain.agents import create_agent
+from langchain.agents.middleware import ModelCallLimitMiddleware
+from langchain_core.language_models import BaseChatModel
 
 from corpcom.workspace import WorkspaceStore
-
-
-READ_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_thread",
-            "description": "Read messages from an earlier conversation in this workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {"thread_id": {"type": "string"}},
-                "required": ["thread_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read the UTF-8 text of a saved file in this workspace. Use its artifact ID.",
-            "parameters": {
-                "type": "object",
-                "properties": {"artifact_id": {"type": "string"}},
-                "required": ["artifact_id"],
-            },
-        },
-    },
-]
+from corpcom.workspace_tools import create_workspace_tools
 
 
 def ask_workspace(
-    store: WorkspaceStore, client: OpenAI, model: str,
+    store: WorkspaceStore, model: BaseChatModel,
     workspace_id: str, thread_id: str, question: str,
 ) -> str:
     """Answer in a thread, reading workspace material on demand and saving the exchange."""
@@ -61,52 +36,25 @@ def ask_workspace(
             for item in detail.artifacts
         ],
     }
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "你是持续研究助手。以下 JSON 是当前 Workspace 的已保存研究状态。"
-                "回答时遵循其目标与用户偏好，将初始假设视为待验证判断。"
-                "当问题需要旧会话或文件内容时，按索引调用工具读取；不要凭索引猜测内容。"
-                "区分已有证据、用户陈述与推断，不编造来源、数据或投资建议。"
-                "工具只能读取当前 Workspace 的资料。\n"
-                + json.dumps(context, ensure_ascii=False)
-            ),
-        },
-        *[{"role": item.role, "content": item.content} for item in thread.messages],
-    ]
-
-    for _ in range(6):
-        response = client.chat.completions.create(
-            model=model, messages=messages, tools=READ_TOOLS, temperature=0,
-        )
-        reply = response.choices[0].message
-        messages.append(reply.model_dump(exclude_none=True))
-        if not reply.tool_calls:
-            if not reply.content:
-                raise RuntimeError("model returned no answer")
-            store.add_message(workspace_id, thread_id, "assistant", reply.content)
-            return reply.content
-
-        for call in reply.tool_calls:
-            arguments = json.loads(call.function.arguments)
-            if call.function.name == "read_thread":
-                history = store.get_thread(workspace_id, arguments["thread_id"])
-                result = {
-                    "title": history.title,
-                    "messages": [
-                        {"role": item.role, "content": item.content}
-                        for item in history.messages
-                    ],
-                }
-            elif call.function.name == "read_file":
-                file = store.get_file(workspace_id, arguments["artifact_id"])
-                result = {"name": file.name, "content": file.path.read_text(encoding="utf-8")}
-            else:
-                raise ValueError(f"unknown tool: {call.function.name}")
-            messages.append({
-                "role": "tool", "tool_call_id": call.id,
-                "content": json.dumps(result, ensure_ascii=False),
-            })
-
-    raise RuntimeError("model did not finish after six rounds")
+    agent = create_agent(
+        model,
+        tools=create_workspace_tools(store.root, workspace_id),
+        system_prompt=(
+            "你是持续研究助手。以下 JSON 是当前 Workspace 的已保存研究状态。"
+            "回答时遵循其目标与用户偏好，将初始假设视为待验证判断。"
+            "当问题需要旧会话或文件内容时，按索引调用工具读取；不要凭索引猜测内容。"
+            "区分已有证据、用户陈述与推断，不编造来源、数据或投资建议。"
+            "工具只能读取当前 Workspace 的资料。\n"
+            + json.dumps(context, ensure_ascii=False)
+        ),
+        middleware=[ModelCallLimitMiddleware(run_limit=6, exit_behavior="error")],
+    )
+    # SQLite remains the conversation source; no framework checkpoint duplicates its history.
+    result = agent.invoke({
+        "messages": [{"role": item.role, "content": item.content} for item in thread.messages],
+    })
+    answer = result["messages"][-1].text
+    if not answer.strip():
+        raise RuntimeError("model returned no answer")
+    store.add_message(workspace_id, thread_id, "assistant", answer)
+    return answer

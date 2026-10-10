@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS artifacts (
 """
 
 
+class RecordNotFoundError(ValueError):
+    """A requested record does not exist within the supplied workspace."""
+
+
 def _require_text(**fields: str) -> None:
     """Reject blank required input without changing valid text formatting."""
     for name, value in fields.items():
@@ -88,7 +92,7 @@ class WorkspaceStore:
             "SELECT * FROM workspaces WHERE id = ?", (workspace_id,)
         ).fetchone()
         if row is None:
-            raise ValueError(f"workspace not found: {workspace_id}")
+            raise RecordNotFoundError(f"workspace not found: {workspace_id}")
         workspace = dict(row)
         workspace["preferences"] = json.loads(workspace["preferences"])
         return Workspace.model_validate(workspace)
@@ -100,7 +104,7 @@ class WorkspaceStore:
             (workspace_id, thread_id),
         ).fetchone()
         if row is None:
-            raise ValueError(f"thread not found in workspace: {thread_id}")
+            raise RecordNotFoundError(f"thread not found in workspace: {thread_id}")
         return Thread.model_validate(dict(row))
 
     def _touch(self, workspace_id: str) -> None:
@@ -229,7 +233,7 @@ class WorkspaceStore:
             (workspace_id, artifact_id),
         ).fetchone()
         if row is None:
-            raise ValueError(f"file not found in workspace: {artifact_id}")
+            raise RecordNotFoundError(f"file not found in workspace: {artifact_id}")
         artifact = dict(row)
         path = self.root / artifact["relative_path"]
         # An index row does not guarantee the file still exists after manual deletion.
