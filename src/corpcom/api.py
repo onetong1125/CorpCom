@@ -7,12 +7,14 @@ import shutil
 from tempfile import TemporaryDirectory
 from threading import Lock
 from typing import Annotated
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Form, HTTPException, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededError
 from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
@@ -74,7 +76,22 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     """Build a single-worker local app; tests can select a separate data directory."""
     load_dotenv()
     root = (data_dir if data_dir is not None else Path(os.getenv("CORPCOM_DATA_DIR", "data"))).resolve()
-    app = FastAPI(title="CorpCom", version="0.1.0")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        root.mkdir(parents=True, exist_ok=True)
+        # Keep the checkpoint connection open for the application's lifetime.
+        with SqliteSaver.from_conn_string(
+            str(root / "checkpoints.sqlite")
+        ) as checkpointer:
+            app.state.checkpointer = checkpointer
+            yield
+
+    app = FastAPI(
+        title="CorpCom",
+        version="0.1.0",
+        lifespan=lifespan
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[origin.strip() for origin in os.getenv(
@@ -151,7 +168,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                     raise HTTPException(409, "A conversation is already running in this workspace")
                 active_workspaces.add(workspace_id)
             try:
-                ask_workspace(store, model, workspace_id, thread_id, body.content)
+                ask_workspace(store, model, workspace_id, thread_id, body.content,
+                              app.state.checkpointer)
                 return store.get_thread(workspace_id, thread_id).messages[-1]
             except APIError as exc:
                 logger.exception("Model request failed")

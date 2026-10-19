@@ -3,23 +3,41 @@
 import json
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import ModelCallLimitMiddleware
 from langchain_core.language_models import BaseChatModel
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langchain.agents.middleware import ModelCallLimitMiddleware, wrap_tool_call
+from langchain_core.messages import ToolMessage
 
-from corpcom.workspace import WorkspaceStore
+from corpcom.workspace import RecordNotFoundError, WorkspaceStore
 from corpcom.workspace_tools import create_workspace_tools
+
+@wrap_tool_call
+def handle_workspace_tool_error(request, handler):
+    """Return expected lookup failures as tool results the model can act on."""
+    try:
+        return handler(request)
+    except RecordNotFoundError:
+        return ToolMessage(
+            content=(
+                "当前 Workspace 中找不到指定资料。"
+                "请检查资料索引中的 ID，再决定是否重新调用工具。"
+            ),
+            tool_call_id=request.tool_call["id"],
+            name=request.tool_call["name"],
+            status="error",
+        )
 
 
 def ask_workspace(
     store: WorkspaceStore, model: BaseChatModel,
     workspace_id: str, thread_id: str, question: str,
+    checkpointer: BaseCheckpointSaver,
 ) -> str:
     """Answer in a thread, reading workspace material on demand and saving the exchange."""
     detail = store.get_workspace_detail(workspace_id)
-    store.add_message(workspace_id, thread_id, "user", question)
-    thread = store.get_thread(workspace_id, thread_id)
+    user_message = store.add_message(workspace_id, thread_id, "user", question)
 
-    # Only the active conversation is loaded in full. Other material is indexed for tool reads.
+    # Refresh workspace metadata and material indexes on every turn.
     context = {
         "title": detail.title,
         "goal": detail.goal,
@@ -47,12 +65,34 @@ def ask_workspace(
             "工具只能读取当前 Workspace 的资料。\n"
             + json.dumps(context, ensure_ascii=False)
         ),
-        middleware=[ModelCallLimitMiddleware(run_limit=6, exit_behavior="error")],
+        middleware=[
+            ModelCallLimitMiddleware(run_limit=6, exit_behavior="error"),
+            handle_workspace_tool_error,
+        ],
+        checkpointer=checkpointer,
     )
-    # SQLite remains the conversation source; no framework checkpoint duplicates its history.
+
+    config = {
+        "configurable": {
+            "thread_id": f"{workspace_id}:{thread_id}",
+        }
+    }
+
+    # Import existing conversation history only before its first checkpoint.
+    if checkpointer.get_tuple(config) is None:
+        messages = store.get_thread(workspace_id, thread_id).messages
+    else:
+        messages = [user_message]
     result = agent.invoke({
-        "messages": [{"role": item.role, "content": item.content} for item in thread.messages],
-    })
+        "messages": [
+            {
+                "id": f"business:{item.id}",
+                "role":item.role,
+                "content":item.content,
+            } for item in messages
+        ],
+
+    }, config,)
     answer = result["messages"][-1].text
     if not answer.strip():
         raise RuntimeError("model returned no answer")

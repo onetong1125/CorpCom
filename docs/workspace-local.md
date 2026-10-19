@@ -7,11 +7,12 @@ Workspace 通过 [后端 HTTP 接口](backend-api.md) 操作，创建研究、�
 ```text
 data/
   corpcom.db
+  checkpoints.sqlite
   workspaces/<workspace_id>/
     files/<artifact_id>/<原文件名>
 ```
 
-默认使用服务启动目录下的 `data/`，可通过 `CORPCOM_DATA_DIR` 指定已有数据目录。备份需要同时复制数据库和文件目录。现有 Docker PTC 的 `runs/` 仍是独立目录，尚未自动归档到 Workspace。
+默认使用服务启动目录下的 `data/`，可通过 `CORPCOM_DATA_DIR` 指定已有数据目录。停止服务后，备份需要同时保留 corpcom.db、checkpoints.sqlite 和文件目录。现有 Docker PTC 的 `runs/` 仍是独立目录，尚未自动归档到 Workspace。
 
 每个研究保存目标、自由文本范围、观察周期、初始假设与偏好。偏好更新整体替换原 JSON 对象，传 `{}` 可清空；尚无偏好修改历史或自动提取。新会话拥有独立消息列表，并共用所属 Workspace 的目标、偏好与文件。
 
@@ -31,7 +32,7 @@ uv run python -m unittest discover -s tests -v
 
 - `tests/test_workspace.py` 直接验收存储层：独立进程重开后恢复目标、偏好、假设、旧消息和文件，并建立新会话；还覆盖跨 Workspace 隔离、同名文件独立副本、原文件删除、非法输入不改状态及已保存文件丢失。
 - `tests/test_workspace_models.py` 验收重开后的对象类型与 JSON 序列化。
-- `tests/test_workspace_agent.py` 使用替身模型运行真实框架循环，覆盖多轮上下文、旧会话与文件读取、归属检查、模型调用上限和空回答。
+- `tests/test_workspace_agent.py` 使用替身模型运行真实框架循环，覆盖多轮上下文、SQLite 重开恢复、旧历史仅导入一次、不同 thread 的 checkpoint 隔离、工具结果落盘、可预期工具错误后的续聊、跨 Workspace 归属检查、非预期异常传播、模型调用上限和空回答。
 - `tests/test_api.py` 验收 HTTP 合同、偏好 JSON 类型与数值校验、文件上传下载、应用重建后的恢复、模型错误、并发限制和 CORS。
 
 自动测试中的模型为替身；真实模型的 HTTP 验收记录见 [后端接口文档](backend-api.md#已验证)。当前只保存初始假设，尚无假设修订版本、自动报告、Run 管理或调度。
@@ -54,17 +55,22 @@ uv run python -m unittest discover -s tests -v
 
 ## 模型上下文与 LangChain 执行循环
 
-`workspace_agent.py` 负责组装研究上下文、注册工具、调用 Agent 并保存问答。Python 入口为 `ask_workspace(store, model, workspace_id, thread_id, question)`，`model` 是 LangChain 的 `BaseChatModel` 实例。
+`workspace_agent.py` 负责组装研究上下文、注册工具、调用 Agent 并保存问答。Python 入口为 `ask_workspace(store, model, workspace_id, thread_id, question, checkpointer)`，`model` 是 LangChain 的 `BaseChatModel` 实例。checkpointer 接收框架的 BaseCheckpointSaver；HTTP 服务使用由 lifespan 管理的 SqliteSaver。
 
 | 职责 | 实现 |
 | --- | --- |
 | 工具参数与描述 | `workspace_tools.py` 中的 `@tool` 从类型标注和英文 docstring 生成 |
 | 模型调用、工具分发及结果回传 | LangChain `create_agent` 执行循环 |
 | 模型连接 | API 的 `get_model` 创建 `ChatOpenAI`，读取 `CORPCOM_MODEL`、`OPENAI_API_KEY`、`OPENAI_BASE_URL` |
-| 研究与会话持久化 | `WorkspaceStore` 从 SQLite 读取历史，并保存本次用户消息及最终回答 |
+| 业务数据持久化 | `WorkspaceStore` 保存研究资料、用户消息及最终助手回答 |
+| Agent 执行状态持久化 | `SqliteSaver` 保存消息状态，包括工具调用和结果，以 `workspace_id:thread_id` 区分会话 |
 
 模型收到目标、范围、观察周期、初始假设、偏好、当前会话消息，以及其他会话和文件索引。`create_workspace_tools(data_dir, workspace_id)` 返回绑定当前研究的 `read_thread` 和 `read_file`，模型按需读取旧消息与 UTF-8 文本文件；Workspace ID 由程序绑定，不交给模型选择。工具在线程中运行，每次读取在执行线程内建立并关闭独立 SQLite 连接。
 
-每次提问最多调用模型六次，超限明确报错。工具归属与文件错误向调用方抛出；工具参数不符合 schema 时，框架将校验错误反馈给模型，后续修正也计入六次上限。失败时保留已写入的用户提问，不保存成功回答。
+每次提问最多调用模型六次，超限明确报错。工具参数不符合 schema 时，框架将校验错误反馈给模型；工具执行中的 `RecordNotFoundError` 由中间件转换为匹配调用 ID、`status="error"` 的 ToolMessage，模型可以据此修正调用或解释失败。后续模型调用仍计入六次上限。其他未处理异常向调用方抛出；调用中断时保留已写入的用户提问，不保存成功回答。
 
-未配置框架 checkpointer，每次提问以 SQLite 中的当前会话历史为准，中间工具消息仅在本次执行中使用。目前只讨论已有资料，不自动获取新财务数据或生成正式报告文件；文件读取仅支持 UTF-8 文本，未对长文件自动摘要。经营数据与 `execute_python` 接入仍在后续批次。
+当前 thread 尚无 checkpoint 时，从业务库导入已有问答，包括已经保存的本轮用户消息；之后每轮仅输入新用户消息，由 checkpoint 恢复此前的 Agent 消息。研究目标、偏好及资料索引仍在每轮刷新。
+
+业务库与 checkpoint 数据库之间没有原子事务。当前支持已完成轮次的历史恢复，不保证进程中途退出后的自动恢复，也未实现请求去重或最终回答的跨库幂等同步。
+
+目前只讨论已有资料，不自动获取新财务数据或生成正式报告文件；文件读取仅支持 UTF-8 文本，未对长文件自动摘要。经营数据与 `execute_python` 接入仍在后续批次。
