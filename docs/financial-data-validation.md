@@ -1,4 +1,5 @@
 # 经营数据接口实测记录
+前面的探针实测与验收记录对应 2026-10-06；2026-10-21 的可调用函数与测试验收见文末。
 
 ## 结论
 
@@ -70,3 +71,50 @@ uv run python examples/probe_fundamentals.py
 - 年报对账：12 个金额到分一致；6 个同比到百分数两位小数一致。
 - 静态检查：脚本编译通过；本批变更通过 `git diff --check`。
 - 产品设计：见 [研究案例、报告与 Workspace](research-workspace.md)。以上数据验证通过后，下一批可以开始 Workspace 持久化；历史回放的时间与版本核验仍为后续独立验收项。
+
+## 可调用年度经营数据函数与验收（2026-10-21）
+
+已从探针提取 `src/corpcom/fundamentals.py` 中的年度经营数据函数：
+
+```python
+from corpcom.fundamentals import get_annual_financials
+
+result = get_annual_financials("sh600519", [2023, 2024])
+```
+
+股票代码使用 `sh` / `sz` 加六位数字。函数获取利润表和现金流量表，按指定年度筛选年末报告期，返回营业收入、归母净利润和经营现金流净额。
+
+返回值为可序列化为 JSON 的字典。`statements` 按报表和报告期组织记录，金额位于 `amounts_yuan`，使用人民币元、两位小数字符串。结果保留来源链接、AKShare 版本、UTC 抓取开始时间、上游公告日期和更新日期，以及合并年度累计口径。
+
+函数不计算同比、不保存文件；文件保存由调用方负责。首次披露时间仍未核验，`first_publication_verified` 为 `false`。当前函数不含请求时限控制，也尚未接入 Workspace Agent 或 Docker PTC。
+
+非法参数、缺失或重复年度、币种或合并口径不符、非有限金额会明确报错；无法解析的金额和请求异常继续向上传播。
+
+### 测试命令
+
+在项目根目录执行。单元测试使用模拟报表，不联网：
+
+```bash
+.venv/bin/python -m unittest discover -s tests -p 'test_fundamentals.py' -v
+```
+
+真实接口测试默认跳过，显式启用后请求两家公司，并对照已有年报基准核对 12 个金额：
+
+```bash
+CORPCOM_LIVE_TESTS=1 .venv/bin/python -m unittest discover -s tests -p 'test_fundamentals_live.py' -v
+```
+
+启用后，网络异常或金额不一致会使测试失败，不会自动跳过。测试不重新下载原始年报；基准来自本文关联的资料核查记录。2023、2024 年为固定验收样本，不代表当前最新数据。
+
+默认全量回归：
+
+```bash
+env -u CORPCOM_LIVE_TESTS .venv/bin/python -m unittest discover -s tests -v
+```
+
+### 本次验收结果
+
+- 6 项单元测试通过，覆盖正常返回、来源与时间、非法参数、年度缺失或重复、口径错误、非法金额及请求异常传播。
+- 真实接口测试由开发者本地显式启用并确认通过，两家公司共 12 个金额与已有年报基准一致。
+- 默认全量回归发现 29 项测试：28 项通过，1 项真实接口测试按预期跳过。
+- `git diff --check` 通过。
