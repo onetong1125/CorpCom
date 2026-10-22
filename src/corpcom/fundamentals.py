@@ -7,7 +7,64 @@ import akshare as ak
 
 
 def get_annual_financials(symbol: str, years: list[int]) -> dict:
-  """Return annual consolidated financial data for one stock."""
+  """Fetch annual consolidated revenue, parent-attributable profit, and operating cash flow for a Shanghai/Shenzhen stock.
+
+  Args:
+      symbol: Exchange-prefixed stock code, such as "sh600519" or "sz000858".
+      years: Non-empty list of distinct integer years, such as [2023, 2024].
+          Each year selects the annual reporting period ending December 31.
+
+  Returns:
+      A JSON-serializable dict containing:
+      - symbol: The requested stock code.
+      - source, interface, akshare_version: Data provider and retrieval metadata.
+      - retrieved_at: UTC retrieval start time as an ISO datetime string.
+      - currency: "CNY".
+      - amount_unit: "yuan".
+      - period_basis: "annual cumulative, consolidated".
+      - first_publication_verified: Always False.
+      - statements: A list of statement records.
+
+      Each statement record contains:
+      - statement: "利润表" or "现金流量表".
+      - period_end: Reporting period end as "YYYY-MM-DD".
+      - amounts_yuan: A dict of decimal strings with two fractional digits.
+          Profit statements contain "营业收入" and
+          "归属于母公司所有者的净利润".
+          Cash flow statements contain "经营活动产生的现金流量净额".
+      - source_publish_date, source_updated_at: Unmodified upstream date values.
+      - source_url: The source page URL.
+
+      Records are grouped by statement, with years ascending within each group.
+      The result contains only these three metrics, not complete statements.
+      Use Decimal for monetary calculations and convert it to str for JSON.
+
+  Notes:
+      Amounts cover the full year on a consolidated basis.
+      Upstream dates are not verified first-publication dates, and historical
+      values may have been revised. This result does not establish which data
+      was available at a historical point in time.
+      The function fetches data but does not calculate growth or write files.
+      Requests have no function-level timeout.
+
+  Raises:
+      ValueError: Rejected arguments, missing or duplicate annual periods,
+          unexpected currency or statement scope, or nonfinite amounts.
+      Other amount-parsing and upstream request exceptions propagate unchanged.
+
+  Example:
+      from decimal import Decimal
+      from corpcom.fundamentals import get_annual_financials
+
+      data = get_annual_financials("sh600519", [2023, 2024])
+      income = {
+          item["period_end"]: item["amounts_yuan"]
+          for item in data["statements"]
+          if item["statement"] == "利润表"
+      }
+      revenue_2024 = Decimal(income["2024-12-31"]["营业收入"])
+  """
+
   if re.fullmatch(r"(sh|sz)[0-9]{6}", symbol) is None:
     raise ValueError("symbol must be sh or sz followed by six digits")
 

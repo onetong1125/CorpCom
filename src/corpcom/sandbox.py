@@ -11,8 +11,9 @@ import uuid
 IMAGE = "corpcom-sandbox:local"
 
 
-def run_python(code: str) -> dict:
-    run_dir = Path.cwd() / "runs" / uuid.uuid4().hex
+def run_python(code: str, *, runs_root: Path | None = None) -> dict:
+    base_dir = Path.cwd() / "runs" if runs_root is None else runs_root
+    run_dir = base_dir.resolve() / uuid.uuid4().hex
     run_dir.mkdir(parents=True)
     (run_dir / "analysis.py").write_text(code)
     container_name = f"corpcom-{run_dir.name}"

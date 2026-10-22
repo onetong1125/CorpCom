@@ -10,6 +10,7 @@ from langchain_core.messages import ToolMessage
 
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore
 from corpcom.workspace_tools import create_workspace_tools
+from corpcom.function_catalog import list_function_summaries
 
 @wrap_tool_call
 def handle_workspace_tool_error(request, handler):
@@ -58,11 +59,31 @@ def ask_workspace(
         model,
         tools=create_workspace_tools(store.root, workspace_id),
         system_prompt=(
-            "你是持续研究助手。以下 JSON 是当前 Workspace 的已保存研究状态。"
-            "回答时遵循其目标与用户偏好，将初始假设视为待验证判断。"
+            "你是持续研究助手。回答时遵循当前 Workspace 的目标与用户偏好，"
+            "将初始假设视为待验证判断。"
             "当问题需要旧会话或文件内容时，按索引调用工具读取；不要凭索引猜测内容。"
-            "区分已有证据、用户陈述与推断，不编造来源、数据或投资建议。"
-            "工具只能读取当前 Workspace 的资料。\n"
+            "已有研究资料的读取限定在当前 Workspace。"
+            "区分已有证据、用户陈述与推断，不编造来源、数据或投资建议。\n"
+            "你可以通过 execute_python 在 Docker 沙箱中运行 Python。"
+            "需要使用数据函数时，先根据下方简表判断本次任务需要哪些函数，"
+            "仅对准备调用的函数使用 read_function_doc 获取完整契约；"
+            "不要为了了解全部能力而读取所有函数文档。"
+            "当前上下文已包含该函数完整契约时可以复用。"
+            "纯概念问题无需读取函数文档或执行沙箱。"
+            "当前函数不覆盖的数据需求应明确说明，不编造函数或参数。\n"
+            "每次沙箱执行使用独立容器和运行目录，"
+            "不能依赖上一次执行的 Python 变量或当前目录文件。"
+            "完成本次分析所需的取数和计算应放在同一次执行中。"
+            "保存完整数据文件，并把回答所需的计算结果和来源摘要写入 result.json；"
+            "仅 print() 不会完成执行契约。"
+            "不要将导致本次任务失败的异常转换成 result.json 后正常退出；"
+            "如需捕获异常记录诊断信息，记录后应重新抛出。"
+            "执行失败时应说明失败，不能声称已经取得数据或完成计算。"
+            "当前执行产物尚未自动登记为 Workspace 资料，"
+            "不能把输出文件名当作 artifact_id 传给 read_file。\n"
+            "可用沙箱数据函数：\n"
+            + json.dumps(list_function_summaries(), ensure_ascii=False)
+            + "\n当前 Workspace 的已保存研究状态：\n"
             + json.dumps(context, ensure_ascii=False)
         ),
         middleware=[

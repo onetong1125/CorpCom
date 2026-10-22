@@ -1,11 +1,14 @@
-"""Define read tools bound to one workspace and its data directory."""
+"""Define research tools bound to one workspace and its data directory."""
 
 from pathlib import Path
+import inspect
 
 from langchain.tools import tool
 from langchain_core.tools import BaseTool
 
+from corpcom.function_catalog import FUNCTIONS
 from corpcom.workspace import WorkspaceStore
+from corpcom.sandbox import run_python
 
 
 def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
@@ -31,4 +34,58 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
             file = reader.get_file(workspace_id, artifact_id)
         return {"name": file.name, "content": file.path.read_text(encoding="utf-8")}
 
-    return [read_thread, read_file]
+    @tool
+    def execute_python(code: str) -> dict:
+        """Run Python in the Docker sandbox.
+
+        Save output files in the working directory.
+        Write a compact JSON summary to result.json, at most 16 KiB.
+        Execution is limited to 90 seconds.
+        Return the summary on success or execution details on failure.
+        """
+        # Check the bound workspace before creating execution files.
+        with WorkspaceStore(data_dir) as store:
+            store.get_workspace(workspace_id)
+
+        execution = run_python(
+            code,
+            runs_root=data_dir / "workspaces" / workspace_id / "runs",
+        )
+
+        return {
+            key: value
+            for key, value in execution.items()
+            if key != "run_dir"
+        }
+
+    @tool
+    def read_function_doc(function_id: str) -> dict:
+        """Read the import statement, signature, and full documentation of one sandbox function selected for the current task.
+
+        Choose the function using the summaries already provided in the system message.
+        Call this tool only when you intend to use that function for the current request.
+        Do not read unrelated function documentation or enumerate the catalog.
+        Reuse documentation already present in the conversation.
+        This tool reads metadata without executing the function.
+        """
+        if function_id not in FUNCTIONS:
+            return {
+                "status": "error",
+                "error": f"Unknown sandbox function: {function_id}",
+                "available_functions": list(FUNCTIONS),
+            }
+
+        function = FUNCTIONS[function_id]
+        return {
+            "function_id": function_id,
+            "import": (
+                f"from {function.__module__} import {function.__name__}"
+            ),
+            "signature": (
+                f"{function.__name__}{inspect.signature(function)}"
+            ),
+            "documentation": inspect.getdoc(function),
+        }
+
+
+    return [read_thread, read_file, read_function_doc, execute_python]
