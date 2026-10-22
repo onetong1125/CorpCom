@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import inspect
+from pydantic import BaseModel, ConfigDict, JsonValue
 
 from langchain.tools import tool
 from langchain_core.tools import BaseTool
@@ -10,6 +11,22 @@ from corpcom.function_catalog import FUNCTIONS
 from corpcom.workspace import WorkspaceStore
 from corpcom.sandbox import run_python
 
+class SandboxOutput(BaseModel):
+    """One file explicitly selected for workspace registration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    kind: str
+
+
+class SandboxResult(BaseModel):
+    """The required structure of the sandbox's result.json."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: dict[str, JsonValue]
+    outputs: list[SandboxOutput]
 
 def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
     """Bind workspace ownership without exposing it as a model-supplied argument."""
@@ -36,14 +53,24 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
 
     @tool
     def execute_python(code: str) -> dict:
-        """Run Python in the Docker sandbox.
+        """Run Python in the Docker sandbox and register selected output files.
 
         Save output files in the working directory.
-        Write a compact JSON summary to result.json, at most 16 KiB.
+        Write result.json, at most 16 KiB, with exactly these fields:
+        - summary: an object containing findings and source information.
+        - outputs: a list of objects containing path and kind strings.
+
+        Each path must be relative to the current run directory.
+        Use an empty outputs list when no files need registration.
+        Only explicitly listed files are registered, without copying them.
+        Example:
+        {"summary": {"rows": 2},
+         "outputs": [{"path": "financials.json", "kind": "data"}]}
+
         Execution is limited to 90 seconds.
-        Return the summary on success or execution details on failure.
+        On success, return the summary in result and registered file references
+        in artifacts. Use their artifact_id values with read_file.
         """
-        # Check the bound workspace before creating execution files.
         with WorkspaceStore(data_dir) as store:
             store.get_workspace(workspace_id)
 
@@ -52,10 +79,35 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
             runs_root=data_dir / "workspaces" / workspace_id / "runs",
         )
 
+        if execution["status"] != "ok":
+            return {
+                key: value
+                for key, value in execution.items()
+                if key != "run_dir"
+            }
+
+        result = SandboxResult.model_validate(execution["result"])
+        with WorkspaceStore(data_dir) as store:
+            artifacts = store.register_run_files(
+                workspace_id,
+                Path(execution["run_dir"]),
+                [
+                    (Path(output.path), output.kind)
+                    for output in result.outputs
+                ],
+            )
+
         return {
-            key: value
-            for key, value in execution.items()
-            if key != "run_dir"
+            "status": "ok",
+            "result": result.summary,
+            "artifacts": [
+                {
+                    "artifact_id": artifact.id,
+                    "name": artifact.name,
+                    "kind": artifact.kind,
+                }
+                for artifact in artifacts
+            ],
         }
 
     @tool
