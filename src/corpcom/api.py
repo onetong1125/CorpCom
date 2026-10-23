@@ -74,6 +74,10 @@ def get_model() -> BaseChatModel:
 
 def create_app(data_dir: Path | None = None) -> FastAPI:
     """Build a single-worker local app; tests can select a separate data directory."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     load_dotenv()
     root = (data_dir if data_dir is not None else Path(os.getenv("CORPCOM_DATA_DIR", "data"))).resolve()
 

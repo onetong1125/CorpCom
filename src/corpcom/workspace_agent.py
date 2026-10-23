@@ -1,16 +1,35 @@
 """Continue one research conversation using its persistent workspace context."""
 
 import json
+import logging
 
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langchain.agents.middleware import ModelCallLimitMiddleware, wrap_tool_call
 from langchain_core.messages import ToolMessage
+from langchain_core.callbacks import BaseCallbackHandler
 
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore
 from corpcom.workspace_tools import create_workspace_tools
 from corpcom.function_catalog import list_function_summaries
+
+logger = logging.getLogger(__name__)
+
+
+class ToolLogHandler(BaseCallbackHandler):
+  def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
+    logger.info(
+        "工具开始 name=%s run_id=%s",
+        serialized["name"],
+        run_id,
+    )
+
+  def on_tool_end(self, output, *, run_id, **kwargs):
+    logger.info("工具返回 run_id=%s", run_id)
+
+  def on_tool_error(self, error, *, run_id, **kwargs):
+    logger.error("工具异常 run_id=%s error=%s", run_id, error)
 
 @wrap_tool_call
 def handle_workspace_tool_error(request, handler):
@@ -35,6 +54,11 @@ def ask_workspace(
     checkpointer: BaseCheckpointSaver,
 ) -> str:
     """Answer in a thread, reading workspace material on demand and saving the exchange."""
+    logger.info(
+        "本轮开始 workspace=%s thread=%s",
+        workspace_id,
+        thread_id,
+    )
     detail = store.get_workspace_detail(workspace_id)
     user_message = store.add_message(workspace_id, thread_id, "user", question)
 
@@ -97,7 +121,8 @@ def ask_workspace(
     config = {
         "configurable": {
             "thread_id": f"{workspace_id}:{thread_id}",
-        }
+        },
+      "callbacks": [ToolLogHandler()],
     }
 
     # Import existing conversation history only before its first checkpoint.
@@ -119,4 +144,9 @@ def ask_workspace(
     if not answer.strip():
         raise RuntimeError("model returned no answer")
     store.add_message(workspace_id, thread_id, "assistant", answer)
+    logger.info(
+        "本轮完成 workspace=%s thread=%s",
+        workspace_id,
+        thread_id,
+    )
     return answer
