@@ -88,7 +88,7 @@ def ask_workspace(
             + json.dumps(context, ensure_ascii=False)
         ),
         middleware=[
-            ModelCallLimitMiddleware(run_limit=6, exit_behavior="error"),
+            ModelCallLimitMiddleware(run_limit=10, exit_behavior="error"),
             handle_workspace_tool_error,
         ],
         checkpointer=checkpointer,

@@ -269,7 +269,7 @@ class WorkspaceAgentTests(unittest.TestCase):
             with self.assertRaises(ModelCallLimitExceededError):
                 ask_workspace(store, model, self.workspace.id, self.thread.id,
                               "反复读取", self.checkpointer)
-            self.assertEqual(len(model.requests), 6)
+            self.assertEqual(len(model.requests), 10)
             self.assertEqual(
                 [item.role for item in store.get_thread(self.workspace.id, self.thread.id).messages],
                 ["user"],

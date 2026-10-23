@@ -55,8 +55,14 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
     def execute_python(code: str) -> dict:
         """Run Python in the Docker sandbox and register selected output files.
 
+        Submit a complete Python program that can be executed directly.
+        The system automatically saves the submitted code as analysis.py in
+        the working directory. Do not overwrite this file; include it in
+        outputs if you want to register the submitted program.
+
         Save output files in the working directory.
-        Write result.json, at most 16 KiB, with exactly these fields:
+        The program must write result.json; printing output is not sufficient.
+        This file must be at most 16 KiB and contain exactly these fields:
         - summary: an object containing findings and source information.
         - outputs: a list of objects containing path and kind strings.
 
