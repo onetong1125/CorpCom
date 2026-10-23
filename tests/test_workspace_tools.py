@@ -1,6 +1,7 @@
 """Verify sandbox function discovery without executing data functions."""
 
 from pathlib import Path
+import shutil
 import unittest
 from unittest.mock import patch
 from tempfile import TemporaryDirectory
@@ -66,8 +67,8 @@ class WorkspaceToolTests(unittest.TestCase):
       "summary": "Return sample data.",
     }])
 
-  def test_execute_python_registers_outputs_and_returns_readable_ids(self):
-    """Register selected outputs and read them through the returned references."""
+  def test_execute_python_archives_outputs_and_returns_readable_ids(self):
+    """Read selected archived copies after deleting the temporary run."""
     temporary = self.enterContext(TemporaryDirectory())
     data = Path(temporary).resolve() / "data"
     with WorkspaceStore(data) as store:
@@ -77,7 +78,7 @@ class WorkspaceToolTests(unittest.TestCase):
           preferences={},
       ).id
 
-    run_dir = data / "workspaces" / wid / "runs" / "test-run"
+    run_dir = data / "workspaces" / wid / ".runs" / "test-run"
     run_dir.mkdir(parents=True)
     source = run_dir / "financials.json"
     content = '{"revenue": 123}'
@@ -98,8 +99,14 @@ class WorkspaceToolTests(unittest.TestCase):
     }
     with patch(
         "corpcom.workspace_tools.run_python", return_value=execution,
-    ):
-      result = tools["execute_python"].invoke({"code": "# test"})
+    ) as run_python:
+      result = tools["execute_python"].invoke({
+        "code": "# test",
+        "archive_path": "financials/v1",
+      })
+      run_python.assert_called_once_with(
+          "# test", runs_root=data / "workspaces" / wid / ".runs",
+      )
 
     self.assertEqual(result["status"], "ok")
     self.assertEqual(result["result"], {"rows": 1})
@@ -108,6 +115,20 @@ class WorkspaceToolTests(unittest.TestCase):
     self.assertEqual(reference["name"], "financials.json")
     self.assertEqual(reference["kind"], "data")
 
+    archive_dir = data / "workspaces" / wid / "tasks" / "financials" / "v1"
+    self.assertEqual(
+        reference["relative_path"],
+        (archive_dir / "financials.json").relative_to(data).as_posix(),
+    )
+    self.assertEqual(
+        {path.name for path in archive_dir.iterdir()}, {"financials.json"},
+    )
+    source.write_text("changed", encoding="utf-8")
+    self.assertEqual(
+        (archive_dir / "financials.json").read_text(encoding="utf-8"), content,
+    )
+    shutil.rmtree(run_dir)
+
     read = tools["read_file"].invoke({
       "artifact_id": reference["artifact_id"],
     })
@@ -115,7 +136,7 @@ class WorkspaceToolTests(unittest.TestCase):
 
     with WorkspaceStore(data) as store:
       saved = store.get_file(wid, reference["artifact_id"])
-      self.assertEqual(saved.path, source)
+      self.assertEqual(saved.path, archive_dir / "financials.json")
       self.assertEqual(
           [item.id for item in store.get_workspace_detail(wid).artifacts],
           [reference["artifact_id"]],
@@ -134,7 +155,7 @@ class WorkspaceToolTests(unittest.TestCase):
       ).id
       before = store.get_workspace_detail(wid)
 
-    run_dir = data / "workspaces" / wid / "runs" / "test-run"
+    run_dir = data / "workspaces" / wid / ".runs" / "test-run"
     run_dir.mkdir(parents=True)
     (run_dir / "first.txt").write_text("first", encoding="utf-8")
     (run_dir.parent / "outside.txt").write_text("outside", encoding="utf-8")
@@ -160,10 +181,16 @@ class WorkspaceToolTests(unittest.TestCase):
       with self.assertRaisesRegex(
           ValueError, "output path must stay within",
       ):
-        tools["execute_python"].invoke({"code": "# test"})
+        tools["execute_python"].invoke({
+          "code": "# test",
+          "archive_path": "financials/v1",
+        })
 
     with WorkspaceStore(data) as store:
       self.assertEqual(store.get_workspace_detail(wid), before)
+    self.assertFalse(
+        (data / "workspaces" / wid / "tasks" / "financials" / "v1").exists()
+    )
 
 
 if __name__ == "__main__":

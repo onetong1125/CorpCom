@@ -52,69 +52,81 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
         return {"name": file.name, "content": file.path.read_text(encoding="utf-8")}
 
     @tool
-    def execute_python(code: str) -> dict:
-        """Run Python in the Docker sandbox and register selected output files.
+    def execute_python(code: str, archive_path: str) -> dict:
+      """Run Python in Docker and archive selected outputs in this workspace.
 
         Submit a complete Python program that can be executed directly.
-        The system automatically saves the submitted code as analysis.py in
-        the working directory. Do not overwrite this file; include it in
-        outputs if you want to register the submitted program.
+        Each execution uses a fresh temporary working directory.
+        The system saves the submitted code as analysis.py there.
+        Do not overwrite it; include it in outputs to archive the program.
 
-        Save output files in the working directory.
-        The program must write result.json; printing output is not sufficient.
-        This file must be at most 16 KiB and contain exactly these fields:
+        archive_path selects a directory under this workspace's tasks directory.
+        Use a meaningful task name and an explicit version, such as
+        "moutai-wuliangye/v1". Consult saved relative_path values to choose a
+        new version directory for each batch. Existing directories are rejected;
+        saved files are never overwritten. Do not include the tasks prefix.
+        This directory receives copies after execution; it is not mounted
+        into the sandbox and does not provide access to earlier files.
+
+        Save output files and result.json in the working directory.
+        Printing output is not sufficient. result.json must be at most
+        16 KiB and contain exactly these fields:
         - summary: an object containing findings and source information.
         - outputs: a list of objects containing path and kind strings.
 
-        Each path must be relative to the current run directory.
-        Use an empty outputs list when no files need registration.
-        Only explicitly listed files are registered, without copying them.
+        Each output path must be relative to the working directory.
+        Only explicitly listed files are copied and indexed.
+        Use an empty outputs list when no files need saving; no archive
+        directory is created in that case.
         Example:
         {"summary": {"rows": 2},
          "outputs": [{"path": "financials.json", "kind": "data"}]}
 
         Execution is limited to 90 seconds.
-        On success, return the summary in result and registered file references
-        in artifacts. Use their artifact_id values with read_file.
+        On success, return the summary in result and saved file references
+        in artifacts. relative_path identifies each saved copy within the
+        data directory. Use artifact_id with read_file to read saved text.
         """
-        with WorkspaceStore(data_dir) as store:
-            store.get_workspace(workspace_id)
+      with WorkspaceStore(data_dir) as store:
+        store.get_workspace(workspace_id)
 
-        execution = run_python(
-            code,
-            runs_root=data_dir / "workspaces" / workspace_id / "runs",
+      execution = run_python(
+          code,
+          runs_root=data_dir / "workspaces" / workspace_id / ".runs",
+      )
+
+      if execution["status"] != "ok":
+        return {
+          key: value
+          for key, value in execution.items()
+          if key != "run_dir"
+        }
+
+      result = SandboxResult.model_validate(execution["result"])
+      with WorkspaceStore(data_dir) as store:
+        artifacts = store.archive_run_files(
+            workspace_id,
+            Path(execution["run_dir"]),
+            [
+              (Path(output.path), output.kind)
+              for output in result.outputs
+            ],
+            archive_path=Path(archive_path),
         )
 
-        if execution["status"] != "ok":
-            return {
-                key: value
-                for key, value in execution.items()
-                if key != "run_dir"
-            }
-
-        result = SandboxResult.model_validate(execution["result"])
-        with WorkspaceStore(data_dir) as store:
-            artifacts = store.register_run_files(
-                workspace_id,
-                Path(execution["run_dir"]),
-                [
-                    (Path(output.path), output.kind)
-                    for output in result.outputs
-                ],
-            )
-
-        return {
-            "status": "ok",
-            "result": result.summary,
-            "artifacts": [
-                {
-                    "artifact_id": artifact.id,
-                    "name": artifact.name,
-                    "kind": artifact.kind,
-                }
-                for artifact in artifacts
-            ],
-        }
+      return {
+        "status": "ok",
+        "result": result.summary,
+        "artifacts": [
+          {
+            "artifact_id": artifact.id,
+            "name": artifact.name,
+            "kind": artifact.kind,
+            "relative_path": artifact.relative_path,
+          }
+          for artifact in artifacts
+        ],
+      }
 
     @tool
     def read_function_doc(function_id: str) -> dict:

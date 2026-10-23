@@ -11,11 +11,19 @@ import uuid
 IMAGE = "corpcom-sandbox:local"
 
 
-def run_python(code: str, *, runs_root: Path | None = None) -> dict:
+def run_python(
+    code: str,
+    *,
+    runs_root: Path | None = None,
+    task_dir: Path | None = None) -> dict:
     base_dir = Path.cwd() / "runs" if runs_root is None else runs_root
     run_dir = base_dir.resolve() / uuid.uuid4().hex
     run_dir.mkdir(parents=True)
     (run_dir / "analysis.py").write_text(code)
+
+    work_dir = run_dir if task_dir is None else task_dir.resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+
     container_name = f"corpcom-{run_dir.name}"
 
     command = [
@@ -30,9 +38,11 @@ def run_python(code: str, *, runs_root: Path | None = None) -> dict:
         "--read-only",
         "--tmpfs", "/tmp:rw,nosuid,size=64m",
         "--user", f"{os.getuid()}:{os.getgid()}",
-        "--mount", f"type=bind,src={run_dir},dst=/workspace",
+        "--mount", f"type=bind,src={run_dir},dst=/execution",
+        "--mount", f"type=bind,src={work_dir},dst=/workspace",
+        "--workdir", "/workspace",
         IMAGE,
-        "python", "/workspace/analysis.py",
+        "python", "/execution/analysis.py",
     ]
     try:
         completed = subprocess.run(

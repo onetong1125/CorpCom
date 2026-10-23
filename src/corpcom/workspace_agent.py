@@ -75,7 +75,12 @@ def ask_workspace(
             for item in detail.threads if item.id != thread_id
         ],
         "files": [
-            {"id": item.id, "name": item.name, "kind": item.kind}
+            {
+                "id": item.id,
+                "name": item.name,
+                "kind": item.kind,
+                "relative_path": item.relative_path,
+            }
             for item in detail.artifacts
         ],
     }

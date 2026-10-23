@@ -290,6 +290,82 @@ class WorkspaceStore:
 
     return artifacts
 
+  def archive_run_files(
+      self, workspace_id: str, run_dir: Path,
+      outputs: list[tuple[Path, str]], *, archive_path: Path,
+  ) -> list[ArtifactFile]:
+    """Copy selected outputs into a new task directory and index one batch."""
+    self.get_workspace(workspace_id)
+    workspace_root = self.root / "workspaces" / workspace_id
+    run_dir = run_dir.resolve(strict=True)
+    if run_dir.parent != workspace_root / ".runs":
+      raise ValueError("run directory must belong to this workspace")
+
+    if (
+        archive_path.is_absolute()
+        or not archive_path.parts
+        or ".." in archive_path.parts
+    ):
+      raise ValueError("archive path must be a non-empty relative task path")
+
+    tasks_root = workspace_root / "tasks"
+    directory = (tasks_root / archive_path).resolve()
+    if directory == tasks_root or not directory.is_relative_to(tasks_root):
+      raise ValueError(
+          "archive path must stay within the workspace tasks directory"
+      )
+
+    selected = []
+    seen = set()
+    for output_path, kind in outputs:
+      _require_text(kind=kind)
+      if output_path.is_absolute():
+        raise ValueError("output path must be relative to the run directory")
+
+      source = (run_dir / output_path).resolve(strict=True)
+      if not source.is_relative_to(run_dir):
+        raise ValueError("output path must stay within the run directory")
+      if not source.is_file():
+        raise ValueError(f"output must be a file: {source}")
+      if source in seen:
+        raise ValueError(f"duplicate output file: {output_path}")
+
+      seen.add(source)
+      selected.append((source, kind))
+
+    if not selected:
+      return []
+
+    # Create exclusively, so cleanup can only remove this batch's directory.
+    directory.mkdir(parents=True)
+    artifacts = []
+    try:
+      with self.db:
+        for source, kind in selected:
+          destination = directory / source.relative_to(run_dir)
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copyfile(source, destination)
+
+          artifact_id = uuid4().hex
+          self.db.execute(
+              """INSERT INTO artifacts
+                     (id, workspace_id, name, kind, relative_path)
+                 VALUES (?, ?, ?, ?, ?)""",
+              (
+                artifact_id, workspace_id, destination.name, kind,
+                destination.relative_to(self.root).as_posix(),
+              ),
+          )
+          artifacts.append(self.get_file(workspace_id, artifact_id))
+
+        self._touch(workspace_id)
+    except (OSError, sqlite3.Error):
+      # SQLite rolls back rows; remove this batch's copies and propagate the error.
+      shutil.rmtree(directory)
+      raise
+
+    return artifacts
+
   def get_file(self, workspace_id: str, artifact_id: str) -> ArtifactFile:
     """Check ownership and return file metadata and an absolute path, without reading contents."""
     row = self.db.execute(
