@@ -20,13 +20,19 @@ logger = logging.getLogger(__name__)
 class ToolLogHandler(BaseCallbackHandler):
   def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
     logger.info(
-        "工具开始 name=%s run_id=%s",
+        "工具开始 name=%s run_id=%s input=%s",
         serialized["name"],
         run_id,
+        input_str,
     )
 
   def on_tool_end(self, output, *, run_id, **kwargs):
-    logger.info("工具返回 run_id=%s", run_id)
+    logger.info(
+        "工具返回 name=%s run_id=%s output=%s",
+        kwargs["name"],
+        run_id,
+        output,
+    )
 
   def on_tool_error(self, error, *, run_id, **kwargs):
     logger.error("工具异常 run_id=%s error=%s", run_id, error)
