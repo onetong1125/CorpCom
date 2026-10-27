@@ -36,8 +36,8 @@ class WorkspaceCreate(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     title: RequiredText
-    goal: RequiredText
-    initial_hypothesis: RequiredText
+    goal: str = ""
+    initial_hypothesis: str = ""
     scope: str = ""
     observation_period: str = ""
     preferences: dict[str, JsonValue] = Field(default_factory=dict)

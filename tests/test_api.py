@@ -109,13 +109,30 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get(self.thread_url).json()["messages"], [])
         self.assertEqual(self.client.get("/api/workspaces/missing").status_code, 404)
 
+    def test_workspace_goal_and_hypothesis_are_optional(self):
+        for body in (
+            {"title": "只填写标题"},
+            {"title": "留空字段", "goal": "", "initial_hypothesis": ""},
+            {"title": "只有目标", "goal": "检验现金流"},
+            {"title": "只有假设", "initial_hypothesis": "现金流稳定"},
+        ):
+            with self.subTest(body=body):
+                response = self.client.post("/api/workspaces", json=body)
+                self.assertEqual(response.status_code, 201, response.text)
+                created = response.json()
+                saved = self.client.get(f"/api/workspaces/{created['id']}").json()
+                for field in ("goal", "initial_hypothesis"):
+                    self.assertEqual(created[field], body.get(field, ""))
+                    self.assertEqual(saved[field], body.get(field, ""))
+
     def test_invalid_http_inputs_do_not_write_records(self):
         before = self.client.get(self.url).json()
         for path, body in (
             (self.url + "/threads", {"title": "  "}),
             (self.thread_url + "/messages", {"content": "\n"}),
             (self.thread_url + "/messages", {"content": "伪造回答", "role": "assistant"}),
-            ("/api/workspaces", {"title": "缺字段"}),
+            ("/api/workspaces", {}),
+            ("/api/workspaces", {"title": "  "}),
         ):
             with self.subTest(path=path, body=body):
                 self.assertEqual(self.client.post(path, json=body).status_code, 422)

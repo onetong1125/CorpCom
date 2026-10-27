@@ -118,7 +118,7 @@ class WorkspaceStore:
       initial_hypothesis: str, preferences: dict[str, JsonValue],
   ) -> Workspace:
     """Create research with free-text scope and period, without fixed companies or metrics."""
-    _require_text(title=title, goal=goal, initial_hypothesis=initial_hypothesis)
+    _require_text(title=title)
     workspace_id = uuid4().hex
     # Commit on success or roll back on error; later processes can read committed rows.
     with self.db:

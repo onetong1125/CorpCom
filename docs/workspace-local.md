@@ -12,7 +12,7 @@ data/
     files/<artifact_id>/<原文件名>
 ```
 
-默认使用服务启动目录下的 `data/`，可通过 `CORPCOM_DATA_DIR` 指定已有数据目录。停止服务后，备份需要同时保留 corpcom.db、checkpoints.sqlite 和文件目录。现有 Docker PTC 的 `runs/` 仍是独立目录，尚未自动归档到 Workspace。
+默认使用服务启动目录下的 `data/`，可通过 `CORPCOM_DATA_DIR` 指定已有数据目录。停止服务后，备份需要同时保留 corpcom.db、checkpoints.sqlite 和文件目录。Workspace 的 `execute_python` 使用 `workspaces/<workspace_id>/.runs/<执行编号>/`，将声明的产物复制到 `workspaces/<workspace_id>/tasks/<任务路径与版本>/` 并登记索引；独立 PTC 命令仍使用根目录 `runs/`。
 
 每个研究保存目标、自由文本范围、观察周期、初始假设与偏好。偏好更新整体替换原 JSON 对象，传 `{}` 可清空；尚无偏好修改历史或自动提取。新会话拥有独立消息列表，并共用所属 Workspace 的目标、偏好与文件。
 
@@ -35,7 +35,7 @@ uv run python -m unittest discover -s tests -v
 - `tests/test_workspace_agent.py` 使用替身模型运行真实框架循环，覆盖多轮上下文、SQLite 重开恢复、旧历史仅导入一次、不同 thread 的 checkpoint 隔离、工具结果落盘、可预期工具错误后的续聊、跨 Workspace 归属检查、非预期异常传播、模型调用上限和空回答。
 - `tests/test_api.py` 验收 HTTP 合同、偏好 JSON 类型与数值校验、文件上传下载、应用重建后的恢复、模型错误、并发限制和 CORS。
 
-自动测试中的模型为替身；真实模型的 HTTP 验收记录见 [后端接口文档](backend-api.md#已验证)。当前只保存初始假设，尚无假设修订版本、自动报告、Run 管理或调度。
+自动测试中的模型为替身；真实模型的 HTTP 验收记录见 [后端接口文档](backend-api.md#已验证)。Agent 已可通过 Python 工具生成并登记报告产物，当前只保存初始假设，尚无正式假设修订版本或调度。执行协调器、流式、上下文和记忆的计划见 [开发路线与进度](roadmap.md)，不以业务 Run 管理为前置条件。
 
 ## 代码中的数据对象
 
@@ -73,4 +73,4 @@ uv run python -m unittest discover -s tests -v
 
 业务库与 checkpoint 数据库之间没有原子事务。当前支持已完成轮次的历史恢复，不保证进程中途退出后的自动恢复，也未实现请求去重或最终回答的跨库幂等同步。
 
-目前只讨论已有资料，不自动获取新财务数据或生成正式报告文件；文件读取仅支持 UTF-8 文本，未对长文件自动摘要。经营数据与 `execute_python` 接入仍在后续批次。
+Agent 工具已包含 `execute_python` 与按需查询数据函数契约的 `read_function_doc`，可使用已接入的数据函数取数并保存研究产物。文件读取仍仅支持 UTF-8 文本，未对长文件自动摘要。下一步的 Jinja2 模板、YAML 配置、运行时注入、上下文预算及研究记忆尚待实现，具体范围见 [当前路线](roadmap.md)。

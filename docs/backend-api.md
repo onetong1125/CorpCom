@@ -52,7 +52,7 @@ curl -X POST http://127.0.0.1:8000/api/workspaces \
   -d '{"title":"经营韧性研究","goal":"持续检验经营韧性","initial_hypothesis":"现金流能够持续覆盖经营投入","scope":"单家公司跟踪","preferences":{"报告语言":"中文"}}'
 ```
 
-`title`、`goal`、`initial_hypothesis` 必填且不能全为空白；`scope`、`observation_period` 默认空字符串，`preferences` 默认空对象。返回结果里的 `id` 用作 Workspace ID。
+`title` 必填且不能全为空白；`goal`、`initial_hypothesis`、`scope`、`observation_period` 选填，省略时默认空字符串，`preferences` 默认空对象。返回结果里的 `id` 用作 Workspace ID。
 
 ```bash
 workspace_id="替换为 Workspace ID"

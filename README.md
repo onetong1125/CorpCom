@@ -2,7 +2,9 @@
 
 围绕投资假设持续积累研究的 Python Agent 项目：一个研究目标对应一个 Workspace，保存会话、偏好、证据和报告，并支持后续更新。
 
-当前已跑通沪深 A 股股价对比的普通工具调用与 Docker PTC，并实现 Workspace、多会话消息、文件的本地持久化及基于 Workspace 的模型对话。后端 HTTP 接口已支持研究管理、对话和文件上传下载；经营研究报告、新闻更新、定时任务及前端尚未实现。首个已确认案例与设计见 [持续研究设计](docs/research-workspace.md)；经营数据接口的实测与复跑方式见 [验证记录](docs/financial-data-validation.md)。
+截至 2026-10-27，已实现 Workspace、多会话与文件持久化、模型对话、Docker PTC，以及研究报告/数据/代码产物归档。Vue 3 前端已完成（用户确认），使用方式见 [前端说明](frontend/README.md)。当前消息接口仍只返回最终答复。
+
+下一阶段按“执行协调器与并发控制 → 流式响应 → 提示词与上下文管理 → 最小记忆 → 全流程验收”推进，Multi-agent 排到 11 月。月底交付范围、每日 5 小时的排期、验收标准与待定事项统一维护在 [开发路线与进度](docs/roadmap.md)。首个研究案例与产品设计见 [持续研究设计](docs/research-workspace.md)；经营数据接口实测与复跑方式见 [验证记录](docs/financial-data-validation.md)。
 
 ## 启动后端
 
