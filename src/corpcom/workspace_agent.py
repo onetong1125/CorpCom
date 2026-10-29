@@ -66,6 +66,14 @@ def ask_workspace(
         thread_id,
     )
     detail = store.get_workspace_detail(workspace_id)
+    # Initialize once per workspace, including history in sibling conversations.
+    initialize_research = (
+        not any(
+            value.strip() if isinstance(value, str) else value
+            for value in detail.info.model_dump().values()
+        )
+        and not store.has_user_messages(workspace_id)
+    )
     user_message = store.add_message(workspace_id, thread_id, "user", question)
 
     # Refresh workspace metadata and material indexes on every turn.
@@ -86,6 +94,17 @@ def ask_workspace(
             for item in detail.artifacts
         ],
     }
+    research_instruction = (
+        "这是整个 Workspace 的第一条用户消息，且研究信息全部为空。"
+        "请先根据本条用户消息初始化研究信息：整理具体的研究目标和范围，"
+        "从研究问题形成可验证的初始假设，并注明这是待验证假设。"
+        "观察周期和用户偏好仅从消息中提取有依据的内容，未提供时保持为空。"
+        "先调用 update_research 保存这些信息，再继续处理用户的研究请求。"
+        "如果消息只有问候等内容、没有研究主题，不编造研究信息，先询问研究目标。"
+        if initialize_research else
+        "用户明确要求修改或清空研究信息时，调用 update_research，仅提交要修改的字段。"
+        "未填写的信息保持为空，不自行补全；分析结论不自动改写用户的初始假设。"
+    )
     agent = create_agent(
         model,
         tools=create_workspace_tools(store.root, workspace_id),
@@ -93,8 +112,8 @@ def ask_workspace(
             "你是持续研究助手。回答时遵循当前 Workspace 的目标与用户偏好，"
             "将初始假设视为待验证判断。"
             "目标、初始假设、范围、观察周期和偏好保存在工作区的 research.json 中。"
-            "用户明确要求修改或清空这些信息时，调用 update_research，仅提交要修改的字段。"
-            "未填写的信息保持为空，不自行补全；分析结论不自动改写用户的初始假设。"
+            + research_instruction
+            + "\n"
             "工具成功后才能说明已保存，本轮后续回答以工具返回的新状态为准。"
             "当问题需要旧会话或文件内容时，按索引调用工具读取；不要凭索引猜测内容。"
             "已有研究资料的读取限定在当前 Workspace。"

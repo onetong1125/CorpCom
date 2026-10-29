@@ -54,13 +54,19 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
 
     @tool
     def update_research(changes: WorkspaceResearchInfo) -> dict:
-        """Save user-requested research changes to this workspace's research.json.
+        """Save research changes to this workspace's research.json.
 
-        Supply only fields the user wants changed: goal, initial_hypothesis,
+        Use for explicit user changes or first-message initialization instructed
+        by the system. During initialization, derive the goal, scope and a testable
+        hypothesis from the user's research question; extract only stated periods
+        and preferences. Otherwise, change only what the user requests.
+
+        Supply only fields to initialize or update: goal, initial_hypothesis,
         scope, observation_period, preferences. Omitted fields are preserved.
         Empty strings clear text fields. Preferences replace the entire object;
         preserve existing keys when adding a preference, or use {} to clear all.
-        Do not infer user preferences or change a hypothesis from analysis alone.
+        Do not infer user preferences. Outside first-message initialization,
+        do not change a hypothesis from analysis alone.
         Returns all saved research fields; use these values after an update.
         """
         with WorkspaceStore(data_dir) as store:

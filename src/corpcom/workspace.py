@@ -199,6 +199,14 @@ class WorkspaceStore:
     )]
     return ThreadDetail(**thread.model_dump(), messages=messages)
 
+  def has_user_messages(self, workspace_id: str) -> bool:
+    """Check user-message history across all conversations in this workspace."""
+    return self.db.execute(
+        """SELECT 1 FROM messages JOIN threads ON threads.id = messages.thread_id
+           WHERE threads.workspace_id = ? AND messages.role = 'user' LIMIT 1""",
+        (workspace_id,),
+    ).fetchone() is not None
+
   def add_message(self, workspace_id: str, thread_id: str, role: str,
       content: str) -> Message:
     """Save supplied message text without calling a model or generating a reply."""

@@ -17,6 +17,7 @@ from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import Field
 
 from corpcom.workspace import WorkspaceStore
+from corpcom.workspace_models import WorkspaceResearchInfo
 from corpcom.workspace_agent import ask_workspace
 
 
@@ -48,6 +49,78 @@ class WorkspaceAgentTests(unittest.TestCase):
             self.thread = store.create_thread(self.workspace.id, "连续讨论")
         # Give each test an independent checkpoint store.
         self.checkpointer = InMemorySaver()
+
+    def test_first_workspace_message_initializes_empty_research_and_persists_it(self):
+        generated = {
+            "goal": "比较茅台与五粮液的经营现金流质量",
+            "scope": "贵州茅台、五粮液",
+            "initial_hypothesis": "待验证假设：两家公司的现金流质量存在差异",
+            "observation_period": "2023—2025 年度",
+            "preferences": {"报告形式": "简短"},
+        }
+        model = ScriptedModel(responses=[
+            AIMessage(content="", tool_calls=[{
+                "id": "initialize-research", "name": "update_research",
+                "args": {"changes": generated},
+            }]),
+            AIMessage(content="已保存研究信息，接下来核对两家公司年报。"),
+        ])
+        with WorkspaceStore(self.data) as store:
+            # History in another workspace and empty sibling threads do not block initialization.
+            store.add_message(self.workspace.id, self.thread.id, "user", "其他研究的历史")
+            empty = store.create_workspace("新研究", goal=" \n", scope="\t")
+            store.create_thread(empty.id, "尚未开始的会话")
+            thread = store.create_thread(empty.id, "首次研究")
+            ask_workspace(
+                store, model, empty.id, thread.id,
+                "比较茅台与五粮液2023—2025年度的经营现金流质量，报告简短些。",
+                self.checkpointer,
+            )
+        self.assertIn("这是整个 Workspace 的第一条用户消息", model.requests[0][0].content)
+        result = next(message for message in model.requests[1] if message.type == "tool")
+        self.assertEqual(json.loads(result.content), generated)
+        with WorkspaceStore(self.data) as store:
+            self.assertEqual(store.get_workspace(empty.id).info.model_dump(), generated)
+            path = self.data / "workspaces" / empty.id / "research.json"
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), generated)
+            next_thread = store.create_thread(empty.id, "继续研究")
+            next_model = ScriptedModel(responses=[AIMessage(content="继续核对年报。")])
+            ask_workspace(store, next_model, empty.id, next_thread.id, "继续", self.checkpointer)
+        prompt = next_model.requests[0][0].content
+        self.assertNotIn("这是整个 Workspace 的第一条用户消息", prompt)
+        context = json.loads(prompt.split("当前 Workspace 的已保存研究状态：\n", 1)[1])
+        for key, value in generated.items():
+            self.assertEqual(context[key], value)
+
+    def test_first_message_does_not_initialize_partially_filled_research(self):
+        for values in (
+            {"goal": "已有目标"}, {"scope": "白酒行业"},
+            {"initial_hypothesis": "已有假设"}, {"observation_period": "未来一年"},
+            {"preferences": {"报告语言": "中文"}},
+        ):
+            with self.subTest(values=values), WorkspaceStore(self.data) as store:
+                workspace = store.create_workspace("已填写研究", **values)
+                thread = store.create_thread(workspace.id, "首次会话")
+                model = ScriptedModel(responses=[AIMessage(content="继续现有研究。")])
+                ask_workspace(store, model, workspace.id, thread.id,
+                              "分析现金流", self.checkpointer)
+                self.assertNotIn("这是整个 Workspace 的第一条用户消息", model.requests[0][0].content)
+                self.assertEqual(store.get_workspace(workspace.id).info, workspace.info)
+
+    def test_empty_info_is_not_initialized_after_a_prior_workspace_message(self):
+        with WorkspaceStore(self.data) as store:
+            workspace = store.create_workspace("空研究")
+            first = store.create_thread(workspace.id, "旧会话")
+            # A saved user message counts even if its model call did not finish.
+            store.add_message(workspace.id, first.id, "user", "之前的问题")
+            second = store.create_thread(workspace.id, "新会话")
+            for thread in (first, second):
+                with self.subTest(thread=thread.id):
+                    model = ScriptedModel(responses=[AIMessage(content="继续讨论。")])
+                    ask_workspace(store, model, workspace.id, thread.id,
+                                  "比较两家公司现金流", self.checkpointer)
+                    self.assertNotIn("这是整个 Workspace 的第一条用户消息", model.requests[0][0].content)
+                    self.assertEqual(store.get_workspace(workspace.id).info, WorkspaceResearchInfo())
 
     def test_agent_updates_research_and_new_thread_reads_saved_context(self):
         model = ScriptedModel(responses=[
