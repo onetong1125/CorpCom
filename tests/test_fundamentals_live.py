@@ -1,6 +1,7 @@
 import json
 import os
 import unittest
+from decimal import Decimal
 
 from corpcom.fundamentals import get_annual_financials
 
@@ -56,14 +57,15 @@ class FundamentalsLiveTests(unittest.TestCase):
         self.assertEqual(result["amount_unit"], "yuan")
         self.assertEqual(
           result["period_basis"],
-          "annual cumulative, consolidated",
+          "annual, consolidated",
         )
         self.assertFalse(result["first_publication_verified"])
-        self.assertEqual(len(result["statements"]), 4)
+        self.assertEqual(len(result["statements"]), 6)
 
         actual = {
           (entry["statement"], entry["period_end"]): entry["amounts_yuan"]
           for entry in result["statements"]
+          if entry["statement"] != "资产负债表"
         }
         self.assertEqual(actual, baseline)
 
@@ -80,6 +82,28 @@ class FundamentalsLiveTests(unittest.TestCase):
             "https://vip.stock.finance.sina.com.cn/corp/go.php/"
             f"vFD_FinanceSummary/stockid/{symbol[2:]}.phtml",
           )
+          if entry["statement"] == "资产负债表":
+            self.assertEqual(entry["period_basis"], "period-end balance")
+            self.assertEqual(
+                set(entry["amounts_yuan"]),
+                {
+                  "应收账款",
+                  "存货",
+                  "资产总计",
+                  "负债合计",
+                  "所有者权益(或股东权益)合计",
+                },
+            )
+            amounts = {
+              field: Decimal(value)
+              for field, value in entry["amounts_yuan"].items()
+            }
+            self.assertEqual(
+                amounts["资产总计"],
+                amounts["负债合计"] + amounts["所有者权益(或股东权益)合计"],
+            )
+          else:
+            self.assertEqual(entry["period_basis"], "annual cumulative")
 
         encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
         self.assertEqual(json.loads(encoded), result)

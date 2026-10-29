@@ -10,10 +10,10 @@
 
 ```bash
 uv sync
-uv run uvicorn corpcom.api:create_app --factory --host 127.0.0.1 --port 8000
+uv run uvicorn corpcom.api:create_app --factory --host 127.0.0.1 --port 8001
 ```
 
-打开 [接口调试页面](http://127.0.0.1:8000/docs) 创建 Workspace、会话并发送消息。后端沿用本机 `.env` 模型配置和 `data/` 存储，前端只需调用 HTTP 接口。完整接口、错误响应和前端示例见 [后端接口文档](docs/backend-api.md)。
+打开 [接口调试页面](http://127.0.0.1:8001/docs) 创建 Workspace、会话并发送消息。后端沿用本机 `.env` 模型配置和 `data/` 存储，前端只需调用 HTTP 接口。完整接口、错误响应和前端示例见 [后端接口文档](docs/backend-api.md)。
 
 ## Workspace 本地验收
 

@@ -7,12 +7,12 @@ import akshare as ak
 
 
 def get_annual_financials(symbol: str, years: list[int]) -> dict:
-  """Fetch annual consolidated revenue, parent-attributable profit, and operating cash flow for a Shanghai/Shenzhen stock.
+  """Fetch selected annual consolidated income, cash-flow, and balance-sheet metrics for a Shanghai/Shenzhen stock.
 
   Args:
       symbol: Exchange-prefixed stock code, such as "sh600519" or "sz000858".
       years: Non-empty list of distinct integer years, such as [2023, 2024].
-          Each year selects the annual reporting period ending December 31.
+          Each year selects the reporting period ending December 31.
 
   Returns:
       A JSON-serializable dict containing:
@@ -21,30 +21,35 @@ def get_annual_financials(symbol: str, years: list[int]) -> dict:
       - retrieved_at: UTC retrieval start time as an ISO datetime string.
       - currency: "CNY".
       - amount_unit: "yuan".
-      - period_basis: "annual cumulative, consolidated".
+      - period_basis: "annual, consolidated".
       - first_publication_verified: Always False.
       - statements: A list of statement records.
 
       Each statement record contains:
-      - statement: "利润表" or "现金流量表".
+      - statement: "利润表", "现金流量表", or "资产负债表".
       - period_end: Reporting period end as "YYYY-MM-DD".
+      - period_basis: "annual cumulative" for income and cash flow,
+          or "period-end balance" for the balance sheet.
       - amounts_yuan: A dict of decimal strings with two fractional digits.
-          Profit statements contain "营业收入" and
-          "归属于母公司所有者的净利润".
-          Cash flow statements contain "经营活动产生的现金流量净额".
+          Income: "营业收入", "归属于母公司所有者的净利润".
+          Cash flow: "经营活动产生的现金流量净额".
+          Balance sheet: "应收账款", "存货", "资产总计", "负债合计",
+          "所有者权益(或股东权益)合计".
       - source_publish_date, source_updated_at: Unmodified upstream date values.
       - source_url: The source page URL.
 
       Records are grouped by statement, with years ascending within each group.
-      The result contains only these three metrics, not complete statements.
+      Only the listed metrics are returned, not complete financial statements.
       Use Decimal for monetary calculations and convert it to str for JSON.
 
   Notes:
-      Amounts cover the full year on a consolidated basis.
+      Income and cash-flow amounts cover the full year.
+      Balance-sheet amounts are balances at December 31.
+      All records use the consolidated reporting scope.
       Upstream dates are not verified first-publication dates, and historical
       values may have been revised. This result does not establish which data
       was available at a historical point in time.
-      The function fetches data but does not calculate growth or write files.
+      The function fetches data but does not calculate ratios or write files.
       Requests have no function-level timeout.
 
   Raises:
@@ -88,12 +93,27 @@ def get_annual_financials(symbol: str, years: list[int]) -> dict:
       stock=symbol,
       symbol="现金流量表",
   )
+  balance = ak.stock_financial_report_sina(
+      stock=symbol,
+      symbol="资产负债表",
+  )
 
   statements = []
 
   for statement, frame, fields in (
       ("利润表", income, ("营业收入", "归属于母公司所有者的净利润"),),
       ("现金流量表", cash_flow, ("经营活动产生的现金流量净额",)),
+      (
+          "资产负债表",
+          balance,
+          (
+              "应收账款",
+              "存货",
+              "资产总计",
+              "负债合计",
+              "所有者权益(或股东权益)合计",
+          ),
+      ),
   ):
     annual = frame.loc[frame["报告日"].isin(periods)]
 
@@ -127,6 +147,11 @@ def get_annual_financials(symbol: str, years: list[int]) -> dict:
 
       statements.append({
         "statement": statement,
+        "period_basis": (
+          "period-end balance"
+          if statement == "资产负债表"
+          else "annual cumulative"
+        ),
         "period_end": datetime.strptime(
             period, "%Y%m%d"
         ).date().isoformat(),
@@ -147,7 +172,7 @@ def get_annual_financials(symbol: str, years: list[int]) -> dict:
     "akshare_version": ak.__version__,
     "currency": "CNY",
     "amount_unit": "yuan",
-    "period_basis": "annual cumulative, consolidated",
+    "period_basis": "annual, consolidated",
     "first_publication_verified": False,
     "statements": statements,
   }

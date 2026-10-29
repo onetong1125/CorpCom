@@ -9,7 +9,7 @@ from corpcom.fundamentals import get_annual_financials
 years = [2023, 2024]
 companies = []
 
-for symbol in ("sh600519", "sz000858"):
+for symbol in ("sh600519", "sz000858", "sz000568"):
   data = get_annual_financials(symbol, years)
   filename = f"{symbol}-annual-financials.json"
 

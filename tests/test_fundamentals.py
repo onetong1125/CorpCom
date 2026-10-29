@@ -31,11 +31,19 @@ class FundamentalsTests(unittest.TestCase):
       **common,
       "经营活动产生的现金流量净额": ["-5", "20"],
     })
+    balance = pd.DataFrame({
+      **common,
+      "应收账款": ["15", "10"],
+      "存货": ["30", "25"],
+      "资产总计": ["200", "180"],
+      "负债合计": ["80", "70"],
+      "所有者权益(或股东权益)合计": ["120", "110"],
+    })
 
     # Replace network access while exercising the real transformation.
     with patch(
       "corpcom.fundamentals.ak.stock_financial_report_sina",
-      side_effect=[income, cash_flow],
+      side_effect=[income, cash_flow, balance],
     ) as fetch:
       before = datetime.now(timezone.utc)
       result = get_annual_financials("sh600519", [2024, 2023])
@@ -44,6 +52,7 @@ class FundamentalsTests(unittest.TestCase):
     self.assertEqual(fetch.call_args_list, [
       call(stock="sh600519", symbol="利润表"),
       call(stock="sh600519", symbol="现金流量表"),
+      call(stock="sh600519", symbol="资产负债表"),
     ])
 
     actual = [
@@ -75,6 +84,28 @@ class FundamentalsTests(unittest.TestCase):
         "2024-12-31",
         {"经营活动产生的现金流量净额": "-5.00"},
       ),
+      (
+        "资产负债表",
+        "2023-12-31",
+        {
+          "应收账款": "10.00",
+          "存货": "25.00",
+          "资产总计": "180.00",
+          "负债合计": "70.00",
+          "所有者权益(或股东权益)合计": "110.00",
+        },
+      ),
+      (
+        "资产负债表",
+        "2024-12-31",
+        {
+          "应收账款": "15.00",
+          "存货": "30.00",
+          "资产总计": "200.00",
+          "负债合计": "80.00",
+          "所有者权益(或股东权益)合计": "120.00",
+        },
+      ),
     ])
 
     self.assertEqual(result["symbol"], "sh600519")
@@ -90,7 +121,18 @@ class FundamentalsTests(unittest.TestCase):
     self.assertEqual(result["akshare_version"], ak.__version__)
     self.assertEqual(
       result["period_basis"],
-      "annual cumulative, consolidated",
+      "annual, consolidated",
+    )
+    self.assertEqual(
+        [entry["period_basis"] for entry in result["statements"]],
+        [
+          "annual cumulative",
+          "annual cumulative",
+          "annual cumulative",
+          "annual cumulative",
+          "period-end balance",
+          "period-end balance",
+        ],
     )
 
     retrieved_at = datetime.fromisoformat(result["retrieved_at"])
@@ -140,6 +182,11 @@ class FundamentalsTests(unittest.TestCase):
       "营业收入": ["100", "120"],
       "归属于母公司所有者的净利润": ["10", "12"],
       "经营活动产生的现金流量净额": ["20", "25"],
+      "应收账款": ["10", "15"],
+      "存货": ["25", "30"],
+      "资产总计": ["180", "200"],
+      "负债合计": ["70", "80"],
+      "所有者权益(或股东权益)合计": ["110", "120"],
     })
     cases = [
       ("missing", [0]),
@@ -147,10 +194,10 @@ class FundamentalsTests(unittest.TestCase):
       ("extra_duplicate", [0, 1, 1]),
     ]
 
-    for index, statement in enumerate(("利润表", "现金流量表")):
+    for index, statement in enumerate(("利润表", "现金流量表", "资产负债表")):
       for case, positions in cases:
         with self.subTest(statement=statement, case=case):
-          frames = [valid.copy(), valid.copy()]
+          frames = [valid.copy(), valid.copy(), valid.copy()]
           frames[index] = valid.iloc[positions].copy()
 
           with patch(
@@ -173,16 +220,21 @@ class FundamentalsTests(unittest.TestCase):
       "营业收入": ["100", "120"],
       "归属于母公司所有者的净利润": ["10", "12"],
       "经营活动产生的现金流量净额": ["20", "25"],
+      "应收账款": ["10", "15"],
+      "存货": ["25", "30"],
+      "资产总计": ["180", "200"],
+      "负债合计": ["70", "80"],
+      "所有者权益(或股东权益)合计": ["110", "120"],
     })
     cases = [
       ("币种", "USD"),
       ("类型", "母公司"),
     ]
 
-    for index, statement in enumerate(("利润表", "现金流量表")):
+    for index, statement in enumerate(("利润表", "现金流量表", "资产负债表")):
       for column, value in cases:
         with self.subTest(statement=statement, column=column):
-          frames = [valid.copy(), valid.copy()]
+          frames = [valid.copy(), valid.copy(), valid.copy()]
           frames[index].loc[0, column] = value
 
           with patch(
@@ -205,11 +257,21 @@ class FundamentalsTests(unittest.TestCase):
       "营业收入": ["100", "120"],
       "归属于母公司所有者的净利润": ["10", "12"],
       "经营活动产生的现金流量净额": ["20", "25"],
+      "应收账款": ["10", "15"],
+      "存货": ["25", "30"],
+      "资产总计": ["180", "200"],
+      "负债合计": ["70", "80"],
+      "所有者权益(或股东权益)合计": ["110", "120"],
     })
     fields = [
       (0, "营业收入"),
       (0, "归属于母公司所有者的净利润"),
       (1, "经营活动产生的现金流量净额"),
+      (2, "应收账款"),
+      (2, "存货"),
+      (2, "资产总计"),
+      (2, "负债合计"),
+      (2, "所有者权益(或股东权益)合计"),
     ]
     cases = [
       ("NaN", ValueError),
@@ -221,7 +283,7 @@ class FundamentalsTests(unittest.TestCase):
     for index, field in fields:
       for value, expected_error in cases:
         with self.subTest(field=field, value=value):
-          frames = [valid.copy(), valid.copy()]
+          frames = [valid.copy(), valid.copy(), valid.copy()]
           frames[index].loc[0, field] = value
 
           with patch(
