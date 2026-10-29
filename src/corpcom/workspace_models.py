@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, JsonValue, PlainSerializer
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, PlainSerializer
 
 
 # Keep datetime attributes in Python and preserve SQLite's UTC millisecond JSON format.
@@ -18,16 +18,24 @@ Timestamp = Annotated[
 ]
 
 
+class WorkspaceResearchInfo(BaseModel):
+    """Shared research.json contents; omitted update fields retain their saved values."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    goal: str = ""
+    scope: str = ""
+    observation_period: str = ""
+    initial_hypothesis: str = ""
+    preferences: dict[str, JsonValue] = Field(default_factory=dict)
+
+
 class Workspace(BaseModel):
     """Research metadata shared across conversations, without loading their contents."""
 
     id: str
     title: str
-    goal: str
-    scope: str
-    observation_period: str
-    initial_hypothesis: str
-    preferences: dict[str, JsonValue] = Field(default_factory=dict)
+    info: WorkspaceResearchInfo
     created_at: Timestamp
     updated_at: Timestamp
 

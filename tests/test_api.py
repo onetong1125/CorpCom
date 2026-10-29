@@ -1,6 +1,7 @@
 """Verify HTTP contracts using real storage and Agent execution with a scripted model."""
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -52,7 +53,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/workspaces").json()[0]["id"], self.workspace["id"])
         updated = self.client.put(self.url + "/preferences", json={"preferences": {"报告形式": "简短"}})
         self.assertEqual(updated.status_code, 200)
-        self.assertEqual(updated.json()["preferences"], {"报告形式": "简短"})
+        self.assertEqual(updated.json()["info"]["preferences"], {"报告形式": "简短"})
         first = self.client.post(self.thread_url + "/messages", json={"content": "先分析什么？"})
         self.assertEqual(first.status_code, 201, first.text)
         self.assertEqual(first.json()["role"], "assistant")
@@ -109,7 +110,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get(self.thread_url).json()["messages"], [])
         self.assertEqual(self.client.get("/api/workspaces/missing").status_code, 404)
 
-    def test_workspace_goal_and_hypothesis_are_optional(self):
+    def test_workspace_research_fields_are_optional(self):
         for body in (
             {"title": "只填写标题"},
             {"title": "留空字段", "goal": "", "initial_hypothesis": ""},
@@ -121,9 +122,36 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 201, response.text)
                 created = response.json()
                 saved = self.client.get(f"/api/workspaces/{created['id']}").json()
-                for field in ("goal", "initial_hypothesis"):
-                    self.assertEqual(created[field], body.get(field, ""))
-                    self.assertEqual(saved[field], body.get(field, ""))
+                for field in ("goal", "initial_hypothesis", "scope", "observation_period"):
+                    self.assertEqual(created["info"][field], body.get(field, ""))
+                    self.assertEqual(saved["info"][field], body.get(field, ""))
+
+    def test_research_updates_preserve_omitted_fields_and_legacy_route(self):
+        updated = self.client.put(self.url + "/research", json={
+            "goal": "新的目标", "initial_hypothesis": "新的假设",
+            "scope": "白酒行业", "observation_period": "未来一年",
+        })
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(updated.json()["info"]["preferences"], self.workspace["info"]["preferences"])
+        updated = self.client.put(self.url + "/preferences", json={
+            "scope": "", "observation_period": "", "preferences": {},
+        })
+        self.assertEqual(updated.status_code, 200, updated.text)
+        saved = updated.json()
+        self.assertEqual(saved["info"]["goal"], "新的目标")
+        self.assertEqual(saved["info"]["initial_hypothesis"], "新的假设")
+        self.assertEqual(saved["info"]["scope"], "")
+        self.assertEqual(saved["info"]["observation_period"], "")
+        self.assertEqual(saved["info"]["preferences"], {})
+        path = self.root / "data" / "workspaces" / saved["id"] / "research.json"
+        for key, value in json.loads(path.read_text(encoding="utf-8")).items():
+            self.assertEqual(saved["info"][key], value)
+        self.assertEqual(self.client.get("/api/workspaces").json()[0]["goal"], "新的目标")
+        for body in ({"goal": None}, {"scope": 12}, {"title": "不支持"}, {"preferences": None}):
+            response = self.client.put(self.url + "/research", json=body)
+            self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.client.get(self.url).json()["info"]["goal"], "新的目标")
+        self.assertEqual(self.client.put("/api/workspaces/missing/research", json={"goal": "新目标"}).status_code, 404)
 
     def test_invalid_http_inputs_do_not_write_records(self):
         before = self.client.get(self.url).json()

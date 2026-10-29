@@ -17,7 +17,7 @@ uv run uvicorn corpcom.api:create_app --factory --host 127.0.0.1 --port 8001
 
 ## Workspace 本地验收
 
-Workspace 的创建、会话、偏好和文件操作统一使用 [后端 HTTP 接口](docs/backend-api.md)。存储接口不需要模型密钥、Docker 或网络；发送消息需要配置模型。
+Workspace 的创建、会话、研究信息和文件操作统一使用 [后端 HTTP 接口](docs/backend-api.md)。存储接口不需要模型密钥、Docker 或网络；发送消息需要配置模型。
 
 ```bash
 uv run python -m unittest discover -s tests -v

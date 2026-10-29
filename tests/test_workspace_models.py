@@ -9,7 +9,7 @@ import unittest
 from corpcom.workspace import WorkspaceStore
 from corpcom.workspace_models import (
     Artifact, ArtifactFile, Message, Thread, ThreadDetail,
-    Workspace, WorkspaceDetail, WorkspaceSummary,
+    Workspace, WorkspaceDetail, WorkspaceResearchInfo, WorkspaceSummary,
 )
 
 
@@ -37,8 +37,10 @@ class WorkspaceModelTests(unittest.TestCase):
                 # Basic metadata stays independent of potentially large related collections.
                 restored = store.get_workspace(workspace.id)
                 self.assertIs(type(restored), Workspace)
+                self.assertIs(type(restored.info), WorkspaceResearchInfo)
+                self.assertNotIn("goal", restored.model_dump())
                 self.assertNotIn("threads", restored.model_dump())
-                self.assertEqual(restored.preferences["报告语言"], "中文")
+                self.assertEqual(restored.info.preferences["报告语言"], "中文")
                 self.assertIsInstance(restored.created_at, datetime)
                 self.assertIsNotNone(restored.created_at.tzinfo)
                 self.assertIsInstance(store.list_workspaces()[0], WorkspaceSummary)

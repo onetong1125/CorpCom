@@ -19,12 +19,12 @@ from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededE
 from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from openai import APIError
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field
 
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore
 from corpcom.workspace_agent import ask_workspace
 from corpcom.workspace_models import (
-    Artifact, Message, Thread, ThreadDetail, Workspace, WorkspaceDetail, WorkspaceSummary,
+    Artifact, Message, Thread, ThreadDetail, Workspace, WorkspaceDetail, WorkspaceResearchInfo, WorkspaceSummary,
 )
 
 
@@ -32,21 +32,8 @@ logger = logging.getLogger(__name__)
 RequiredText = Annotated[str, Field(min_length=1, pattern=r"\S")]
 
 
-class WorkspaceCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-
+class WorkspaceCreate(WorkspaceResearchInfo):
     title: RequiredText
-    goal: str = ""
-    initial_hypothesis: str = ""
-    scope: str = ""
-    observation_period: str = ""
-    preferences: dict[str, JsonValue] = Field(default_factory=dict)
-
-
-class PreferencesUpdate(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-
-    preferences: dict[str, JsonValue]
 
 
 class ThreadCreate(BaseModel):
@@ -145,9 +132,10 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             return store.get_workspace_detail(workspace_id)
 
     @app.put("/api/workspaces/{workspace_id}/preferences")
-    def replace_preferences(workspace_id: str, body: PreferencesUpdate) -> Workspace:
+    @app.put("/api/workspaces/{workspace_id}/research")
+    def update_research(workspace_id: str, body: WorkspaceResearchInfo) -> Workspace:
         with WorkspaceStore(root) as store:
-            return store.set_preferences(workspace_id, body.preferences)
+            return store.update_research(workspace_id, body)
 
     @app.post("/api/workspaces/{workspace_id}/threads", status_code=201)
     def create_thread(workspace_id: str, body: ThreadCreate) -> Thread:

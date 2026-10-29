@@ -200,8 +200,15 @@ async function openModal(kind) {
     observation_period: "",
     preferences: "{}",
   });
-  if (kind === "details")
-    form.preferences = JSON.stringify(workspace.value.preferences, null, 2);
+  if (kind === "details") {
+    Object.assign(form, {
+      goal: workspace.value.info.goal,
+      initial_hypothesis: workspace.value.info.initial_hypothesis,
+      scope: workspace.value.info.scope,
+      observation_period: workspace.value.info.observation_period,
+      preferences: JSON.stringify(workspace.value.info.preferences, null, 2),
+    });
+  }
   modal.value.showModal();
   await nextTick();
   modal.value.querySelector("input, textarea, button")?.focus();
@@ -258,8 +265,14 @@ async function saveModal() {
       await refreshResearch();
     } else {
       await jsonRequest(
-        `${workspacePath.value}/preferences`,
-        { preferences },
+        `${workspacePath.value}/research`,
+        {
+          goal: form.goal.trim(),
+          initial_hypothesis: form.initial_hypothesis.trim(),
+          scope: form.scope.trim(),
+          observation_period: form.observation_period.trim(),
+          preferences,
+        },
         "PUT",
       );
       completed = true;
@@ -618,22 +631,6 @@ onMounted(initialize);
       </div>
       <form @submit.prevent="saveModal">
         <fieldset :disabled="saving">
-          <div
-            v-if="modalKind === 'details' && workspace"
-            class="research-details"
-          >
-            <dl>
-              <dt>研究目标</dt>
-              <dd>{{ workspace.goal || "未填写" }}</dd>
-              <dt>初始假设</dt>
-              <dd>{{ workspace.initial_hypothesis || "未填写" }}</dd>
-              <dt>研究范围</dt>
-              <dd>{{ workspace.scope || "未填写" }}</dd>
-              <dt>观察周期</dt>
-              <dd>{{ workspace.observation_period || "未填写" }}</dd>
-            </dl>
-          </div>
-
           <template v-if="modalKind === 'workspace' || modalKind === 'thread'"
             ><label
               >标题 <span class="required">*</span
@@ -647,7 +644,7 @@ onMounted(initialize);
                     : '例如：2025 年报增量研究'
                 " /></label
           ></template>
-          <template v-if="modalKind === 'workspace'"
+          <template v-if="modalKind === 'workspace' || modalKind === 'details'"
             ><label
               >研究目标（选填）<textarea
                 v-model="form.goal"
@@ -665,12 +662,12 @@ onMounted(initialize);
             </label>
             <div class="form-row">
               <label
-                >研究范围<input
+                >研究范围（选填）<input
                   v-model="form.scope"
                   name="scope"
                   placeholder="公司、行业或事件" /></label
               ><label
-                >观察周期<input
+                >观察周期（选填）<input
                   v-model="form.observation_period"
                   name="observation_period"
                   placeholder="例如：2023—2025 年度"
@@ -703,7 +700,7 @@ onMounted(initialize);
             取消</button
           ><button class="primary-button" type="submit" :disabled="saving">
             <RefreshCw v-if="saving" class="spin" :size="16" />{{
-              saving ? "保存中…" : modalKind === "details" ? "保存偏好" : "创建"
+              saving ? "保存中…" : modalKind === "details" ? "保存研究信息" : "创建"
             }}
           </button>
         </div>

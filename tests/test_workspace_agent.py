@@ -49,6 +49,44 @@ class WorkspaceAgentTests(unittest.TestCase):
         # Give each test an independent checkpoint store.
         self.checkpointer = InMemorySaver()
 
+    def test_agent_updates_research_and_new_thread_reads_saved_context(self):
+        model = ScriptedModel(responses=[
+            AIMessage(content="", tool_calls=[{
+                "id": "update-research", "name": "update_research",
+                "args": {"changes": {
+                    "goal": "核对现金流质量", "scope": "",
+                    "observation_period": "未来一年",
+                    "preferences": {"报告语言": "中文", "报告形式": "简短"},
+                }},
+            }]),
+            AIMessage(content="已保存研究信息。"),
+        ])
+        with WorkspaceStore(self.data) as store:
+            other = store.create_workspace("另一个研究")
+            ask_workspace(store, model, self.workspace.id, self.thread.id,
+                          "目标改为核对现金流质量，清空范围，观察一年，报告简短且保留中文。",
+                          self.checkpointer)
+            saved = store.get_workspace(self.workspace.id)
+            self.assertEqual(saved.info.goal, "核对现金流质量")
+            self.assertEqual(saved.info.scope, "")
+            self.assertEqual(saved.info.observation_period, "未来一年")
+            self.assertEqual(saved.info.initial_hypothesis, self.workspace.info.initial_hypothesis)
+            self.assertEqual(saved.info.preferences, {"报告语言": "中文", "报告形式": "简短"})
+            self.assertEqual(store.get_workspace(other.id), other)
+        tool_result = next(m for m in model.requests[1] if m.type == "tool")
+        self.assertEqual(json.loads(tool_result.content)["goal"], saved.info.goal)
+        with WorkspaceStore(self.data) as store:
+            second = store.create_thread(self.workspace.id, "新会话")
+            next_model = ScriptedModel(responses=[AIMessage(content="继续核对现金流质量。")])
+            ask_workspace(store, next_model, self.workspace.id, second.id,
+                          "当前研究目标是什么？", self.checkpointer)
+        prompt = next_model.requests[0][0].content
+        context = json.loads(prompt.split("当前 Workspace 的已保存研究状态：\n", 1)[1])
+        self.assertEqual(context["goal"], saved.info.goal)
+        self.assertEqual(context["scope"], "")
+        self.assertEqual(context["initial_hypothesis"], saved.info.initial_hypothesis)
+        self.assertEqual(context["preferences"], saved.info.preferences)
+
     def test_same_thread_retains_both_turns_in_context_and_storage(self):
         first_question = "先分析什么指标？"
         first_answer = "先分析经营现金流，再核对净利润。"

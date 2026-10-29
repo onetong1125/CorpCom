@@ -30,7 +30,8 @@ uv run uvicorn corpcom.api:create_app --factory --host 127.0.0.1 --port 8000
 | POST | `/api/workspaces` | 创建研究，返回 `Workspace`，状态码 201 |
 | GET | `/api/workspaces` | 返回 `WorkspaceSummary[]` |
 | GET | `/api/workspaces/{wid}` | 返回 `WorkspaceDetail`，包含会话和文件索引 |
-| PUT | `/api/workspaces/{wid}/preferences` | `{"preferences": {...}}` 整体替换偏好，返回 `Workspace` |
+| PUT | `/api/workspaces/{wid}/research` | 更新提交的研究字段，返回 `Workspace` |
+| PUT | `/api/workspaces/{wid}/preferences` | 保留的兼容路由，支持相同的五类字段；原 `{"preferences": {...}}` 请求仍整体替换偏好 |
 | POST | `/api/workspaces/{wid}/threads` | `{"title":"首次讨论"}` 创建会话，返回 `Thread`，状态码 201 |
 | GET | `/api/workspaces/{wid}/threads/{tid}` | 返回 `ThreadDetail`，包含按写入顺序排列的消息 |
 | POST | `/api/workspaces/{wid}/threads/{tid}/messages` | `{"content":"继续研究"}` 调用 Agent，返回已保存的助手 `Message`，状态码 201 |
@@ -40,7 +41,7 @@ uv run uvicorn corpcom.api:create_app --factory --host 127.0.0.1 --port 8000
 
 消息接口接收本轮用户文本。当前 thread 尚无 checkpoint 时，后端从业务库导入完整问答历史；已有 checkpoint 时，由框架恢复历史，仅输入本轮用户消息。模型成功回答后，后端将最终回答保存到业务库。前端无需传入历史、角色或模型配置。接口一次返回完整回答，尚未接入流式输出。
 
-`corpcom.db` 保存研究资料及用户、最终助手消息；同一数据目录下的 `checkpoints.sqlite` 保存 Agent 消息状态，包括工具调用和结果。服务通过 lifespan 管理 checkpoint 连接，使用 `workspace_id:thread_id` 标识执行历史。
+`corpcom.db` 保存 Workspace 标识、标题、时间、会话、文件索引及用户、最终助手消息；研究目标、初始假设、范围、观察周期和偏好统一保存于 `workspaces/<wid>/research.json`。同一数据目录下的 `checkpoints.sqlite` 保存 Agent 消息状态，包括工具调用和结果。服务通过 lifespan 管理 checkpoint 连接，使用 `workspace_id:thread_id` 标识执行历史。
 
 ## 从创建研究到连续对话
 
@@ -53,6 +54,16 @@ curl -X POST http://127.0.0.1:8000/api/workspaces \
 ```
 
 `title` 必填且不能全为空白；`goal`、`initial_hypothesis`、`scope`、`observation_period` 选填，省略时默认空字符串，`preferences` 默认空对象。返回结果里的 `id` 用作 Workspace ID。
+
+研究档案表单和对话中的 Agent 工具都可以更新上述五类信息。直接调用接口时，只提交要修改的字段：
+
+```bash
+curl -X PUT http://127.0.0.1:8000/api/workspaces/替换为WorkspaceID/research \
+  -H 'Content-Type: application/json' \
+  -d '{"goal":"核对现金流质量","scope":"","observation_period":"未来一年"}'
+```
+
+未提交的字段保持原值；文本字段传 `""` 清空，不接受 `null`；`preferences` 整体替换，传 `{}` 清空。返回值包含保存后的完整 Workspace，五类研究字段位于 `info` 对象中，例如 `response.info.goal`；创建和详情响应也使用相同结构，列表摘要仍返回顶层 `goal`。创建与更新请求的研究字段仍在顶层。旧 `/preferences` 路径接受相同请求。旧数据库需手动执行一次迁移脚本，存储初始化不自动迁移，命令见 [本地存储](workspace-local.md#数据位置与隔离)。
 
 ```bash
 workspace_id="替换为 Workspace ID"

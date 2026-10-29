@@ -7,11 +7,13 @@ import ArtifactPanel from "../src/components/ArtifactPanel.vue";
 const workspace = {
   id: "w1",
   title: "经营韧性研究",
-  goal: "比较经营现金流",
-  initial_hypothesis: "现金流稳定",
-  scope: "两家公司",
-  observation_period: "2023—2025",
-  preferences: { 报告语言: "中文" },
+  info: {
+    goal: "比较经营现金流",
+    initial_hypothesis: "现金流稳定",
+    scope: "两家公司",
+    observation_period: "2023—2025",
+    preferences: { 报告语言: "中文" },
+  },
   threads: [{ id: "t1", workspace_id: "w1", title: "首次讨论" }],
   artifacts: [],
 };
@@ -55,7 +57,7 @@ beforeEach(() => {
         posted.push({ url, body: JSON.parse(options.body) });
         return postHandler(url, options);
       }
-      if (url === "/api/workspaces") return response([detail]);
+      if (url === "/api/workspaces") return response([{ id: detail.id, title: detail.title, goal: detail.info.goal }]);
       if (url === "/api/workspaces/w1") return response(detail);
       if (url === "/api/workspaces/w1/threads/t1")
         return response({ ...detail.threads[0], messages });
@@ -159,39 +161,53 @@ describe("research workbench", () => {
     expect(wrapper.find('[role="alert"]').exists()).toBe(false);
   });
 
-  it("edits preferences inside the research archive and reloads saved values", async () => {
+  it("edits research fields inside the research archive and reloads saved values", async () => {
     await openApp();
     await wrapper.get(".meta-button").trigger("click");
     expect(wrapper.get("#dialog-title").text()).toBe("研究档案");
-    expect(wrapper.get(".research-details").text()).toContain(workspace.goal);
-    expect(wrapper.get(".research-details").text()).toContain(
-      workspace.observation_period,
+    expect(wrapper.get('textarea[name="goal"]').element.value).toBe(workspace.info.goal);
+    expect(wrapper.get('input[name="observation_period"]').element.value).toBe(
+      workspace.info.observation_period,
     );
     expect(
       JSON.parse(wrapper.get('textarea[name="preferences"]').element.value),
-    ).toEqual(workspace.preferences);
+    ).toEqual(workspace.info.preferences);
     await wrapper.get('textarea[name="preferences"]').setValue("[]");
     await wrapper.get("dialog form").trigger("submit");
     expect(wrapper.get('dialog [role="alert"]').text()).toContain("JSON 对象");
     expect(posted).toHaveLength(0);
     postHandler = async (url, options) => {
-      detail.preferences = JSON.parse(options.body).preferences;
+      Object.assign(detail.info, JSON.parse(options.body));
       return response(detail);
     };
+    await wrapper.get('textarea[name="goal"]').setValue("核对现金流");
+    await wrapper.get('textarea[name="initial_hypothesis"]').setValue("待核实现金流质量");
+    await wrapper.get('input[name="scope"]').setValue("");
+    await wrapper.get('input[name="observation_period"]').setValue("未来一年");
     await wrapper
       .get('textarea[name="preferences"]')
       .setValue('{"报告语言":"中文","关注重点":"现金流"}');
     await wrapper.get("dialog form").trigger("submit");
     await flushPromises();
     expect(posted[0]).toEqual({
-      url: "/api/workspaces/w1/preferences",
-      body: { preferences: { 报告语言: "中文", 关注重点: "现金流" } },
+      url: "/api/workspaces/w1/research",
+      body: {
+        goal: "核对现金流",
+        initial_hypothesis: "待核实现金流质量",
+        scope: "",
+        observation_period: "未来一年",
+        preferences: { 报告语言: "中文", 关注重点: "现金流" },
+      },
     });
     expect(wrapper.get("dialog").element.open).toBe(false);
     await wrapper.get(".meta-button").trigger("click");
     expect(
       JSON.parse(wrapper.get('textarea[name="preferences"]').element.value),
-    ).toEqual(detail.preferences);
+    ).toEqual(detail.info.preferences);
+    expect(wrapper.get('textarea[name="goal"]').element.value).toBe("核对现金流");
+    expect(wrapper.get('textarea[name="initial_hypothesis"]').element.value).toBe("待核实现金流质量");
+    expect(wrapper.get('input[name="scope"]').element.value).toBe("");
+    expect(wrapper.get('input[name="observation_period"]').element.value).toBe("未来一年");
   });
 
   it("closes a successfully created form even if refreshing the new workspace fails", async () => {
@@ -349,7 +365,7 @@ it("leaves an existing empty conversation blank with an enabled composer", async
   ).toBeUndefined();
 });
 
-it("creates a workspace with only a title and leaves goal and hypothesis optional", async () => {
+it("creates a workspace with only a title and leaves all research fields optional", async () => {
   await openApp();
   await wrapper.get(".new-workspace").trigger("click");
   expect(wrapper.get('input[name="title"]').element.required).toBe(true);
@@ -357,14 +373,14 @@ it("creates a workspace with only a title and leaves goal and hypothesis optiona
   expect(
     wrapper.get('textarea[name="initial_hypothesis"]').element.required,
   ).toBe(false);
+  expect(wrapper.get('input[name="scope"]').element.required).toBe(false);
+  expect(wrapper.get('input[name="observation_period"]').element.required).toBe(false);
+  expect(wrapper.get("dialog").text()).toContain("研究范围（选填）");
+  expect(wrapper.get("dialog").text()).toContain("观察周期（选填）");
   await wrapper.get('input[name="title"]').setValue("仅标题的研究");
   postHandler = async (url, options) => {
-    detail = {
-      ...detail,
-      ...JSON.parse(options.body),
-      threads: [],
-      artifacts: [],
-    };
+    const { title, ...info } = JSON.parse(options.body);
+    detail = { ...detail, title, info, threads: [], artifacts: [] };
     return response(detail, 201);
   };
   await wrapper.get("dialog form").trigger("submit");

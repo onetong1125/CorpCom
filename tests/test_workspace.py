@@ -2,12 +2,14 @@
 
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
 
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore
+from corpcom.workspace_models import WorkspaceResearchInfo
 
 
 class WorkspaceStoreTests(unittest.TestCase):
@@ -69,8 +71,8 @@ with WorkspaceStore(Path(sys.argv[1])) as store:
     result = json.loads(completed.stdout)
     restored = result["workspace"]
     for key in ("goal", "scope", "observation_period", "initial_hypothesis"):
-      self.assertEqual(restored[key], getattr(workspace, key))
-    self.assertEqual(restored["preferences"],
+      self.assertEqual(restored["info"][key], getattr(workspace.info, key))
+    self.assertEqual(restored["info"]["preferences"],
                      {"报告形式": "简短", "关注指标": ["现金流"]})
     self.assertEqual([t["id"] for t in restored["threads"]],
                      [first.id, result["second"]["id"]])
@@ -99,7 +101,7 @@ with WorkspaceStore(Path(sys.argv[1])) as store:
     with self.assertRaisesRegex(RecordNotFoundError, "file not found"):
       self.store.get_file(second.id, artifact.id)
     self.store.set_preferences(second.id, {"研究风格": "事件驱动"})
-    self.assertEqual(self.store.get_workspace(first.id).preferences["报告语言"],
+    self.assertEqual(self.store.get_workspace(first.id).info.preferences["报告语言"],
                      "中文")
     other = self.store.get_workspace_detail(second.id)
     self.assertEqual(other.threads, [])
@@ -137,7 +139,80 @@ with WorkspaceStore(Path(sys.argv[1])) as store:
     source.write_text("evidence", encoding="utf-8")
     with self.assertRaisesRegex(RecordNotFoundError, "workspace not found"):
       self.store.import_file("../../outside", source, "file")
-    self.assertFalse((self.data / "workspaces").exists())
+    self.assertEqual([p.name for p in (self.data / "workspaces").iterdir()], [wid])
+
+  def test_research_file_is_the_source_for_details_and_listing(self):
+    workspace = self.create()
+    path = self.data / "workspaces" / workspace.id / "research.json"
+    content = json.loads(path.read_text(encoding="utf-8"))
+    self.assertEqual(set(content), set(WorkspaceResearchInfo.model_fields))
+    self.assertEqual(content["goal"], workspace.info.goal)
+    updated = self.store.update_research(workspace.id, WorkspaceResearchInfo(
+        goal="核对现金流", scope="", observation_period="", preferences={},
+    ))
+    self.assertEqual(updated.info.initial_hypothesis, workspace.info.initial_hypothesis)
+    self.assertEqual(updated.info.scope, "")
+    self.assertEqual(updated.info.observation_period, "")
+    self.assertEqual(updated.info.preferences, {})
+    with WorkspaceStore(self.data) as reopened:
+      self.assertEqual(reopened.get_workspace(workspace.id), updated)
+      self.assertEqual(reopened.list_workspaces()[0].goal, "核对现金流")
+    content = json.loads(path.read_text(encoding="utf-8"))
+    content["goal"] = "文件中的目标"
+    path.write_text(json.dumps(content), encoding="utf-8")
+    self.assertEqual(self.store.get_workspace(workspace.id).info.goal, "文件中的目标")
+    self.assertEqual(self.store.list_workspaces()[0].goal, "文件中的目标")
+    path.unlink()
+    with self.assertRaises(FileNotFoundError):
+      self.store.get_workspace(workspace.id)
+
+  def test_legacy_research_columns_migrate_without_losing_related_records(self):
+    legacy = self.root / "legacy"
+    legacy.mkdir()
+    with sqlite3.connect(legacy / "corpcom.db") as db:
+      db.executescript("""
+        CREATE TABLE workspaces (
+          id TEXT PRIMARY KEY, title TEXT NOT NULL,
+          goal TEXT NOT NULL, scope TEXT NOT NULL,
+          observation_period TEXT NOT NULL, initial_hypothesis TEXT NOT NULL,
+          preferences TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        INSERT INTO workspaces VALUES (
+          'legacy-id', '旧研究', '旧目标', '旧范围', '三个月', '旧假设',
+          '{"报告语言":"中文"}', '2026-10-01T00:00:00.000Z', '2026-10-02T00:00:00.000Z'
+        );
+        CREATE TABLE threads (
+          id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+          title TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        INSERT INTO threads VALUES ('old-thread', 'legacy-id', '旧会话', '2026-10-01T00:00:00.000Z');
+      """)
+    with WorkspaceStore(legacy) as store:
+      # Opening storage no longer migrates a development database implicitly.
+      self.assertIn("goal", {row["name"] for row in store.db.execute("PRAGMA table_info(workspaces)")})
+      self.assertFalse((legacy / "workspaces" / "legacy-id" / "research.json").exists())
+    completed = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parents[1] / "scripts" / "migrate_workspace_research.py"), str(legacy)],
+        capture_output=True, text=True, timeout=10,
+    )
+    self.assertEqual(completed.returncode, 0, completed.stderr)
+    with WorkspaceStore(legacy) as store:
+      saved = store.get_workspace_detail("legacy-id")
+      self.assertEqual(saved.info.goal, "旧目标")
+      self.assertEqual(saved.info.scope, "旧范围")
+      self.assertEqual(saved.info.observation_period, "三个月")
+      self.assertEqual(saved.info.initial_hypothesis, "旧假设")
+      self.assertEqual(saved.info.preferences, {"报告语言": "中文"})
+      self.assertEqual(saved.threads[0].id, "old-thread")
+      self.assertEqual(saved.model_dump(mode="json")["updated_at"], "2026-10-02T00:00:00.000Z")
+      self.assertEqual(
+          {row["name"] for row in store.db.execute("PRAGMA table_info(workspaces)")},
+          {"id", "title", "created_at", "updated_at"},
+      )
+      self.assertEqual(store.db.execute("PRAGMA foreign_key_check").fetchall(), [])
+      store.update_research("legacy-id", WorkspaceResearchInfo(goal="新目标"))
+    with WorkspaceStore(legacy) as store:
+      self.assertEqual(store.get_workspace("legacy-id").info.goal, "新目标")
 
   def test_missing_stored_file_is_an_explicit_error(self):
     """Manual deletion must not leave an apparently readable file in the index."""

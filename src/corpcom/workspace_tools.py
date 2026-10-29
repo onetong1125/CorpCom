@@ -9,6 +9,7 @@ from langchain_core.tools import BaseTool
 
 from corpcom.function_catalog import FUNCTIONS
 from corpcom.workspace import WorkspaceStore
+from corpcom.workspace_models import WorkspaceResearchInfo
 from corpcom.sandbox import run_python
 
 class SandboxOutput(BaseModel):
@@ -50,6 +51,21 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
         with WorkspaceStore(data_dir) as reader:
             file = reader.get_file(workspace_id, artifact_id)
         return {"name": file.name, "content": file.path.read_text(encoding="utf-8")}
+
+    @tool
+    def update_research(changes: WorkspaceResearchInfo) -> dict:
+        """Save user-requested research changes to this workspace's research.json.
+
+        Supply only fields the user wants changed: goal, initial_hypothesis,
+        scope, observation_period, preferences. Omitted fields are preserved.
+        Empty strings clear text fields. Preferences replace the entire object;
+        preserve existing keys when adding a preference, or use {} to clear all.
+        Do not infer user preferences or change a hypothesis from analysis alone.
+        Returns all saved research fields; use these values after an update.
+        """
+        with WorkspaceStore(data_dir) as store:
+            saved = store.update_research(workspace_id, changes)
+        return saved.info.model_dump()
 
     @tool
     def execute_python(code: str, archive_path: str) -> dict:
@@ -158,4 +174,4 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
         }
 
 
-    return [read_thread, read_file, read_function_doc, execute_python]
+    return [read_thread, read_file, update_research, read_function_doc, execute_python]

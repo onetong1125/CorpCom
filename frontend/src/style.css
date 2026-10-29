@@ -961,24 +961,6 @@ small {
   padding-top: 19px;
   margin-top: 16px;
 }
-.research-details {
-  margin-bottom: 20px;
-}
-.research-details dl {
-  margin: 0;
-}
-.research-details dt {
-  font-size: 11px;
-  color: #91a080;
-  margin: 20px 0 8px;
-}
-.research-details dd {
-  margin: 0;
-  line-height: 1.9;
-  font-size: 13px;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
 .markdown {
   font-size: 12px;
   line-height: 1.95;

@@ -71,11 +71,7 @@ def ask_workspace(
     # Refresh workspace metadata and material indexes on every turn.
     context = {
         "title": detail.title,
-        "goal": detail.goal,
-        "scope": detail.scope,
-        "observation_period": detail.observation_period,
-        "initial_hypothesis": detail.initial_hypothesis,
-        "preferences": detail.preferences,
+        **detail.info.model_dump(),
         "other_threads": [
             {"id": item.id, "title": item.title}
             for item in detail.threads if item.id != thread_id
@@ -96,6 +92,10 @@ def ask_workspace(
         system_prompt=(
             "你是持续研究助手。回答时遵循当前 Workspace 的目标与用户偏好，"
             "将初始假设视为待验证判断。"
+            "目标、初始假设、范围、观察周期和偏好保存在工作区的 research.json 中。"
+            "用户明确要求修改或清空这些信息时，调用 update_research，仅提交要修改的字段。"
+            "未填写的信息保持为空，不自行补全；分析结论不自动改写用户的初始假设。"
+            "工具成功后才能说明已保存，本轮后续回答以工具返回的新状态为准。"
             "当问题需要旧会话或文件内容时，按索引调用工具读取；不要凭索引猜测内容。"
             "已有研究资料的读取限定在当前 Workspace。"
             "区分已有证据、用户陈述与推断，不编造来源、数据或投资建议。\n"

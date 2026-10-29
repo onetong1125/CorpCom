@@ -1,4 +1,4 @@
-"""Store research and conversations in SQLite, and imported file copies on disk."""
+"""Store research in workspace JSON, with conversations and file indexes in SQLite."""
 
 import json
 from pathlib import Path
@@ -10,20 +10,15 @@ from pydantic import JsonValue
 
 from corpcom.workspace_models import (
   Artifact, ArtifactFile, Message, Thread, ThreadDetail,
-  Workspace, WorkspaceDetail, WorkspaceSummary,
+  Workspace, WorkspaceDetail, WorkspaceResearchInfo, WorkspaceSummary,
 )
 
 # Threads and files belong to a workspace; messages belong through their thread.
-# Preferences are JSON text. Artifact rows index files; their contents stay on disk.
+# Research fields live in research.json. Artifact rows index files on disk.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS workspaces (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
-    goal TEXT NOT NULL,
-    scope TEXT NOT NULL,
-    observation_period TEXT NOT NULL,
-    initial_hypothesis TEXT NOT NULL,
-    preferences TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -86,15 +81,27 @@ class WorkspaceStore:
     self.db.close()
 
   def get_workspace(self, workspace_id: str) -> Workspace:
-    """Decode a stored row into typed metadata without loading related records."""
+    """Combine workspace identity with research.json without loading related records."""
     row = self.db.execute(
         "SELECT * FROM workspaces WHERE id = ?", (workspace_id,)
     ).fetchone()
     if row is None:
       raise RecordNotFoundError(f"workspace not found: {workspace_id}")
-    workspace = dict(row)
-    workspace["preferences"] = json.loads(workspace["preferences"])
-    return Workspace.model_validate(workspace)
+    path = self.root / "workspaces" / workspace_id / "research.json"
+    research = WorkspaceResearchInfo.model_validate_json(path.read_text(encoding="utf-8"))
+    return Workspace(**dict(row), info=research)
+
+  def _write_research(self, workspace_id: str, research: WorkspaceResearchInfo) -> None:
+    """Replace a complete JSON file while the caller holds SQLite's write lock."""
+    content = json.dumps(research.model_dump(), ensure_ascii=False, allow_nan=False, indent=2)
+    path = self.root / "workspaces" / workspace_id / "research.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    try:
+      temporary.write_text(content + "\n", encoding="utf-8")
+      temporary.replace(path)
+    finally:
+      temporary.unlink(missing_ok=True)
 
   def _thread(self, workspace_id: str, thread_id: str) -> Thread:
     # Check ownership before reading or adding messages, not just the thread ID.
@@ -114,30 +121,31 @@ class WorkspaceStore:
     )
 
   def create_workspace(
-      self, title: str, goal: str, scope: str, observation_period: str,
-      initial_hypothesis: str, preferences: dict[str, JsonValue],
+      self, title: str, goal: str = "", scope: str = "", observation_period: str = "",
+      initial_hypothesis: str = "", preferences: dict[str, JsonValue] | None = None,
   ) -> Workspace:
-    """Create research with free-text scope and period, without fixed companies or metrics."""
+    """Create research with optional fields in the workspace's research.json."""
     _require_text(title=title)
+    research = WorkspaceResearchInfo(
+        goal=goal, scope=scope, observation_period=observation_period,
+        initial_hypothesis=initial_hypothesis,
+        preferences={} if preferences is None else preferences,
+    )
     workspace_id = uuid4().hex
-    # Commit on success or roll back on error; later processes can read committed rows.
     with self.db:
       self.db.execute(
-          """INSERT INTO workspaces
-             (id, title, goal, scope, observation_period, initial_hypothesis,
-              preferences)
-             VALUES (?, ?, ?, ?, ?, ?, ?)""",
-          (workspace_id, title, goal, scope, observation_period,
-           initial_hypothesis,
-           json.dumps(preferences, ensure_ascii=False, allow_nan=False)),
+          "INSERT INTO workspaces (id, title) VALUES (?, ?)",
+          (workspace_id, title),
       )
+      self._write_research(workspace_id, research)
     return self.get_workspace(workspace_id)
 
   def list_workspaces(self) -> list[WorkspaceSummary]:
-    rows = self.db.execute(
-        "SELECT id, title, goal, created_at, updated_at FROM workspaces ORDER BY rowid"
-    )
-    return [WorkspaceSummary.model_validate(dict(row)) for row in rows]
+    rows = self.db.execute("SELECT * FROM workspaces ORDER BY rowid")
+    return [
+        WorkspaceSummary(**row, goal=self.get_workspace(row["id"]).info.goal)
+        for row in rows
+    ]
 
   def get_workspace_detail(self, workspace_id: str) -> WorkspaceDetail:
     """Return workspace details and indexes; messages and file contents are read separately."""
@@ -153,18 +161,21 @@ class WorkspaceStore:
     return WorkspaceDetail(**workspace.model_dump(), threads=threads,
                            artifacts=artifacts)
 
-  def set_preferences(self, workspace_id: str,
-      preferences: dict[str, JsonValue]) -> Workspace:
-    """Replace preferences with explicit user input; do not merge keys. An empty object clears them."""
-    self.get_workspace(workspace_id)
+  def update_research(self, workspace_id: str, changes: WorkspaceResearchInfo) -> Workspace:
+    """Update supplied fields; serialize read-modify-write across API and tool workers."""
     with self.db:
-      self.db.execute(
-          "UPDATE workspaces SET preferences = ? WHERE id = ?",
-          (json.dumps(preferences, ensure_ascii=False, allow_nan=False),
-           workspace_id),
-      )
+      self.db.execute("BEGIN IMMEDIATE")
+      workspace = self.get_workspace(workspace_id)
+      values = workspace.info.model_dump()
+      values.update(changes.model_dump(exclude_unset=True))
+      self._write_research(workspace_id, WorkspaceResearchInfo(**values))
       self._touch(workspace_id)
     return self.get_workspace(workspace_id)
+
+  def set_preferences(self, workspace_id: str,
+      preferences: dict[str, JsonValue]) -> Workspace:
+    """Replace preferences; an empty object clears them."""
+    return self.update_research(workspace_id, WorkspaceResearchInfo(preferences=preferences))
 
   def create_thread(self, workspace_id: str, title: str) -> Thread:
     """Create an empty conversation sharing workspace details without copying old messages."""
