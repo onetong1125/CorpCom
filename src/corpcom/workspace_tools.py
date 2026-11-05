@@ -10,7 +10,7 @@ from langchain.tools import tool
 from langchain_core.tools import BaseTool, ToolException
 
 from corpcom.function_catalog import FUNCTIONS
-from corpcom.workspace import WorkspaceStore
+from corpcom.workspace import ArtifactRegistrationError, WorkspaceStore
 from corpcom.workspace_models import WorkspaceResearchInfo
 from corpcom.sandbox import run_python, run_bash
 
@@ -191,6 +191,7 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
       Commands have a 90-second limit.
       Return exit_code, stdout, and stderr.
       Files created here are not automatically registered as artifacts.
+      Use register_artifact to register finished workspace files for delivery.
       """
       with WorkspaceStore(data_dir) as store:
         store.get_workspace(workspace_id)
@@ -211,7 +212,8 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
         file_path is relative to /workspace, such as tasks/demo/report.md.
         Create missing parent directories. Overwrite the entire existing file.
         Share a per-file lock with edit_file; Bash writes do not use this lock.
-        This does not register an artifact. Update research.json via update_research.
+        Use register_artifact to register the finished file; writing alone does not
+        create an artifact. Update research.json via update_research.
         """
         with WorkspaceStore(data_dir) as store:
             store.get_workspace(workspace_id)
@@ -237,6 +239,8 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
         Missing or ambiguous matches return an error without changing the file.
         Read, match, and write under the same per-file lock as write_file.
         Bash writes do not use this lock. Files are not automatically registered.
+        Use register_artifact for an unregistered deliverable; already registered
+        files keep their artifact ID and expose the updated contents.
         Update research.json via update_research.
         """
         with WorkspaceStore(data_dir) as store:
@@ -264,6 +268,33 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
         }
 
     edit_file.handle_tool_error = True
+
+    @tool
+    def register_artifact(file_path: str, kind: str) -> dict:
+        """Register an existing workspace file for the frontend file list and download.
+
+        file_path is relative to /workspace, for example tasks/demo/report.md.
+        kind is a non-empty category such as report, data, or code.
+        Register finished files created with write_file or by programs run via Bash.
+        This indexes the existing file without copying it. Later edits are visible
+        through the same artifact ID; this is not an immutable snapshot.
+        Repeated registration of the same resolved path returns the existing ID
+        and kind. execute_python outputs and uploaded files are already registered.
+        Returns artifact_id, name, kind, and relative_path (relative to data directory).
+        """
+        with WorkspaceStore(data_dir) as store:
+            try:
+                artifact = store.register_workspace_file(workspace_id, Path(file_path), kind)
+            except ArtifactRegistrationError as exc:
+                raise ToolException(str(exc)) from exc
+        return {
+            "artifact_id": artifact.id,
+            "name": artifact.name,
+            "kind": artifact.kind,
+            "relative_path": artifact.relative_path,
+        }
+
+    register_artifact.handle_tool_error = True
 
     @tool
     def read_function_doc(function_id: str) -> dict:
@@ -296,6 +327,6 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
 
 
     return [read_thread, update_research, read_function_doc,
-            execute_python, execute_bash, write_file, edit_file,
+            execute_python, execute_bash, write_file, edit_file, register_artifact,
             # read_file,  # 暂停注册
             ]

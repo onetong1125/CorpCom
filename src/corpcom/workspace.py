@@ -50,6 +50,10 @@ class RecordNotFoundError(ValueError):
   """A requested record does not exist within the supplied workspace."""
 
 
+class ArtifactRegistrationError(ValueError):
+  """A supplied file or kind cannot be registered as a workspace artifact."""
+
+
 def _require_text(**fields: str) -> None:
   """Reject blank required input without changing valid text formatting."""
   for name, value in fields.items():
@@ -384,6 +388,41 @@ class WorkspaceStore:
       raise
 
     return artifacts
+
+  def register_workspace_file(
+      self, workspace_id: str, file_path: Path, kind: str,
+  ) -> ArtifactFile:
+    """Index an existing workspace file in place, reusing its existing record."""
+    self.get_workspace(workspace_id)
+    if not kind.strip():
+      raise ArtifactRegistrationError("kind must not be empty")
+    if file_path.is_absolute() or "\0" in str(file_path):
+      raise ArtifactRegistrationError("file_path must be relative to /workspace")
+    workspace_root = (self.root / "workspaces" / workspace_id).resolve()
+    source = (workspace_root / file_path).resolve()
+    if not source.is_relative_to(workspace_root):
+      raise ArtifactRegistrationError("file_path must stay within the current workspace")
+    if not source.is_file():
+      raise ArtifactRegistrationError("file_path must refer to an existing regular file")
+    relative_path = source.relative_to(self.root).as_posix()
+    # Serialize lookup and insert across connections to avoid duplicate registrations.
+    with self.db:
+      self.db.execute("BEGIN IMMEDIATE")
+      row = self.db.execute(
+          "SELECT id FROM artifacts WHERE workspace_id = ? AND relative_path = ?",
+          (workspace_id, relative_path),
+      ).fetchone()
+      if row is not None:
+        artifact_id = row["id"]
+      else:
+        artifact_id = uuid4().hex
+        self.db.execute(
+            """INSERT INTO artifacts (id, workspace_id, name, kind, relative_path)
+               VALUES (?, ?, ?, ?, ?)""",
+            (artifact_id, workspace_id, source.name, kind, relative_path),
+        )
+        self._touch(workspace_id)
+    return self.get_file(workspace_id, artifact_id)
 
   def get_file(self, workspace_id: str, artifact_id: str) -> ArtifactFile:
     """Check ownership and return file metadata and an absolute path, without reading contents."""

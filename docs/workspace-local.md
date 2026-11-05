@@ -77,6 +77,14 @@ Edit 使用字面字符串匹配：`old_string` 不能为空，默认必须恰�
 
 两个工具在单进程内按解析后的实际路径共享锁，覆盖整个读改写过程，不同工具实例和指向同一路径的符号链接使用同一把锁。Bash、外部程序及其他服务进程的写入不受该锁保护，也不保证与这些写入并发时的文件一致性。这两个工具不自动登记 Artifact，`research.json` 仍通过 `update_research` 更新。
 
+## 主动登记工作区产物
+
+`register_artifact(file_path: str, kind: str)` 将当前 Workspace 中已有的普通文件登记到 Artifact 索引，不复制或移动文件。`file_path` 相对于 `/workspace`，例如 `tasks/demo/report.md`；`kind` 为非空分类，例如 `report`、`data`、`code`。绝对路径、越界路径、指向工作区外的符号链接、目录和不存在的文件会返回错误工具消息。
+
+模型完成通过 `write_file` 或 Bash 执行程序生成的交付文件后，调用此工具；临时文件不必全部登记。返回值包含 `artifact_id`、`name`、`kind` 和相对于数据目录的 `relative_path`。同一解析后路径重复登记复用已有 ID 和分类，不修改分类；并发登记的查询与插入使用同一个写事务。上传文件和 `execute_python` 的 `outputs` 已自动登记，无需再次登记，旧 Python 复制归档流程保持原样。
+
+登记后的文件通过已有文件列表、元数据和下载接口访问。后续编辑该文件沿用原 ID，接口读取最新内容；登记不创建不可变快照或历史版本。专项验证见 `tests/test_register_artifact.py`，覆盖登记、重复与并发登记、路径隔离，以及编辑后通过 HTTP 读取新内容。
+
 ## 自动验收
 
 在项目根目录执行：
