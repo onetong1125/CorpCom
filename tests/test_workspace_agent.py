@@ -509,6 +509,36 @@ class WorkspaceAgentTests(unittest.TestCase):
             ],
         )
 
+    def test_file_tools_allow_correction_after_failed_edit(self):
+        model = ScriptedModel(responses=[
+            AIMessage(content="", tool_calls=[{
+                "id": "write", "name": "write_file",
+                "args": {"file_path": "tasks/demo/note.txt", "content": "原始内容"},
+            }]),
+            AIMessage(content="", tool_calls=[{
+                "id": "bad-edit", "name": "edit_file",
+                "args": {"file_path": "tasks/demo/note.txt", "old_string": "不存在", "new_string": "更新"},
+            }]),
+            AIMessage(content="", tool_calls=[{
+                "id": "edit", "name": "edit_file",
+                "args": {"file_path": "tasks/demo/note.txt", "old_string": "原始内容", "new_string": "更新"},
+            }]),
+            AIMessage(content="文件已更新。"),
+        ])
+        with WorkspaceStore(self.data) as store:
+            answer = ask_workspace(store, model, self.workspace.id, self.thread.id,
+                                   "写入并编辑笔记", self.checkpointer)
+            self.assertEqual(answer, "文件已更新。")
+            self.assertEqual(store.get_workspace_detail(self.workspace.id).artifacts, [])
+        path = self.data / "workspaces" / self.workspace.id / "tasks/demo/note.txt"
+        self.assertEqual(path.read_text(encoding="utf-8"), "更新")
+        results = {m.tool_call_id: m for m in model.requests[-1] if m.type == "tool"}
+        self.assertEqual(results["write"].status, "success")
+        self.assertEqual(results["bad-edit"].status, "error")
+        self.assertIn("not found", results["bad-edit"].content)
+        self.assertEqual(results["edit"].status, "success")
+        self.assertEqual(json.loads(results["edit"].content)["replacements"], 1)
+
     def test_missing_record_error_persists_and_allows_next_turn(self):
         model = ScriptedModel(responses=[
             AIMessage(content="", tool_calls=[

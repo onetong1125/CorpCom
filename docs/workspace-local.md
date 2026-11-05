@@ -67,6 +67,16 @@ data/
 
 2026-11-05 验收：上述容器层行为已通过真实 Docker 验证，补齐后的仓库 probe 也由用户运行通过。Agent 工具尚未接入 Bash，现有 `execute_python` 仍使用独立执行与复制归档流程；API 仍保留 Workspace 互斥，不能据此认定 Agent 或前端并发已完成。
 
+## 工作区文本写入与编辑
+
+系统提示词和工具说明要求：创建或完整覆盖文本文件使用 `write_file`，局部修改使用 `edit_file`；不得用 shell 重定向、heredoc、`tee`、`sed -i` 或临时脚本代替。Bash 用于浏览、搜索、读取文件及执行程序；需要编写代码文件时，先通过文件工具保存，再执行。编辑匹配失败时读取最新内容并修正参数，不切换到 shell 绕过。这是模型的工具使用规则，当前没有在 Bash 执行层增加命令拦截。
+
+Agent 可调用 `write_file(file_path: str, content: str)` 创建或完整覆盖 UTF-8 文件，缺失的父目录会自动创建；`edit_file(file_path: str, old_string: str, new_string: str, replace_all: bool = False)` 编辑已有 UTF-8 文件。两者的 `file_path` 都相对于 `/workspace`，例如 `tasks/demo/report.md`；绝对路径、越出工作区的路径及指向工作区外的符号链接会返回错误。
+
+Edit 使用字面字符串匹配：`old_string` 不能为空，默认必须恰好匹配一次；`replace_all=True` 替换全部非重叠匹配。找不到匹配或默认模式下存在多处匹配时不改文件，返回错误工具消息供模型修正；`new_string` 可以为空，用于删除匹配内容。成功返回相对路径，Edit 还返回替换次数。未预期的 I/O 异常继续向调用方抛出。
+
+两个工具在单进程内按解析后的实际路径共享锁，覆盖整个读改写过程，不同工具实例和指向同一路径的符号链接使用同一把锁。Bash、外部程序及其他服务进程的写入不受该锁保护，也不保证与这些写入并发时的文件一致性。这两个工具不自动登记 Artifact，`research.json` 仍通过 `update_research` 更新。
+
 ## 自动验收
 
 在项目根目录执行：
