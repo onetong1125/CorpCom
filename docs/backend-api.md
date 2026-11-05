@@ -100,7 +100,7 @@ curl -X POST "http://127.0.0.1:8000/api/workspaces/$workspace_id/files" \
   -F 'file=@docs/research-workspace.md' -F 'kind=plan'
 ```
 
-上传后生成独立副本；同名文件再次上传得到新的文件 ID。接口接收文件内容，文件名必须是普通文件名，不能包含目录。文件响应不返回服务器绝对路径，通过 `/content` 下载。文件内容可以是二进制，但当前 Agent 的 `read_file` 仅支持 UTF-8 文本。
+上传后生成独立副本；同名文件再次上传得到新的文件 ID。接口接收文件内容，文件名必须是普通文件名，不能包含目录。文件响应不返回服务器绝对路径，通过 `/content` 下载。文件内容可以是二进制；Agent 的 `read_file` 工具已暂时停用，工作区文件通过 `execute_bash` 按路径读取，上传与下载接口不受影响。
 
 ## 错误与执行行为
 

@@ -113,12 +113,12 @@ uv run python -m unittest discover -s tests -v
 | 业务数据持久化 | `WorkspaceStore` 保存研究资料、用户消息及最终助手回答 |
 | Agent 执行状态持久化 | `SqliteSaver` 保存消息状态，包括工具调用和结果，以 `workspace_id:thread_id` 区分会话 |
 
-模型收到目标、范围、观察周期、初始假设、偏好、当前会话消息，以及其他会话和文件索引。`create_workspace_tools(data_dir, workspace_id)` 返回绑定当前研究的 `read_thread` 和 `read_file`，模型按需读取旧消息与 UTF-8 文本文件；Workspace ID 由程序绑定，不交给模型选择。`update_research(changes)` 将用户指定的字段保存到 `research.json`，返回更新后的全部研究信息，供本轮后续回答使用。工具在线程中运行，每次操作在执行线程内建立并关闭独立 SQLite 连接。
+模型收到目标、范围、观察周期、初始假设、偏好、当前会话消息，以及其他会话索引；每轮 context 不再注入完整文件索引。`create_workspace_tools(data_dir, workspace_id)` 返回绑定当前研究的工具，模型通过 `read_thread` 读取旧消息，通过 `execute_bash` 按路径发现和读取工作区文件。提示词说明上传或导入文件位于 `/workspace/files/<artifact_id>/<原文件名>`，任务产物（包括 Python 归档产物）位于 `/workspace/tasks/`；目录可能尚未创建，应先查看实际目录结构。`read_file(artifact_id)` 暂时注释并停止注册。Workspace ID 由程序绑定，不交给模型选择；Artifact 索引和前端文件查询、下载接口保留。`update_research(changes)` 将用户指定的字段保存到 `research.json`，返回更新后的全部研究信息，供本轮后续回答使用。工具在线程中运行，每次存储操作在执行线程内建立并关闭独立 SQLite 连接。
 
 每次提问最多调用模型六次，超限明确报错。工具参数不符合 schema 时，框架将校验错误反馈给模型；工具执行中的 `RecordNotFoundError` 由中间件转换为匹配调用 ID、`status="error"` 的 ToolMessage，模型可以据此修正调用或解释失败。后续模型调用仍计入六次上限。其他未处理异常向调用方抛出；调用中断时保留已写入的用户提问，不保存成功回答。
 
-当前 thread 尚无 checkpoint 时，从业务库导入已有问答，包括已经保存的本轮用户消息；之后每轮仅输入新用户消息，由 checkpoint 恢复此前的 Agent 消息。研究目标、偏好及资料索引仍在每轮刷新。
+当前 thread 尚无 checkpoint 时，从业务库导入已有问答，包括已经保存的本轮用户消息；之后每轮仅输入新用户消息，由 checkpoint 恢复此前的 Agent 消息。研究状态及其他会话索引仍在每轮刷新；文件通过工具按需发现，历史消息中的文件引用和工具结果仍随 checkpoint 恢复。
 
 业务库与 checkpoint 数据库之间没有原子事务。当前支持已完成轮次的历史恢复，不保证进程中途退出后的自动恢复，也未实现请求去重或最终回答的跨库幂等同步。
 
-Agent 工具已包含 `execute_python` 与按需查询数据函数契约的 `read_function_doc`，可使用已接入的数据函数取数并保存研究产物。文件读取仍仅支持 UTF-8 文本，未对长文件自动摘要。下一步的 Jinja2 模板、YAML 配置、运行时注入、上下文预算及研究记忆尚待实现，具体范围见 [当前路线](roadmap.md)。
+Agent 工具已包含 `execute_python` 与按需查询数据函数契约的 `read_function_doc`，可使用已接入的数据函数取数并保存研究产物。工作区文件通过 Bash 按需读取，未对长文件自动摘要。下一步的 Jinja2 模板、YAML 配置、运行时注入、上下文预算及研究记忆尚待实现，具体范围见 [当前路线](roadmap.md)。

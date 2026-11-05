@@ -10,7 +10,7 @@ from langchain_core.tools import BaseTool
 from corpcom.function_catalog import FUNCTIONS
 from corpcom.workspace import WorkspaceStore
 from corpcom.workspace_models import WorkspaceResearchInfo
-from corpcom.sandbox import run_python
+from corpcom.sandbox import run_python, run_bash
 
 class SandboxOutput(BaseModel):
     """One file explicitly selected for workspace registration."""
@@ -45,12 +45,13 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
             ],
         }
 
-    @tool
-    def read_file(artifact_id: str) -> dict:
-        """Read the UTF-8 text of a saved file in this workspace using its artifact ID."""
-        with WorkspaceStore(data_dir) as reader:
-            file = reader.get_file(workspace_id, artifact_id)
-        return {"name": file.name, "content": file.path.read_text(encoding="utf-8")}
+    # 暂停按 Artifact ID 读取的 Agent 工具，工作区文件通过 execute_bash 读取。
+    # @tool
+    # def read_file(artifact_id: str) -> dict:
+    #     """Read the UTF-8 text of a saved file in this workspace using its artifact ID."""
+    #     with WorkspaceStore(data_dir) as reader:
+    #         file = reader.get_file(workspace_id, artifact_id)
+    #     return {"name": file.name, "content": file.path.read_text(encoding="utf-8")}
 
     @tool
     def update_research(changes: WorkspaceResearchInfo) -> dict:
@@ -107,7 +108,7 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
         Execution is limited to 90 seconds.
         On success, return the summary in result and saved file references
         in artifacts. relative_path identifies each saved copy within the
-        data directory. Use artifact_id with read_file to read saved text.
+        data directory. Use execute_bash to find and read files under /workspace.
         """
       with WorkspaceStore(data_dir) as store:
         store.get_workspace(workspace_id)
@@ -151,6 +152,24 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
       }
 
     @tool
+    def execute_bash(command: str) -> dict:
+      """Run Bash in this workspace's shared Docker container.
+
+      The working directory is /workspace. Files persist across calls.
+      Commands have a 90-second limit.
+      Return exit_code, stdout, and stderr.
+      Files created here are not automatically registered as artifacts.
+      """
+      with WorkspaceStore(data_dir) as store:
+        store.get_workspace(workspace_id)
+
+      return run_bash(
+          command,
+          workspace_id=workspace_id,
+          workspace_dir=data_dir / "workspaces" / workspace_id,
+      )
+
+    @tool
     def read_function_doc(function_id: str) -> dict:
         """Read the import statement, signature, and full documentation of one sandbox function selected for the current task.
 
@@ -180,4 +199,7 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
         }
 
 
-    return [read_thread, read_file, update_research, read_function_doc, execute_python]
+    return [read_thread, update_research, read_function_doc,
+            execute_python, execute_bash,
+            # read_file,  # 暂停注册
+            ]

@@ -67,6 +67,34 @@ class WorkspaceToolTests(unittest.TestCase):
       "summary": "Return sample data.",
     }])
 
+  def test_execute_bash_binds_workspace_and_returns_execution_result(self):
+    temporary = self.enterContext(TemporaryDirectory())
+    data = Path(temporary).resolve() / "data"
+    with WorkspaceStore(data) as store:
+      wid = store.create_workspace(title="Bash 工具验证").id
+
+    tools = {
+      tool.name: tool
+      for tool in create_workspace_tools(data, wid)
+    }
+    bash = tools["execute_bash"]
+    self.assertNotIn("read_file", tools)
+    schema = bash.tool_call_schema.model_json_schema()
+    self.assertEqual(set(schema["properties"]), {"command"})
+
+    execution = {"exit_code": 7, "stdout": "output", "stderr": "failure"}
+    with patch(
+        "corpcom.workspace_tools.run_bash", return_value=execution,
+    ) as run_bash:
+      result = bash.invoke({"command": "exit 7"})
+      run_bash.assert_called_once_with(
+          "exit 7",
+          workspace_id=wid,
+          workspace_dir=data / "workspaces" / wid,
+      )
+
+    self.assertEqual(result, execution)
+
   def test_execute_python_archives_outputs_and_returns_readable_ids(self):
     """Read selected archived copies after deleting the temporary run."""
     temporary = self.enterContext(TemporaryDirectory())
@@ -129,14 +157,16 @@ class WorkspaceToolTests(unittest.TestCase):
     )
     shutil.rmtree(run_dir)
 
-    read = tools["read_file"].invoke({
-      "artifact_id": reference["artifact_id"],
-    })
-    self.assertEqual(read, {"name": "financials.json", "content": content})
+    # read_file Agent 工具暂时停用，归档文件仍通过存储层验证。
+    # read = tools["read_file"].invoke({
+    #   "artifact_id": reference["artifact_id"],
+    # })
+    # self.assertEqual(read, {"name": "financials.json", "content": content})
 
     with WorkspaceStore(data) as store:
       saved = store.get_file(wid, reference["artifact_id"])
       self.assertEqual(saved.path, archive_dir / "financials.json")
+      self.assertEqual(saved.path.read_text(encoding="utf-8"), content)
       self.assertEqual(
           [item.id for item in store.get_workspace_detail(wid).artifacts],
           [reference["artifact_id"]],
