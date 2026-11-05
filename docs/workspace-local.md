@@ -53,7 +53,27 @@ data/
 
 新建共享容器使用 `--init` 回收孤儿进程，避免超时后积累僵尸进程。已有容器不会因重新启动而获得此选项，需要重建；挂载目录中的文件保留不等于安装环境保留。
 
-在项目根目录、Docker 可访问且已构建 `corpcom-sandbox:local` 镜像时执行：
+### 手动生命周期与依赖维护
+
+首版由开发者手动停止或删除指定 Workspace 容器，不做自动空闲停止或自动清理。操作前先等待研究请求结束并停止后端，避免执行中的命令被中断或新请求同时进入；当前没有协调停止与命令执行的接口。
+
+容器名为 `corpcom-workspace-<workspace_id>`。手动执行 `docker stop <容器名>` 后，下次 Bash 调用会启动原容器；手动执行 `docker rm <已停止的容器名>` 后，下次调用会重新创建容器。删除容器不删除宿主机 Workspace 目录。这里的停止不是 `docker pause`。
+
+正式依赖由 [Dockerfile.sandbox](../Dockerfile.sandbox) 维护，新容器使用 `corpcom-sandbox:local` 镜像中的环境；不保证恢复运行期间临时安装的依赖。当前镜像以 Python 3.11 slim 为基础，安装 `akshare==1.19.1`，未完整锁定基础镜像和间接依赖。更新正式依赖后，在项目根目录执行 `docker build -f Dockerfile.sandbox -t corpcom-sandbox:local .`，再按上述流程停止并删除旧容器，下次调用使用新镜像创建容器。仅停止后启动旧容器不会应用新镜像。
+
+根文件系统只读、使用非 root 用户；`/workspace` 是持久挂载，`/tmp` 是临时 tmpfs，停止或删除容器后其内容不保留。依赖策略是按镜像重新提供环境，不是备份运行时环境。
+
+### 可重复验证
+
+在项目根目录、Docker 可访问且已构建 `corpcom-sandbox:local` 镜像时执行容器生命周期验证：
+
+```bash
+.venv/bin/python examples/probe_workspace_container.py
+```
+
+该脚本使用唯一 Workspace ID 和临时目录，验证 6 个线程经 Barrier 同时首次获取返回同一容器 ID、停止后恢复原 ID 且能读取文件，以及删除重建后 ID 改变但挂载文件保留；结束时清理测试容器。2026-11-05 用户补齐并发与停止恢复场景后，助手运行完整脚本通过。该 probe 不验证新增依赖或镜像更新流程。
+
+Bash 执行验证：
 
 ```bash
 .venv/bin/python examples/probe_workspace_bash.py
@@ -89,23 +109,31 @@ Edit 使用字面字符串匹配：`old_string` 不能为空，默认必须恰�
 
 ## M1—M3 验收记录（2026-11-05）
 
-本节汇总本轮已执行的验证和用户确认。本次文档更新未重新运行测试，也未执行合并前全量回归。
+本节分别记录自动测试、脚本化模型与真实 Docker 验证，以及用户的真实模型和前端确认。全量回归结果来自 2026-11-05 上一会话交接记录；本会话在补齐 M1 probe 后实际运行了该脚本，未重复运行未受影响的全量测试。
 
 | 层次 | 证据与工件 | 结果 |
 | --- | --- | --- |
-| M1 容器层 | 本会话前段的真实 Docker 验证：连续获取、停止后恢复、6 个线程并发获取；[重建 probe](../examples/probe_workspace_container.py) 由用户及助手运行 | 并发首次获取只创建一个容器，停止后恢复原 ID，重建后挂载文件保留；并发与恢复验证当时使用临时脚本，尚需补为持久回归工件 |
+| M1 容器层 | [容器生命周期 probe](../examples/probe_workspace_container.py) 已补齐并发首次获取和停止后恢复；本会话助手运行，真实 Docker | 6 个线程首次获取返回同一 ID；停止后恢复原 ID 并能读取文件；删除重建后 ID 改变、文件保留；脚本正常退出并清理测试容器 |
 | M2 Bash 层 | [Bash probe](../examples/probe_workspace_bash.py)，真实 Docker；助手分步验证，最终仓库脚本由用户运行通过 | 工作目录、跨调用读写、输出与退出码、并行执行、超时父子进程终止与回收、原容器复用通过 |
 | M3 Agent 到 Docker | [Agent Bash probe](../examples/probe_agent_bash.py)，助手实际运行；脚本化模型、真实框架及 Docker | 文件列表和内容回传、业务问答与 checkpoint 落盘、容器复用通过；固定模型脚本不作为自主工具选择证据 |
 | M3 文件工具与上下文 | [文件工具测试](../tests/test_workspace_file_tools.py)、[Agent 测试](../tests/test_workspace_agent.py)、[工具测试](../tests/test_workspace_tools.py)；相关 Workspace 与 API 回归分批通过 | 创建覆盖、唯一/全部匹配、失败不改文件、路径限制、跨实例与路径别名串行、Write/Edit 共锁、错误后修正调用，以及不注入 files 验证通过 |
 | M3 登记与 HTTP | [登记专项测试](../tests/test_register_artifact.py) 7 项及工具测试 6 项由助手运行通过 | 原地登记、重复/并发复用 ID、旧上传及 Python 归档索引复用、编辑后 HTTP 读取新内容、跨 Workspace 拒绝访问通过 |
 | M3 真实模型与前端 | 用户确认实测验收完成 | 模型写报告 → 调用登记工具 → 前端文件列表出现 → 预览及下载通过；该项来源为用户实测确认 |
 
-M2、M3 在上述范围内已验收。M1 核心容器能力已验证，仍有以下合并前待办：
+### 合并前回归与收尾结果
 
-- 确认容器空闲时是否停止、何时清理、由谁触发，以及操作与运行中任务的关系；尚未决定采用手动还是自动策略。
-- 确认容器重建后的依赖恢复策略。当前根文件系统只读、使用非 root 用户；挂载文件持久化不表示运行期间安装的环境也能恢复。
-- 将并发首次创建、停止后恢复的已有实测场景补为可重复运行的回归工件。
-- 完成 M1—M3 合并前回归，再合并 main；本次仅更新文档，不视为合并或回归完成。
+上一会话在提交 `fd443e0` 后运行了以下回归，结果由 2026-11-05 交接记录承接：
+
+| 检查 | 结果 |
+| --- | --- |
+| `.venv/bin/python -m unittest discover -s tests -v` | 共 62 项，61 通过、1 按配置跳过；跳过 `test_fundamentals_live.FundamentalsLiveTests.test_matches_annual_report_baseline`，未启用 `CORPCOM_LIVE_TESTS=1`，不作为真实金融接口验证 |
+| `frontend/` 下 `npm test` | 1 个测试文件、13 项测试通过 |
+| `frontend/` 下 `npm run build` | 生产构建成功 |
+| `probe_workspace_container.py`、`probe_workspace_bash.py`、`probe_agent_bash.py` | 三个真实 Docker probe 全部正常退出，使用唯一测试容器与临时目录并完成清理；Agent probe 使用脚本化模型 |
+
+本会话后续只增加 M1 probe 场景并更新文档，未修改产品实现。新增场景的完整 probe 已运行通过；手动停止／删除、暂不自动清理，以及正式依赖由镜像提供、临时安装依赖不保证恢复的策略已由用户确认。
+
+M1、M2、M3 在上述范围内已验收。当前仍在 `codex/workspace-container-reuse` 分支，尚未合并 main 或推送。
 
 目前没有 RunCoordinator，API 仍为 Workspace 互斥；这份记录不覆盖 M4—M6 的多 Thread 并发、研究中上传及运行状态恢复。
 
