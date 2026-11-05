@@ -43,6 +43,30 @@ data/
 
 所有会话和文件操作都检查所属 Workspace ID，跨 Workspace 读取会话、写消息或获取文件会失败。这是单用户应用的数据归属检查；同一操作系统用户仍可直接访问磁盘文件。
 
+## 共享容器与 Bash 验证
+
+`sandbox.run_bash` 通过 `ensure_workspace_container` 获取同一 Workspace 的共享容器，再用 `docker exec` 执行命令。传入的 `workspace_dir` 挂载到容器的 `/workspace`，也是命令的工作目录；文件可跨调用读取，各次调用使用独立进程。返回值包含 `exit_code`、`stdout` 和 `stderr`。
+
+命令默认限时 90 秒，可通过 `timeout_seconds` 调整。容器内的 GNU `timeout --signal=KILL` 在到期时终止命令进程组，不提供退出清理时间；宿主机的等待上限额外留出 12 秒，用于等待 Docker 返回，不代替容器内的超时控制。超时测试预期返回 `137`，但其他 KILL 终止也可能返回该值，不能单凭它判定超时。进程组方案不覆盖主动脱离进程组的进程。
+
+新建共享容器使用 `--init` 回收孤儿进程，避免超时后积累僵尸进程。已有容器不会因重新启动而获得此选项，需要重建；挂载目录中的文件保留不等于安装环境保留。
+
+在项目根目录、Docker 可访问且已构建 `corpcom-sandbox:local` 镜像时执行：
+
+```bash
+.venv/bin/python examples/probe_workspace_bash.py
+```
+
+脚本使用随机 Workspace ID 和临时目录，结束时删除本次测试容器。验证内容包括：
+
+- 工作目录为 `/workspace`，文件跨调用可读且宿主机内容一致。
+- stderr 与非零退出码正确返回。
+- 两条各等待 2 秒的命令并行执行，打印总耗时供检查。
+- 一条命令超时后，另一条并行命令正常完成；忽略 TERM 的子进程及其 Bash 父进程均被终止并回收。
+- 超时后仍可执行命令，且获取到的容器 ID 保持不变。
+
+2026-11-05 验收：上述容器层行为已通过真实 Docker 验证，补齐后的仓库 probe 也由用户运行通过。Agent 工具尚未接入 Bash，现有 `execute_python` 仍使用独立执行与复制归档流程；API 仍保留 Workspace 互斥，不能据此认定 Agent 或前端并发已完成。
+
 ## 自动验收
 
 在项目根目录执行：

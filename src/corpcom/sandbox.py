@@ -80,6 +80,36 @@ def run_python(
         return {"status": "error", "error": f"invalid result.json: {exc}", "run_dir": str(run_dir)}
     return {"status": "ok", "result": result, "run_dir": str(run_dir)}
 
+def run_bash(
+    command: str,
+    *,
+    workspace_id: str,
+    workspace_dir: Path,
+    timeout_seconds: int = 90
+) -> dict:
+    """Run a shell command in the workspace's shared container."""
+    container_id = ensure_workspace_container(workspace_id, workspace_dir)
+
+    completed = subprocess.run(
+        [
+            "docker", "exec",
+            "--workdir", "/workspace",
+            container_id,
+            "timeout", "--signal=KILL", f"{timeout_seconds}s",
+            "bash", "-c", command,
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=timeout_seconds + 12,
+    )
+
+    return {
+        "exit_code": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
 def create_workspace_container(
     workspace_id: str,
     workspace_dir: Path,
@@ -87,7 +117,7 @@ def create_workspace_container(
     """Start a persistent container backed by the workspace directory."""
     container_name = f"corpcom-workspace-{workspace_id}"
     command = [
-        "docker", "run", "-d",
+        "docker", "run", "--init", "-d",
         "--name", container_name,
         "--network", "bridge",
         "--memory", "1g",
