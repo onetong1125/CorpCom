@@ -11,6 +11,8 @@ data/
   workspaces/<workspace_id>/
     research.json
     files/<artifact_id>/<原文件名>
+    tasks/<任务名>/<代码、数据或报告>
+    .runs/<旧 execute_python 执行编号>/
 ```
 
 默认使用服务启动目录下的 `data/`，可通过 `CORPCOM_DATA_DIR` 指定已有数据目录。停止服务后，备份需要同时保留 corpcom.db、checkpoints.sqlite 和文件目录。Workspace 的 `execute_python` 使用 `workspaces/<workspace_id>/.runs/<执行编号>/`，将声明的产物复制到 `workspaces/<workspace_id>/tasks/<任务路径与版本>/` 并登记索引；独立 PTC 命令仍使用根目录 `runs/`。
@@ -65,7 +67,7 @@ data/
 - 一条命令超时后，另一条并行命令正常完成；忽略 TERM 的子进程及其 Bash 父进程均被终止并回收。
 - 超时后仍可执行命令，且获取到的容器 ID 保持不变。
 
-2026-11-05 验收：上述容器层行为已通过真实 Docker 验证，补齐后的仓库 probe 也由用户运行通过。Agent 工具尚未接入 Bash，现有 `execute_python` 仍使用独立执行与复制归档流程；API 仍保留 Workspace 互斥，不能据此认定 Agent 或前端并发已完成。
+2026-11-05 验收：上述容器层行为已通过真实 Docker 验证，补齐后的仓库 probe 也由用户运行通过。Agent 已接入 `execute_bash`，完整调用链另由 `examples/probe_agent_bash.py` 验证；现有 `execute_python` 仍使用独立执行与复制归档流程。API 仍保留 Workspace 互斥，跨 Thread 的 Agent 与前端并发留待 M4—M6 验收。
 
 ## 工作区文本写入与编辑
 
@@ -85,6 +87,28 @@ Edit 使用字面字符串匹配：`old_string` 不能为空，默认必须恰�
 
 登记后的文件通过已有文件列表、元数据和下载接口访问。后续编辑该文件沿用原 ID，接口读取最新内容；登记不创建不可变快照或历史版本。专项验证见 `tests/test_register_artifact.py`，覆盖登记、重复与并发登记、路径隔离，以及编辑后通过 HTTP 读取新内容。
 
+## M1—M3 验收记录（2026-11-05）
+
+本节汇总本轮已执行的验证和用户确认。本次文档更新未重新运行测试，也未执行合并前全量回归。
+
+| 层次 | 证据与工件 | 结果 |
+| --- | --- | --- |
+| M1 容器层 | 本会话前段的真实 Docker 验证：连续获取、停止后恢复、6 个线程并发获取；[重建 probe](../examples/probe_workspace_container.py) 由用户及助手运行 | 并发首次获取只创建一个容器，停止后恢复原 ID，重建后挂载文件保留；并发与恢复验证当时使用临时脚本，尚需补为持久回归工件 |
+| M2 Bash 层 | [Bash probe](../examples/probe_workspace_bash.py)，真实 Docker；助手分步验证，最终仓库脚本由用户运行通过 | 工作目录、跨调用读写、输出与退出码、并行执行、超时父子进程终止与回收、原容器复用通过 |
+| M3 Agent 到 Docker | [Agent Bash probe](../examples/probe_agent_bash.py)，助手实际运行；脚本化模型、真实框架及 Docker | 文件列表和内容回传、业务问答与 checkpoint 落盘、容器复用通过；固定模型脚本不作为自主工具选择证据 |
+| M3 文件工具与上下文 | [文件工具测试](../tests/test_workspace_file_tools.py)、[Agent 测试](../tests/test_workspace_agent.py)、[工具测试](../tests/test_workspace_tools.py)；相关 Workspace 与 API 回归分批通过 | 创建覆盖、唯一/全部匹配、失败不改文件、路径限制、跨实例与路径别名串行、Write/Edit 共锁、错误后修正调用，以及不注入 files 验证通过 |
+| M3 登记与 HTTP | [登记专项测试](../tests/test_register_artifact.py) 7 项及工具测试 6 项由助手运行通过 | 原地登记、重复/并发复用 ID、旧上传及 Python 归档索引复用、编辑后 HTTP 读取新内容、跨 Workspace 拒绝访问通过 |
+| M3 真实模型与前端 | 用户确认实测验收完成 | 模型写报告 → 调用登记工具 → 前端文件列表出现 → 预览及下载通过；该项来源为用户实测确认 |
+
+M2、M3 在上述范围内已验收。M1 核心容器能力已验证，仍有以下合并前待办：
+
+- 确认容器空闲时是否停止、何时清理、由谁触发，以及操作与运行中任务的关系；尚未决定采用手动还是自动策略。
+- 确认容器重建后的依赖恢复策略。当前根文件系统只读、使用非 root 用户；挂载文件持久化不表示运行期间安装的环境也能恢复。
+- 将并发首次创建、停止后恢复的已有实测场景补为可重复运行的回归工件。
+- 完成 M1—M3 合并前回归，再合并 main；本次仅更新文档，不视为合并或回归完成。
+
+目前没有 RunCoordinator，API 仍为 Workspace 互斥；这份记录不覆盖 M4—M6 的多 Thread 并发、研究中上传及运行状态恢复。
+
 ## 自动验收
 
 在项目根目录执行：
@@ -97,6 +121,8 @@ uv run python -m unittest discover -s tests -v
 
 - `tests/test_workspace.py` 直接验收存储层：独立进程重开后恢复目标、偏好、假设、旧消息和文件，并建立新会话；还覆盖独立迁移脚本及初始化不自动迁移、文件作为统一来源、部分更新与清空、跨 Workspace 隔离、同名文件独立副本、原文件删除、非法输入不改状态及已保存文件丢失。
 - `tests/test_workspace_models.py` 验收重开后的对象类型与 JSON 序列化。
+- `tests/test_workspace_file_tools.py` 验收文本创建、覆盖、精确替换、路径限制，以及 Write/Edit 的单进程文件锁。
+- `tests/test_register_artifact.py` 验收主动登记、去重、并发与现有 HTTP 产物访问链路。
 - `tests/test_workspace_agent.py` 使用替身模型运行真实框架循环，覆盖首条消息初始化及跨会话和部分填写的排除条件、对话修改研究信息与新会话读取、多轮上下文、SQLite 重开恢复、旧历史仅导入一次、不同 thread 的 checkpoint 隔离、工具结果落盘、可预期工具错误后的续聊、跨 Workspace 归属检查、非预期异常传播、模型调用上限和空回答。
 - `tests/test_api.py` 验收 HTTP 合同、研究信息部分更新与旧偏好路由兼容、偏好 JSON 类型与数值校验、文件上传下载、应用重建后的恢复、模型错误、并发限制和 CORS。
 
@@ -133,7 +159,7 @@ uv run python -m unittest discover -s tests -v
 
 模型收到目标、范围、观察周期、初始假设、偏好、当前会话消息，以及其他会话索引；每轮 context 不再注入完整文件索引。`create_workspace_tools(data_dir, workspace_id)` 返回绑定当前研究的工具，模型通过 `read_thread` 读取旧消息，通过 `execute_bash` 按路径发现和读取工作区文件。提示词说明上传或导入文件位于 `/workspace/files/<artifact_id>/<原文件名>`，任务产物（包括 Python 归档产物）位于 `/workspace/tasks/`；目录可能尚未创建，应先查看实际目录结构。`read_file(artifact_id)` 暂时注释并停止注册。Workspace ID 由程序绑定，不交给模型选择；Artifact 索引和前端文件查询、下载接口保留。`update_research(changes)` 将用户指定的字段保存到 `research.json`，返回更新后的全部研究信息，供本轮后续回答使用。工具在线程中运行，每次存储操作在执行线程内建立并关闭独立 SQLite 连接。
 
-每次提问最多调用模型六次，超限明确报错。工具参数不符合 schema 时，框架将校验错误反馈给模型；工具执行中的 `RecordNotFoundError` 由中间件转换为匹配调用 ID、`status="error"` 的 ToolMessage，模型可以据此修正调用或解释失败。后续模型调用仍计入六次上限。其他未处理异常向调用方抛出；调用中断时保留已写入的用户提问，不保存成功回答。
+每次提问最多调用模型十次，超限明确报错。工具参数不符合 schema 时，框架将校验错误反馈给模型；工具执行中的 `RecordNotFoundError` 由中间件转换为匹配调用 ID、`status="error"` 的 ToolMessage，模型可以据此修正调用或解释失败。后续模型调用仍计入十次上限。其他未处理异常向调用方抛出；调用中断时保留已写入的用户提问，不保存成功回答。
 
 当前 thread 尚无 checkpoint 时，从业务库导入已有问答，包括已经保存的本轮用户消息；之后每轮仅输入新用户消息，由 checkpoint 恢复此前的 Agent 消息。研究状态及其他会话索引仍在每轮刷新；文件通过工具按需发现，历史消息中的文件引用和工具结果仍随 checkpoint 恢复。
 
