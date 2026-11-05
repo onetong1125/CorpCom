@@ -42,12 +42,9 @@ def handle_workspace_tool_error(request, handler):
     """Return expected lookup failures as tool results the model can act on."""
     try:
         return handler(request)
-    except RecordNotFoundError:
+    except RecordNotFoundError as exc:
         return ToolMessage(
-            content=(
-                "当前 Workspace 中找不到指定资料。"
-                "请检查资料索引中的 ID，再决定是否重新调用工具。"
-            ),
+            content=str(exc),
             tool_call_id=request.tool_call["id"],
             name=request.tool_call["name"],
             status="error",

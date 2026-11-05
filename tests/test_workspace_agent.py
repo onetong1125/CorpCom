@@ -359,7 +359,10 @@ class WorkspaceAgentTests(unittest.TestCase):
                     self.assertEqual(error.tool_call_id, "foreign_read")
                     self.assertEqual(error.name, name)
                     self.assertEqual(error.status, "error")
-                    self.assertIn("找不到指定资料", error.content)
+                    self.assertEqual(
+                        error.content,
+                        f"thread not found in workspace: {private_thread.id}",
+                    )
 
                     # Neither context nor tool results may expose foreign material.
                     for request in model.requests:
@@ -577,7 +580,7 @@ class WorkspaceAgentTests(unittest.TestCase):
             self.assertEqual(error.tool_call_id, "missing_read")
             self.assertEqual(error.name, "read_thread")
             self.assertEqual(error.status, "error")
-            self.assertIn("找不到指定资料", error.content)
+            self.assertEqual(error.content, "thread not found in workspace: missing")
             self.assertNotIn(str(self.data), error.content)
 
         # Reopen SQLite to verify persistence and continuation.
