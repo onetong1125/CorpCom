@@ -243,9 +243,10 @@ class WorkspaceAgentTests(unittest.TestCase):
         model = ScriptedModel(responses=[
             AIMessage(content="", tool_calls=[
                 {"id": "old_thread", "name": "read_thread", "args": {"thread_id": self.thread.id}},
-                {"id": "plan_file", "name": "read_file", "args": {"artifact_id": file.id}},
+                # read_file 工具暂时停用。
+                # {"id": "plan_file", "name": "read_file", "args": {"artifact_id": file.id}},
             ]),
-            AIMessage(content="已承接旧会话和研究计划，下一步核对现金流。"),
+            AIMessage(content="已承接旧会话，下一步核对现金流。"),
         ])
 
         checkpoint_path = str(self.data / "checkpoint.sqlite")
@@ -257,20 +258,30 @@ class WorkspaceAgentTests(unittest.TestCase):
                 store, model, self.workspace.id, second.id,
                 "继续昨天的研究", checkpointer,
             )
-            self.assertIn("旧会话和研究计划", answer)
+            self.assertIn("已承接旧会话", answer)
             self.assertEqual(len(model.requests), 2)
             context = model.requests[0][0].content
             self.assertIn("检验经营韧性", context)
             self.assertIn("现金流稳定", context)
             self.assertIn('"报告语言": "中文"', context)
+            for request in model.requests:
+                prompt = request[0].content
+                state = json.loads(prompt.split("当前 Workspace 的已保存研究状态：\n", 1)[1])
+                self.assertNotIn("files", state)
+                self.assertNotIn(file.id, prompt)
+                self.assertNotIn(file.name, prompt)
+                self.assertNotIn(str(file.path), prompt)
+                self.assertIn("/workspace/files/", prompt)
+                self.assertIn("/workspace/tasks/", prompt)
+            self.assertEqual(store.get_file(self.workspace.id, file.id), file)
             self.assertEqual(model.requests[0][-1].content, "继续昨天的研究")
-            # Both reads execute through real framework workers, exercising SQLite thread safety.
+            # Read through a real framework worker, exercising SQLite thread safety.
             results = {
                 item.tool_call_id: json.loads(item.content)
                 for item in model.requests[1] if item.type == "tool"
             }
             self.assertEqual(results["old_thread"]["messages"], [{"role": "user", "content": "先核对现金流"}])
-            self.assertEqual(results["plan_file"]["content"], "# 原始计划\n检查现金流。\n")
+            # self.assertEqual(results["plan_file"]["content"], "# 原始计划\n检查现金流。\n")
             self.assertEqual(
                 [(item.role, item.content) for item in store.get_thread(self.workspace.id, second.id).messages],
                 [("user", "继续昨天的研究"), ("assistant", answer)],
@@ -290,7 +301,7 @@ class WorkspaceAgentTests(unittest.TestCase):
 
             self.assertEqual(
                 [item.type for item in saved_messages],
-                ["human", "ai", "tool", "tool", "ai"],
+                ["human", "ai", "tool", "ai"],
             )
             self.assertEqual(
                 {
@@ -299,7 +310,7 @@ class WorkspaceAgentTests(unittest.TestCase):
                 },
                 {
                     "old_thread": "read_thread",
-                    "plan_file": "read_file",
+                    # "plan_file": "read_file",
                 },
             )
 
@@ -322,7 +333,7 @@ class WorkspaceAgentTests(unittest.TestCase):
             private_file = store.import_file(other.id, source, "plan")
             for name, arguments in (
                 ("read_thread", {"thread_id": private_thread.id}),
-                ("read_file", {"artifact_id": private_file.id}),
+                # ("read_file", {"artifact_id": private_file.id}),
             ):
                 with self.subTest(tool=name):
                     thread = store.create_thread(self.workspace.id, name)
@@ -348,7 +359,10 @@ class WorkspaceAgentTests(unittest.TestCase):
                     self.assertEqual(error.tool_call_id, "foreign_read")
                     self.assertEqual(error.name, name)
                     self.assertEqual(error.status, "error")
-                    self.assertIn("找不到指定资料", error.content)
+                    self.assertEqual(
+                        error.content,
+                        f"thread not found in workspace: {private_thread.id}",
+                    )
 
                     # Neither context nor tool results may expose foreign material.
                     for request in model.requests:
@@ -498,13 +512,43 @@ class WorkspaceAgentTests(unittest.TestCase):
             ],
         )
 
+    def test_file_tools_allow_correction_after_failed_edit(self):
+        model = ScriptedModel(responses=[
+            AIMessage(content="", tool_calls=[{
+                "id": "write", "name": "write_file",
+                "args": {"file_path": "tasks/demo/note.txt", "content": "原始内容"},
+            }]),
+            AIMessage(content="", tool_calls=[{
+                "id": "bad-edit", "name": "edit_file",
+                "args": {"file_path": "tasks/demo/note.txt", "old_string": "不存在", "new_string": "更新"},
+            }]),
+            AIMessage(content="", tool_calls=[{
+                "id": "edit", "name": "edit_file",
+                "args": {"file_path": "tasks/demo/note.txt", "old_string": "原始内容", "new_string": "更新"},
+            }]),
+            AIMessage(content="文件已更新。"),
+        ])
+        with WorkspaceStore(self.data) as store:
+            answer = ask_workspace(store, model, self.workspace.id, self.thread.id,
+                                   "写入并编辑笔记", self.checkpointer)
+            self.assertEqual(answer, "文件已更新。")
+            self.assertEqual(store.get_workspace_detail(self.workspace.id).artifacts, [])
+        path = self.data / "workspaces" / self.workspace.id / "tasks/demo/note.txt"
+        self.assertEqual(path.read_text(encoding="utf-8"), "更新")
+        results = {m.tool_call_id: m for m in model.requests[-1] if m.type == "tool"}
+        self.assertEqual(results["write"].status, "success")
+        self.assertEqual(results["bad-edit"].status, "error")
+        self.assertIn("not found", results["bad-edit"].content)
+        self.assertEqual(results["edit"].status, "success")
+        self.assertEqual(json.loads(results["edit"].content)["replacements"], 1)
+
     def test_missing_record_error_persists_and_allows_next_turn(self):
         model = ScriptedModel(responses=[
             AIMessage(content="", tool_calls=[
                 {
                     "id": "missing_read",
-                    "name": "read_file",
-                    "args": {"artifact_id": "missing"},
+                    "name": "read_thread",
+                    "args": {"thread_id": "missing"},
                 },
             ]),
             AIMessage(content="找不到指定资料，请核对 ID。"),
@@ -522,7 +566,7 @@ class WorkspaceAgentTests(unittest.TestCase):
         ):
             answer = ask_workspace(
                 store, model, self.workspace.id, self.thread.id,
-                "读取不存在的文件", checkpointer,
+                "读取不存在的会话", checkpointer,
             )
             self.assertEqual(answer, "找不到指定资料，请核对 ID。")
             self.assertEqual(len(model.requests), 2)
@@ -534,9 +578,9 @@ class WorkspaceAgentTests(unittest.TestCase):
             self.assertEqual(len(results), 1)
             error = results[0]
             self.assertEqual(error.tool_call_id, "missing_read")
-            self.assertEqual(error.name, "read_file")
+            self.assertEqual(error.name, "read_thread")
             self.assertEqual(error.status, "error")
-            self.assertIn("找不到指定资料", error.content)
+            self.assertEqual(error.content, "thread not found in workspace: missing")
             self.assertNotIn(str(self.data), error.content)
 
         # Reopen SQLite to verify persistence and continuation.
@@ -571,8 +615,8 @@ class WorkspaceAgentTests(unittest.TestCase):
             AIMessage(content="", tool_calls=[
                 {
                     "id": "broken_read",
-                    "name": "read_file",
-                    "args": {"artifact_id": "any-file"},
+                    "name": "update_research",
+                    "args": {"changes": {"goal": "更新目标"}},
                 },
             ]),
         ])
@@ -581,7 +625,7 @@ class WorkspaceAgentTests(unittest.TestCase):
             # Patch the class because tool workers create their own store instances.
             with patch.object(
                 WorkspaceStore,
-                "get_file",
+                "update_research",
                 side_effect=RuntimeError("unexpected storage failure"),
             ):
                 with self.assertRaisesRegex(

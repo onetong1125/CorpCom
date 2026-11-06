@@ -69,13 +69,14 @@ class ApiTests(unittest.TestCase):
         self.model.responses = [
             AIMessage(content="", tool_calls=[
                 {"id": "history", "name": "read_thread", "args": {"thread_id": self.thread["id"]}},
-                {"id": "plan", "name": "read_file", "args": {"artifact_id": artifact["id"]}},
+                # read_file 工具暂时停用；上传、索引和下载仍在下方验证。
+                # {"id": "plan", "name": "read_file", "args": {"artifact_id": artifact["id"]}},
             ]),
-            AIMessage(content="已读旧会话和计划，继续核对现金流。"),
+            AIMessage(content="已读旧会话，继续核对现金流。"),
             AIMessage(content="上一轮安排是核对现金流。"),
         ]
         self.model.i = 0
-        continued = self.client.post(second_url + "/messages", json={"content": "读取旧会话和计划，继续研究"})
+        continued = self.client.post(second_url + "/messages", json={"content": "读取旧会话，继续研究"})
         self.assertEqual(continued.status_code, 201, continued.text)
         followup = self.client.post(second_url + "/messages", json={"content": "刚才安排了什么？"})
         self.assertEqual(followup.status_code, 201, followup.text)

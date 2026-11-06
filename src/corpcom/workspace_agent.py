@@ -42,12 +42,9 @@ def handle_workspace_tool_error(request, handler):
     """Return expected lookup failures as tool results the model can act on."""
     try:
         return handler(request)
-    except RecordNotFoundError:
+    except RecordNotFoundError as exc:
         return ToolMessage(
-            content=(
-                "当前 Workspace 中找不到指定资料。"
-                "请检查资料索引中的 ID，再决定是否重新调用工具。"
-            ),
+            content=str(exc),
             tool_call_id=request.tool_call["id"],
             name=request.tool_call["name"],
             status="error",
@@ -76,22 +73,13 @@ def ask_workspace(
     )
     user_message = store.add_message(workspace_id, thread_id, "user", question)
 
-    # Refresh workspace metadata and material indexes on every turn.
+    # Refresh research state and other-thread references on every turn.
     context = {
         "title": detail.title,
         **detail.info.model_dump(),
         "other_threads": [
             {"id": item.id, "title": item.title}
             for item in detail.threads if item.id != thread_id
-        ],
-        "files": [
-            {
-                "id": item.id,
-                "name": item.name,
-                "kind": item.kind,
-                "relative_path": item.relative_path,
-            }
-            for item in detail.artifacts
         ],
     }
     research_instruction = (
@@ -115,27 +103,52 @@ def ask_workspace(
             + research_instruction
             + "\n"
             "工具成功后才能说明已保存，本轮后续回答以工具返回的新状态为准。"
-            "当问题需要旧会话或文件内容时，按索引调用工具读取；不要凭索引猜测内容。"
+            "需要旧会话时，按索引调用 read_thread；"
+            "需要文件内容时，通过 execute_bash 发现并实际读取文件，不要凭文件名猜测内容。"
             "已有研究资料的读取限定在当前 Workspace。"
             "区分已有证据、用户陈述与推断，不编造来源、数据或投资建议。\n"
-            "你可以通过 execute_python 在 Docker 沙箱中运行 Python。"
+            "你可以通过 execute_bash 在当前 Workspace 的共享 Docker 容器中执行命令。"
+            "工作目录为 /workspace，文件跨调用保留，进程内变量不跨调用保留。"
+            "上传或导入的文件位于 /workspace/files/<artifact_id>/<原文件名>，"
+            "任务产物（包括 execute_python 已归档的文件）位于 /workspace/tasks/ 下。"
+            "files 和 tasks 目录可能尚未创建，先查看 /workspace 的实际目录结构。"
+            "Bash 用于浏览、搜索、读取文件及执行程序，先检查已有内容再决定写入位置。"
+            "研究代码、中间数据和报告按任务放在 tasks/<任务名>/ 下，避免覆盖其他任务文件。"
+            "创建或完整覆盖文本文件必须使用 write_file(file_path, content)，缺失的父目录会自动创建。"
+            "局部修改已有文本必须使用 edit_file(file_path, old_string, new_string, replace_all=False)。"
+            "禁止通过 shell 重定向（如 >、>>）、heredoc、tee、sed -i，"
+            "或临时脚本、Python 等程序代替这两个工具创建或修改文本文件。"
+            "需要编写代码文件时，先用 write_file 或 edit_file 保存代码，再用 Bash 执行。"
+            "file_path 使用相对于 /workspace 的路径，例如 tasks/demo/report.md。"
+            "old_string 不能为空；默认必须恰好匹配一次，replace_all=True 时替换全部匹配。"
+            "匹配失败时先用 Bash 读取最新内容，再修正编辑参数；不要改用 shell 或脚本绕过失败。"
+            "write_file 和 edit_file 对同一路径的操作串行。"
+            "research.json 的研究信息仍通过 update_research 修改。"
+            "判断命令是否成功应检查 exit_code，并结合 stdout 和 stderr；失败时不能声称任务完成。"
+            "Bash、write_file 和 edit_file 不会自动登记产物，不能据此声称文件已经可在前端预览或下载。\n"
+            "工作区中需要交付给用户的报告、数据或代码文件完成后，"
+            "调用 register_artifact(file_path, kind) 登记，file_path 相对于 /workspace，"
+            "kind 可使用 report、data 或 code；临时文件无需全部登记。"
+            "登记直接引用现有文件，不复制文件；同一路径重复登记返回原 Artifact ID 和分类。"
+            "已登记文件修改后沿用原索引，前端读取最新内容，不保存历史快照。"
+            "execute_python 的 outputs 会自动归档登记，上传文件也已登记，无需再次调用 register_artifact。\n"
             "需要使用数据函数时，先根据下方简表判断本次任务需要哪些函数，"
             "仅对准备调用的函数使用 read_function_doc 获取完整契约；"
             "不要为了了解全部能力而读取所有函数文档。"
             "当前上下文已包含该函数完整契约时可以复用。"
             "纯概念问题无需读取函数文档或执行沙箱。"
             "当前函数不覆盖的数据需求应明确说明，不编造函数或参数。\n"
-            "每次沙箱执行使用独立容器和运行目录，"
-            "不能依赖上一次执行的 Python 变量或当前目录文件。"
-            "完成本次分析所需的取数和计算应放在同一次执行中。"
+            "execute_python 用于在独立 Docker 容器和运行目录中运行 Python 并登记产物。"
+            "使用 execute_python 时，不能依赖上一次 execute_python 调用的 Python 变量或临时文件；"
+            "完成本次分析所需的取数和计算应放在同一次 execute_python 调用中。"
             "保存本次研究所需的完整数据，并按 execute_python 的契约提交结果与待登记文件。"
             "回答所需的计算结果应附带来源摘要。"
-            "仅 print() 不会完成执行契约。"
-            "不要将导致本次任务失败的异常转换成 result.json 后正常退出；"
-            "如需捕获异常记录诊断信息，记录后应重新抛出。"
+            "仅 print() 不会完成 execute_python 的执行契约。"
+            "execute_python 中不要将导致本次任务失败的异常转换成 result.json 后正常退出；"
+            "如需捕获异常记录诊断信息，记录后应重新抛出。\n"
             "执行失败时应说明失败，不能声称已经取得数据或完成计算。"
             "只有工具确认登记成功，才能声称文件已保存到 Workspace 资料索引。"
-            "不能把输出文件名当作 artifact_id 传给 read_file。\n"
+            "\n"
             "可用沙箱数据函数：\n"
             + json.dumps(list_function_summaries(), ensure_ascii=False)
             + "\n当前 Workspace 的已保存研究状态：\n"

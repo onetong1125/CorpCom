@@ -6,7 +6,10 @@ import os
 from pathlib import Path
 import subprocess
 import uuid
+from threading import Lock
 
+_workspace_locks: dict[str, Lock] = {}
+_workspace_locks_guard = Lock()
 
 IMAGE = "corpcom-sandbox:local"
 
@@ -76,6 +79,116 @@ def run_python(
     except json.JSONDecodeError as exc:
         return {"status": "error", "error": f"invalid result.json: {exc}", "run_dir": str(run_dir)}
     return {"status": "ok", "result": result, "run_dir": str(run_dir)}
+
+def run_bash(
+    command: str,
+    *,
+    workspace_id: str,
+    workspace_dir: Path,
+    timeout_seconds: int = 90
+) -> dict:
+    """Run a shell command in the workspace's shared container."""
+    container_id = ensure_workspace_container(workspace_id, workspace_dir)
+
+    completed = subprocess.run(
+        [
+            "docker", "exec",
+            "--workdir", "/workspace",
+            container_id,
+            "timeout", "--signal=KILL", f"{timeout_seconds}s",
+            "bash", "-c", command,
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=timeout_seconds + 12,
+    )
+
+    return {
+        "exit_code": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+def create_workspace_container(
+    workspace_id: str,
+    workspace_dir: Path,
+) -> str:
+    """Start a persistent container backed by the workspace directory."""
+    container_name = f"corpcom-workspace-{workspace_id}"
+    command = [
+        "docker", "run", "--init", "-d",
+        "--name", container_name,
+        "--network", "bridge",
+        "--memory", "1g",
+        "--cpus", "1",
+        "--pids-limit", "64",
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges",
+        "--read-only",
+        "--tmpfs", "/tmp:rw,nosuid,size=64m",
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "--mount", f"type=bind,src={workspace_dir.resolve()},dst=/workspace",
+        "--workdir", "/workspace",
+        IMAGE, "sleep", "infinity"
+    ]
+
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return completed.stdout.strip()
+
+def ensure_workspace_container(
+    workspace_id: str,
+    workspace_dir: Path,
+) -> str:
+    """Return a running container for the workspace, creating it if needed."""
+    with _workspace_locks_guard:
+        if workspace_id not in _workspace_locks:
+            _workspace_locks[workspace_id] = Lock()
+        workspace_lock = _workspace_locks[workspace_id]
+
+    with workspace_lock:
+        container_name = f"corpcom-workspace-{workspace_id}"
+
+        completed = subprocess.run(
+            [
+                "docker", "container", "ls",
+                "-a",
+                "--no-trunc",
+                "--filter", f"name=^/{container_name}$",
+                "--format", "{{.ID}}\t{{.State}}",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+
+        output = completed.stdout.strip()
+        if not output:
+            return create_workspace_container(workspace_id, workspace_dir)
+
+        container_id, state = output.split("\t")
+        if state == "running":
+            return container_id
+        if state in ("created", "exited"):
+            subprocess.run(
+                ["docker", "start", container_id],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+            return container_id
+        raise RuntimeError(
+            f"Cannot reuse container {container_id}: state={state}"
+        )
+
 
 
 def main() -> None:

@@ -1,16 +1,40 @@
 """Define research tools bound to one workspace and its data directory."""
 
 from pathlib import Path
+from contextlib import contextmanager
 import inspect
+from threading import Lock
 from pydantic import BaseModel, ConfigDict, JsonValue
 
 from langchain.tools import tool
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, ToolException
 
 from corpcom.function_catalog import FUNCTIONS
-from corpcom.workspace import WorkspaceStore
+from corpcom.workspace import ArtifactRegistrationError, WorkspaceStore
 from corpcom.workspace_models import WorkspaceResearchInfo
-from corpcom.sandbox import run_python
+from corpcom.sandbox import run_python, run_bash
+
+_file_locks: dict[Path, Lock] = {}
+_file_locks_guard = Lock()
+
+
+@contextmanager
+def _locked_workspace_file(workspace_dir: Path, file_path: str):
+    """Resolve model-supplied paths and serialize writes within this process."""
+    relative = Path(file_path)
+    if not file_path or "\0" in file_path or relative.is_absolute():
+        raise ToolException("file_path must be a non-empty workspace-relative path")
+    root = workspace_dir.resolve()
+    path = (root / relative).resolve()
+    if path == root or not path.is_relative_to(root):
+        raise ToolException("file_path must stay within the current workspace")
+    with _file_locks_guard:
+        lock = _file_locks.setdefault(path, Lock())
+    with lock:
+        if path.is_dir():
+            raise ToolException("file_path must refer to a file, not a directory")
+        yield path
+
 
 class SandboxOutput(BaseModel):
     """One file explicitly selected for workspace registration."""
@@ -45,12 +69,13 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
             ],
         }
 
-    @tool
-    def read_file(artifact_id: str) -> dict:
-        """Read the UTF-8 text of a saved file in this workspace using its artifact ID."""
-        with WorkspaceStore(data_dir) as reader:
-            file = reader.get_file(workspace_id, artifact_id)
-        return {"name": file.name, "content": file.path.read_text(encoding="utf-8")}
+    # 暂停按 Artifact ID 读取的 Agent 工具，工作区文件通过 execute_bash 读取。
+    # @tool
+    # def read_file(artifact_id: str) -> dict:
+    #     """Read the UTF-8 text of a saved file in this workspace using its artifact ID."""
+    #     with WorkspaceStore(data_dir) as reader:
+    #         file = reader.get_file(workspace_id, artifact_id)
+    #     return {"name": file.name, "content": file.path.read_text(encoding="utf-8")}
 
     @tool
     def update_research(changes: WorkspaceResearchInfo) -> dict:
@@ -76,6 +101,9 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
     @tool
     def execute_python(code: str, archive_path: str) -> dict:
       """Run Python in Docker and archive selected outputs in this workspace.
+
+        Do not use this tool as a workaround for creating or editing workspace
+        text files. Use write_file or edit_file for those operations.
 
         Submit a complete Python program that can be executed directly.
         Each execution uses a fresh temporary working directory.
@@ -107,7 +135,7 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
         Execution is limited to 90 seconds.
         On success, return the summary in result and saved file references
         in artifacts. relative_path identifies each saved copy within the
-        data directory. Use artifact_id with read_file to read saved text.
+        data directory. Use execute_bash to find and read files under /workspace.
         """
       with WorkspaceStore(data_dir) as store:
         store.get_workspace(workspace_id)
@@ -151,6 +179,124 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
       }
 
     @tool
+    def execute_bash(command: str) -> dict:
+      """Run Bash in this workspace's shared Docker container.
+
+      Use for browsing, searching, reading files, and executing programs.
+      To create or overwrite text files, use write_file. To change existing
+      text, use edit_file. Do not substitute shell redirection (>, >>),
+      heredocs, tee, sed -i, or temporary scripts for these file tools.
+      Save code with write_file or edit_file before executing it here.
+      The working directory is /workspace. Files persist across calls.
+      Commands have a 90-second limit.
+      Return exit_code, stdout, and stderr.
+      Files created here are not automatically registered as artifacts.
+      Use register_artifact to register finished workspace files for delivery.
+      """
+      with WorkspaceStore(data_dir) as store:
+        store.get_workspace(workspace_id)
+
+      return run_bash(
+          command,
+          workspace_id=workspace_id,
+          workspace_dir=data_dir / "workspaces" / workspace_id,
+      )
+
+    @tool
+    def write_file(file_path: str, content: str) -> dict:
+        """Create or overwrite a UTF-8 file in the current workspace.
+
+        Required for creating text files or replacing their entire contents,
+        including code files. Do not use shell redirection, heredocs, tee,
+        or temporary scripts instead. Use edit_file for targeted changes.
+        file_path is relative to /workspace, such as tasks/demo/report.md.
+        Create missing parent directories. Overwrite the entire existing file.
+        Share a per-file lock with edit_file; Bash writes do not use this lock.
+        Use register_artifact to register the finished file; writing alone does not
+        create an artifact. Update research.json via update_research.
+        """
+        with WorkspaceStore(data_dir) as store:
+            store.get_workspace(workspace_id)
+        workspace_dir = data_dir / "workspaces" / workspace_id
+        with _locked_workspace_file(workspace_dir, file_path) as path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        return {"status": "ok", "file_path": path.relative_to(workspace_dir.resolve()).as_posix()}
+
+    write_file.handle_tool_error = True
+
+    @tool
+    def edit_file(
+        file_path: str, old_string: str, new_string: str, replace_all: bool = False,
+    ) -> dict:
+        """Replace exact text in an existing UTF-8 workspace file.
+
+        Required for targeted text changes. Do not substitute sed -i, shell
+        redirection, heredocs, or temporary scripts. If matching fails, read
+        the latest file with execute_bash and correct the edit arguments.
+        file_path is relative to /workspace. old_string must not be empty.
+        By default it must occur exactly once; replace_all replaces every occurrence.
+        Missing or ambiguous matches return an error without changing the file.
+        Read, match, and write under the same per-file lock as write_file.
+        Bash writes do not use this lock. Files are not automatically registered.
+        Use register_artifact for an unregistered deliverable; already registered
+        files keep their artifact ID and expose the updated contents.
+        Update research.json via update_research.
+        """
+        with WorkspaceStore(data_dir) as store:
+            store.get_workspace(workspace_id)
+        if not old_string:
+            raise ToolException("old_string must not be empty")
+        workspace_dir = data_dir / "workspaces" / workspace_id
+        with _locked_workspace_file(workspace_dir, file_path) as path:
+            try:
+                content = path.read_text(encoding="utf-8")
+            except FileNotFoundError as exc:
+                raise ToolException("File not found; read the workspace directory before editing") from exc
+            except UnicodeDecodeError as exc:
+                raise ToolException("edit_file only supports UTF-8 text files") from exc
+            count = content.count(old_string)
+            if count == 0:
+                raise ToolException("old_string was not found; read the latest file before editing")
+            if count > 1 and not replace_all:
+                raise ToolException("old_string matches multiple times; provide a unique string or set replace_all=True")
+            path.write_text(content.replace(old_string, new_string), encoding="utf-8")
+        return {
+            "status": "ok",
+            "file_path": path.relative_to(workspace_dir.resolve()).as_posix(),
+            "replacements": count,
+        }
+
+    edit_file.handle_tool_error = True
+
+    @tool
+    def register_artifact(file_path: str, kind: str) -> dict:
+        """Register an existing workspace file for the frontend file list and download.
+
+        file_path is relative to /workspace, for example tasks/demo/report.md.
+        kind is a non-empty category such as report, data, or code.
+        Register finished files created with write_file or by programs run via Bash.
+        This indexes the existing file without copying it. Later edits are visible
+        through the same artifact ID; this is not an immutable snapshot.
+        Repeated registration of the same resolved path returns the existing ID
+        and kind. execute_python outputs and uploaded files are already registered.
+        Returns artifact_id, name, kind, and relative_path (relative to data directory).
+        """
+        with WorkspaceStore(data_dir) as store:
+            try:
+                artifact = store.register_workspace_file(workspace_id, Path(file_path), kind)
+            except ArtifactRegistrationError as exc:
+                raise ToolException(str(exc)) from exc
+        return {
+            "artifact_id": artifact.id,
+            "name": artifact.name,
+            "kind": artifact.kind,
+            "relative_path": artifact.relative_path,
+        }
+
+    register_artifact.handle_tool_error = True
+
+    @tool
     def read_function_doc(function_id: str) -> dict:
         """Read the import statement, signature, and full documentation of one sandbox function selected for the current task.
 
@@ -180,4 +326,7 @@ def create_workspace_tools(data_dir: Path, workspace_id: str) -> list[BaseTool]:
         }
 
 
-    return [read_thread, read_file, update_research, read_function_doc, execute_python]
+    return [read_thread, update_research, read_function_doc,
+            execute_python, execute_bash, write_file, edit_file, register_artifact,
+            # read_file,  # 暂停注册
+            ]
