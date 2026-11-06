@@ -63,7 +63,7 @@ curl -X PUT http://127.0.0.1:8000/api/workspaces/替换为WorkspaceID/research \
   -d '{"goal":"核对现金流质量","scope":"","observation_period":"未来一年"}'
 ```
 
-未提交的字段保持原值；文本字段传 `""` 清空，不接受 `null`；`preferences` 整体替换，传 `{}` 清空。返回值包含保存后的完整 Workspace，五类研究字段位于 `info` 对象中，例如 `response.info.goal`；创建和详情响应也使用相同结构，列表摘要仍返回顶层 `goal`。创建与更新请求的研究字段仍在顶层。旧 `/preferences` 路径接受相同请求。旧数据库需手动执行一次迁移脚本，存储初始化不自动迁移，命令见 [本地存储](workspace-local.md#数据位置与隔离)。
+未提交的字段保持原值；文本字段传 `""` 清空，不接受 `null`；`preferences` 整体替换，传 `{}` 清空。返回值包含保存后的完整 Workspace，五类研究字段位于 `info` 对象中，例如 `response.info.goal`；创建和详情响应也使用相同结构，列表摘要仍返回顶层 `goal`。创建与更新请求的研究字段仍在顶层。旧 `/preferences` 路径接受相同请求。存储初始化只创建当前表结构，数据布局见 [本地存储](workspace-local.md#数据位置与隔离)。
 
 ```bash
 workspace_id="替换为 Workspace ID"

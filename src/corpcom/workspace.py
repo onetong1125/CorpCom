@@ -26,7 +26,11 @@ CREATE TABLE IF NOT EXISTS threads (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     title TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    execution_status TEXT CHECK (execution_status IN ('running', 'succeeded', 'failed', 'interrupted')),
+    execution_started_at TEXT,
+    execution_finished_at TEXT,
+    execution_error TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,

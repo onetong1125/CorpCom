@@ -31,19 +31,19 @@ data/
 
 创建时仅标题必填。更新只替换提交的字段，未提交字段保持原值；文本传 `""` 清空，偏好传 `{}` 清空。偏好对象仍整体替换，不合并键。用户可通过研究档案表单、HTTP 接口或对话中的 `update_research` 工具管理这些信息。整个 Workspace 的第一条用户消息到来时，如果五类研究信息全部为空（空白文本也视为空），Agent 根据该消息整理目标、范围和待验证初始假设，通过 `update_research` 保存后继续回答；观察周期和偏好只提取消息中有依据的内容。若消息没有研究主题，则先询问目标。已有任一字段或任一会话已有用户消息时，不再自动初始化，此后只按用户明确要求修改。新会话拥有独立消息列表，共享这些研究信息与文件。
 
-存储初始化只创建当前表结构，不包含旧结构的兼容或自动迁移逻辑。开发阶段已有旧数据库时，停止后端后手动运行一次：
-
-```bash
-.venv/bin/python scripts/migrate_workspace_research.py data
-```
-
-脚本将五个研究字段写入各 Workspace 的 `research.json`，直接删除数据库中的对应列；标识、标题、时间和关联记录保持不变。脚本针对旧表结构执行一次，不做版本判断或重复迁移。新建数据目录无需执行。迁移后列表、详情和 Agent 上下文均从该文件读取，文件缺失或格式错误会明确报错。
+存储初始化只创建当前表结构，不包含旧结构的兼容或自动迁移逻辑。五个研究字段保存在各 Workspace 的 `research.json` 中；列表、详情和 Agent 上下文均从该文件读取，文件缺失或格式错误会明确报错。
 
 接口和 Agent 工具共用 `WorkspaceStore.update_research`。更新在 SQLite 写事务内读取最新文件并合并指定字段，再通过临时文件替换完整 JSON，防止并发写入丢失其他字段或读到半份 JSON。文件替换与 SQLite 时间戳提交不构成跨介质原子事务；手工编辑文件也不更新数据库时间戳。
 
 文件导入时生成独立副本，原文件后来被修改或删除不影响副本；同名文件重复导入会生成不同 ID，保留各自内容。已登记的副本丢失时明确报错。
 
 所有会话和文件操作都检查所属 Workspace ID，跨 Workspace 读取会话、写消息或获取文件会失败。这是单用户应用的数据归属检查；同一操作系统用户仍可直接访问磁盘文件。
+
+## Thread 最近执行状态
+
+`Thread` 和 `threads` 表直接保存最近一轮的 `execution_status`、`execution_started_at`、`execution_finished_at`、`execution_error`，不另建执行表或执行 ID。状态可为 `running`、`succeeded`、`failed`、`interrupted`；尚未执行时四个字段均为空。每轮覆盖最近状态，消息历史仍保留在 `messages` 表。
+
+2026-11-06：已通过 DDL SQL（`ALTER TABLE threads ADD COLUMN`）为已有 `threads` 表增加上述四个字段，并同步更新 `Thread` 模型和新库建表语句。已核对本地 `data/corpcom.db` 的表结构；协调器写入状态、Thread 准入和启动时标记中断尚未接入。
 
 ## 共享容器与 Bash 验证
 
@@ -133,7 +133,7 @@ Edit 使用字面字符串匹配：`old_string` 不能为空，默认必须恰�
 
 本会话后续只增加 M1 probe 场景并更新文档，未修改产品实现。新增场景的完整 probe 已运行通过；手动停止／删除、暂不自动清理，以及正式依赖由镜像提供、临时安装依赖不保证恢复的策略已由用户确认。
 
-M1、M2、M3 在上述范围内已验收。当前仍在 `codex/workspace-container-reuse` 分支，尚未合并 main 或推送。
+M1、M2、M3 在上述范围内已验收。2026-11-06 核对：已通过 PR #1 合并到 main，合并提交为 `65b6c02`。M4—M6 在新分支 `xyt/feat-thread-concurrency` 上推进，M6 验收完成后再合并 PR。
 
 目前没有 RunCoordinator，API 仍为 Workspace 互斥；这份记录不覆盖 M4—M6 的多 Thread 并发、研究中上传及运行状态恢复。
 
@@ -147,7 +147,7 @@ uv run python -m unittest discover -s tests -v
 
 测试使用临时数据目录，不修改已有研究资料：
 
-- `tests/test_workspace.py` 直接验收存储层：独立进程重开后恢复目标、偏好、假设、旧消息和文件，并建立新会话；还覆盖独立迁移脚本及初始化不自动迁移、文件作为统一来源、部分更新与清空、跨 Workspace 隔离、同名文件独立副本、原文件删除、非法输入不改状态及已保存文件丢失。
+- `tests/test_workspace.py` 直接验收存储层：独立进程重开后恢复目标、偏好、假设、旧消息和文件，并建立新会话；还覆盖文件作为统一来源、部分更新与清空、跨 Workspace 隔离、同名文件独立副本、原文件删除、非法输入不改状态及已保存文件丢失。
 - `tests/test_workspace_models.py` 验收重开后的对象类型与 JSON 序列化。
 - `tests/test_workspace_file_tools.py` 验收文本创建、覆盖、精确替换、路径限制，以及 Write/Edit 的单进程文件锁。
 - `tests/test_register_artifact.py` 验收主动登记、去重、并发与现有 HTTP 产物访问链路。
