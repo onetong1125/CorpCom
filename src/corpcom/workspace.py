@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 from uuid import uuid4
+from typing import Literal
 
 from pydantic import JsonValue
 
@@ -57,6 +58,9 @@ class RecordNotFoundError(ValueError):
 class ArtifactRegistrationError(ValueError):
   """A supplied file or kind cannot be registered as a workspace artifact."""
 
+
+class ThreadBusyError(ValueError):
+  """The thread already has an execution in progress."""
 
 def _require_text(**fields: str) -> None:
   """Reject blank required input without changing valid text formatting."""
@@ -442,3 +446,69 @@ class WorkspaceStore:
     if not path.is_file():
       raise FileNotFoundError(f"stored file is missing: {path}")
     return ArtifactFile(**artifact, path=path)
+
+  def start_thread_execution(
+      self, workspace_id: str, thread_id: str,
+  ) -> Thread:
+    # 检查会话存在且属于当前 Workspace。
+    self._thread(workspace_id, thread_id)
+
+    with self.db:
+      cursor = self.db.execute(
+          """
+          UPDATE threads
+          SET execution_status      = 'running',
+              execution_started_at  = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+              execution_finished_at = NULL,
+              execution_error       = NULL
+          WHERE workspace_id = ?
+            AND id = ?
+            AND (
+              execution_status IS NULL
+                  OR execution_status <> 'running'
+              )
+          """,
+          (workspace_id, thread_id),
+      )
+
+      if cursor.rowcount == 0:
+        raise ThreadBusyError(f"Thread is already running: {thread_id}")
+
+      return self._thread(workspace_id, thread_id)
+
+  def finish_thread_execution(
+      self,
+      workspace_id: str,
+      thread_id: str,
+      *,
+      status: Literal["succeeded", "failed"],
+      error: str | None = None,
+  ) -> Thread:
+    self._thread(workspace_id, thread_id)
+
+    with self.db:
+      self.db.execute(
+          """
+          UPDATE threads SET execution_status = ?,
+          execution_finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+          execution_error = ?
+          WHERE workspace_id = ? AND id = ?
+          """,
+          (status, error, workspace_id, thread_id),
+      )
+
+      return self._thread(workspace_id, thread_id)
+
+
+  def interrupt_running_executions(self) -> int:
+    with self.db:
+      cursor = self.db.execute(
+          """
+          UPDATE threads
+          SET execution_status = 'interrupted',
+              execution_finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+              execution_error = '后端重启，上次执行已中断'
+          WHERE execution_status = 'running'
+          """
+      )
+      return cursor.rowcount
