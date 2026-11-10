@@ -70,7 +70,7 @@ with TemporaryDirectory(prefix="corpcom-agent-bash-") as temporary:
       WorkspaceStore(data) as store,
       SqliteSaver.from_conn_string(checkpoint_path) as checkpointer,
     ):
-      answer = RunCoordinator(checkpointer).run(
+      answer = RunCoordinator(checkpointer, max_concurrent_runs=2).run(
           store, model, workspace.id, thread.id, question, ).content
     assert answer == expected_answer, answer
     assert len(model.requests) == 3, len(model.requests)

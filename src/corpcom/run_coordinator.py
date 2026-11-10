@@ -1,3 +1,4 @@
+from threading import BoundedSemaphore
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langchain_core.language_models import BaseChatModel
 
@@ -6,9 +7,18 @@ from corpcom.workspace_models import Message
 from corpcom.workspace_agent import ask_workspace
 
 
+class ExecutionCapacityError(ValueError):
+  """The backend has reached its concurrent execution limit."""
+
+
 class RunCoordinator:
-  def __init__(self, checkpointer: BaseCheckpointSaver):
+  def __init__(self,
+    checkpointer: BaseCheckpointSaver,
+    *,
+    max_concurrent_runs: int,
+  ):
     self.checkpointer = checkpointer
+    self._slots = BoundedSemaphore(max_concurrent_runs)
 
   def run(self,
       store: WorkspaceStore,
@@ -17,15 +27,20 @@ class RunCoordinator:
       thread_id: str,
       question: str,
   ) -> Message:
-    # 准入
-    store.start_thread_execution(workspace_id, thread_id)
-
+    if not self._slots.acquire(blocking=False):
+      raise ExecutionCapacityError("Too many concurrent executions")
     try:
-      answer = ask_workspace(
-          store, model, workspace_id, thread_id, question, self.checkpointer)
-      return store.complete_thread_execution(workspace_id, thread_id, answer)
+      # 准入
+      store.start_thread_execution(workspace_id, thread_id)
 
-    except Exception as e:
-      store.finish_thread_execution(workspace_id, thread_id,
-                                    status="failed", error=str(e))
-      raise
+      try:
+        answer = ask_workspace(
+            store, model, workspace_id, thread_id, question, self.checkpointer)
+        return store.complete_thread_execution(workspace_id, thread_id, answer)
+
+      except Exception as e:
+        store.finish_thread_execution(workspace_id, thread_id,
+                                      status="failed", error=str(e))
+        raise
+    finally:
+      self._slots.release()

@@ -176,7 +176,7 @@ class WorkspaceAgentTests(unittest.TestCase):
             SqliteSaver.from_conn_string(checkpoint_path) as checkpointer
         ):
             self.assertEqual(
-                RunCoordinator(checkpointer).run(
+                RunCoordinator(checkpointer, max_concurrent_runs=2).run(
                     store, model, self.workspace.id, self.thread.id, first_question
                 ).content,
                 first_answer,
@@ -193,7 +193,7 @@ class WorkspaceAgentTests(unittest.TestCase):
                 side_effect=AssertionError("第二轮不应从业务库重新加载历史"),
             ):
                 self.assertEqual(
-                    RunCoordinator(checkpointer).run(
+                    RunCoordinator(checkpointer, max_concurrent_runs=2).run(
                         store, model, self.workspace.id, self.thread.id,
                         second_question
                     ).content,
@@ -258,7 +258,7 @@ class WorkspaceAgentTests(unittest.TestCase):
             WorkspaceStore(self.data) as store,
             SqliteSaver.from_conn_string(checkpoint_path) as checkpointer,
         ):
-            answer = RunCoordinator(checkpointer).run(
+            answer = RunCoordinator(checkpointer, max_concurrent_runs=2).run(
                 store, model, self.workspace.id, second.id,
                 "继续昨天的研究"
             ).content
@@ -348,7 +348,7 @@ class WorkspaceAgentTests(unittest.TestCase):
                             "args": arguments},]),
                         AIMessage(content="当前 Workspace 中找不到指定资料。"),
                     ])
-                    answer = RunCoordinator(self.checkpointer).run(
+                    answer = RunCoordinator(self.checkpointer, max_concurrent_runs=2).run(
                         store, model, self.workspace.id, thread.id,"读取指定资料"
                     ).content
                     self.assertEqual(

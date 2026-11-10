@@ -77,7 +77,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             str(root / "checkpoints.sqlite")
         ) as checkpointer:
             app.state.checkpointer = checkpointer
-            app.state.coordinator = RunCoordinator(checkpointer)
+            app.state.coordinator = RunCoordinator(
+                checkpointer, max_concurrent_runs=2)
             with WorkspaceStore(root) as store:
                 store.interrupt_running_executions()
             yield
