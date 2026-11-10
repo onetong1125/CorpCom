@@ -19,6 +19,7 @@ from pydantic import Field
 from corpcom.workspace import WorkspaceStore
 from corpcom.workspace_models import WorkspaceResearchInfo
 from corpcom.workspace_agent import ask_workspace
+from corpcom.run_coordinator import RunCoordinator
 
 
 class ScriptedModel(FakeMessagesListChatModel):
@@ -175,8 +176,9 @@ class WorkspaceAgentTests(unittest.TestCase):
             SqliteSaver.from_conn_string(checkpoint_path) as checkpointer
         ):
             self.assertEqual(
-                ask_workspace(store, model, self.workspace.id, self.thread.id,
-                              first_question, checkpointer),
+                RunCoordinator(checkpointer).run(
+                    store, model, self.workspace.id, self.thread.id, first_question
+                ).content,
                 first_answer,
             )
         # Reopen both databases; no checkpoint connection is reused.
@@ -191,8 +193,10 @@ class WorkspaceAgentTests(unittest.TestCase):
                 side_effect=AssertionError("第二轮不应从业务库重新加载历史"),
             ):
                 self.assertEqual(
-                    ask_workspace(store, model, self.workspace.id, self.thread.id,
-                                  second_question, checkpointer),
+                    RunCoordinator(checkpointer).run(
+                        store, model, self.workspace.id, self.thread.id,
+                        second_question
+                    ).content,
                     second_answer,
                 )
 
@@ -254,10 +258,10 @@ class WorkspaceAgentTests(unittest.TestCase):
             WorkspaceStore(self.data) as store,
             SqliteSaver.from_conn_string(checkpoint_path) as checkpointer,
         ):
-            answer = ask_workspace(
+            answer = RunCoordinator(checkpointer).run(
                 store, model, self.workspace.id, second.id,
-                "继续昨天的研究", checkpointer,
-            )
+                "继续昨天的研究"
+            ).content
             self.assertIn("已承接旧会话", answer)
             self.assertEqual(len(model.requests), 2)
             context = model.requests[0][0].content
@@ -344,8 +348,9 @@ class WorkspaceAgentTests(unittest.TestCase):
                             "args": arguments},]),
                         AIMessage(content="当前 Workspace 中找不到指定资料。"),
                     ])
-                    answer = ask_workspace(store, model, self.workspace.id, thread.id,
-                                           "读取指定资料", self.checkpointer)
+                    answer = RunCoordinator(self.checkpointer).run(
+                        store, model, self.workspace.id, thread.id,"读取指定资料"
+                    ).content
                     self.assertEqual(
                         answer, "当前 Workspace 中找不到指定资料。",
                     )

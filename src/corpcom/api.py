@@ -9,6 +9,7 @@ from threading import Lock
 from typing import Annotated
 from contextlib import asynccontextmanager
 
+from corpcom.run_coordinator import RunCoordinator
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Form, HTTPException, UploadFile
 from fastapi.exceptions import RequestValidationError
@@ -76,6 +77,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             str(root / "checkpoints.sqlite")
         ) as checkpointer:
             app.state.checkpointer = checkpointer
+            app.state.coordinator = RunCoordinator(checkpointer)
             with WorkspaceStore(root) as store:
                 store.interrupt_running_executions()
             yield
@@ -162,9 +164,9 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                     raise HTTPException(409, "A conversation is already running in this workspace")
                 active_workspaces.add(workspace_id)
             try:
-                ask_workspace(store, model, workspace_id, thread_id, body.content,
-                              app.state.checkpointer)
-                return store.get_thread(workspace_id, thread_id).messages[-1]
+                return app.state.coordinator.run(
+                    store, model, workspace_id, thread_id, body.content,
+                )
             except APIError as exc:
                 logger.exception("Model request failed")
                 raise HTTPException(502, "Model request failed; the user message was saved") from exc

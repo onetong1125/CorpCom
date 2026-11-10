@@ -512,3 +512,38 @@ class WorkspaceStore:
           """
       )
       return cursor.rowcount
+
+  def complete_thread_execution(
+      self,
+      workspace_id: str,
+      thread_id: str,
+      answer: str,
+  ) -> Message:
+    self._thread(workspace_id, thread_id)
+    _require_text(content=answer)
+    with self.db:
+      cursor = self.db.execute(
+          """
+          INSERT INTO messages (thread_id, role, content)
+          VALUES (?, 'assistant', ?);
+          """,
+          (thread_id, answer)
+      )
+      message_id = cursor.lastrowid
+
+      self.db.execute(
+          """
+          UPDATE threads
+          SET execution_status = 'succeeded',
+              execution_finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+              execution_error = NULL
+          WHERE workspace_id = ? AND id = ?;
+          """,
+          (workspace_id, thread_id),
+      )
+
+      self._touch(workspace_id)
+
+      return Message.model_validate(dict(self.db.execute(
+          "SELECT * FROM messages WHERE id = ?", (message_id,)
+      ).fetchone()))

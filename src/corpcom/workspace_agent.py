@@ -55,7 +55,7 @@ def ask_workspace(
     workspace_id: str, thread_id: str, question: str,
     checkpointer: BaseCheckpointSaver,
 ) -> str:
-    """Answer in a thread, reading workspace material on demand and saving the exchange."""
+    """Save user's question and generating the answer."""
     logger.info(
         "本轮开始 workspace=%s thread=%s",
         workspace_id,
@@ -119,9 +119,8 @@ def ask_workspace(
     answer = result["messages"][-1].text
     if not answer.strip():
         raise RuntimeError("model returned no answer")
-    store.add_message(workspace_id, thread_id, "assistant", answer)
     logger.info(
-        "本轮完成 workspace=%s thread=%s",
+        "回答生成完成 workspace=%s thread=%s",
         workspace_id,
         thread_id,
     )
