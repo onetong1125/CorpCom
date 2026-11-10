@@ -61,16 +61,16 @@ def ask_workspace(
         workspace_id,
         thread_id,
     )
-    detail = store.get_workspace_detail(workspace_id)
     # Initialize once per workspace, including history in sibling conversations.
-    initialize_research = (
-        not any(
-            value.strip() if isinstance(value, str) else value
-            for value in detail.info.model_dump().values()
-        )
-        and not store.has_user_messages(workspace_id)
+    user_message, is_first = store.add_user_message(
+        workspace_id, thread_id, question,
     )
-    user_message = store.add_message(workspace_id, thread_id, "user", question)
+    detail = store.get_workspace_detail(workspace_id)
+
+    initialize_research = is_first and not any(
+        value.strip() if isinstance(value, str) else value
+        for value in detail.info.model_dump().values()
+    )
 
     # Refresh research state and other-thread references on every turn.
     context = {

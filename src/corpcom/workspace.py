@@ -234,6 +234,32 @@ class WorkspaceStore:
         "SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)
     ).fetchone()))
 
+  def add_user_message(
+    self,
+    workspace_id: str,
+    thread_id: str,
+    content: str,
+) -> tuple[Message, bool]:
+    """Save the user's message and return whether is's an initial message """
+    self._thread(workspace_id, thread_id)
+    _require_text(content=content)
+    with self.db:
+      # 先取得数据库写入资格
+      self.db.execute("BEGIN IMMEDIATE")
+      is_first = not self.has_user_messages(workspace_id)
+      cursor = self.db.execute(
+          "INSERT INTO messages (thread_id, role, content) VALUES (?, 'user', ?)",
+          (thread_id, content),
+      )
+      self._touch(workspace_id)
+      message = Message.model_validate(dict(self.db.execute(
+        "SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)
+      ).fetchone()))
+
+      return (message, is_first)
+
+
+
   def import_file(self, workspace_id: str, source: Path,
       kind: str) -> ArtifactFile:
     """Copy and index a file; separate imports preserve copies with the same name."""

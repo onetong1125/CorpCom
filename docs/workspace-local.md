@@ -43,7 +43,27 @@ data/
 
 `Thread` 和 `threads` 表直接保存最近一轮的 `execution_status`、`execution_started_at`、`execution_finished_at`、`execution_error`，不另建执行表或执行 ID。状态可为 `running`、`succeeded`、`failed`、`interrupted`；尚未执行时四个字段均为空。每轮覆盖最近状态，消息历史仍保留在 `messages` 表。
 
-2026-11-06：已通过 DDL SQL（`ALTER TABLE threads ADD COLUMN`）为已有 `threads` 表增加上述四个字段，并同步更新 `Thread` 模型和新库建表语句。已核对本地 `data/corpcom.db` 的表结构；协调器写入状态、Thread 准入和启动时标记中断尚未接入。
+2026-11-06：已通过 DDL SQL（`ALTER TABLE threads ADD COLUMN`）为已有 `threads` 表增加上述四个字段，并同步更新 `Thread` 模型和新库建表语句。已核对本地 `data/corpcom.db` 的表结构；执行生命周期于后续 M4 接入，验收范围见下文。
+
+## M4 执行协调器与验收（2026-11-10）
+
+HTTP 消息接口通过应用共用的 `RunCoordinator` 执行研究。首版单进程，整体最多两轮，不排队；先获取额度，再通过数据库条件 UPDATE 取得 Thread 执行资格。同 Thread 冲突返回 409，整体满额返回 503（满额检查优先）；两种拒绝均发生在用户问题保存前。同 Workspace 的不同 Thread 可并行执行。
+
+`ask_workspace` 保存用户问题并生成回答，协调器通过 `complete_thread_execution` 在同一 SQLite 事务内插入最终回答、写入 succeeded 和结束时间并更新 Workspace 时间。失败时记录 failed 并原样抛出异常，finally 释放整体额度。业务库与 checkpoint 库之间仍没有跨库原子事务，也没有请求去重、自动重试或完整执行历史。
+
+现有 Thread 详情及 Workspace 的 Thread 列表返回最近执行状态。应用启动、接受请求前将遗留 running 改为 interrupted，保留开始时间和消息；结束时间是确认中断的时间。普通打开 Store 不触发此处理，重复启动不刷新已有终态。不支持多个服务进程同时使用同一数据目录。
+
+本次执行 `.venv/bin/python -m unittest discover -s tests -v`：67 项，66 通过、1 按配置跳过；跳过的是需 `CORPCOM_LIVE_TESTS=1` 的真实金融接口测试。模型测试使用脚本化替身。已补齐的仓库回归场景：
+
+| 工件 | 验收内容 |
+| --- | --- |
+| `tests/test_api.py`（12 项通过） | 同 Thread 拒绝重叠；同 Workspace 双 Thread 同时进入执行；跨 Workspace 共用两轮额度，第三轮拒绝且数据不变；额度复用；连续两次模型失败后的状态和消息；应用启动标记中断、其他终态不变、再次启动不刷新结束时间 |
+| `tests/test_workspace.py` | 在回答 INSERT 后用 SQLite 触发器拒绝状态 UPDATE，确认异常传播，回答和状态整体回滚；新连接读取仍与原快照一致 |
+| `examples/probe_agent_bash.py` | 前述接入步骤已运行通过：脚本化模型、真实 Docker、工具结果回传、问答与 checkpoint 落盘及容器复用；本次仅新增测试，未重复执行该 probe |
+
+**空 Workspace 并发首轮初始化竞态已修复并通过回归。** `add_user_message` 使用 `BEGIN IMMEDIATE`，在同一短事务内判断是否已有用户消息并插入本轮问题，返回消息及首条标记。`ask_workspace` 使用该标记和研究信息是否为空决定初始化指令。`tests/test_workspace.py` 验证并发插入只有一个首条标记；`tests/test_workspace_agent.py` 使用 Barrier 确保两个问题均已保存后才组装提示词，验证只有首条问题得到初始化指令、两轮均正常保存回答。测试使用临时数据库、真实框架和脚本化模型，不作为真实模型初始化质量证据。M4 最终验收待汇总。
+
+前端 Thread 运行展示、切换及上传属于 M5，两个真实研究任务的完整并发验收属于 M6；M6 验收后才合并 PR。
 
 ## 共享容器与 Bash 验证
 
@@ -87,7 +107,7 @@ Bash 执行验证：
 - 一条命令超时后，另一条并行命令正常完成；忽略 TERM 的子进程及其 Bash 父进程均被终止并回收。
 - 超时后仍可执行命令，且获取到的容器 ID 保持不变。
 
-2026-11-05 验收：上述容器层行为已通过真实 Docker 验证，补齐后的仓库 probe 也由用户运行通过。Agent 已接入 `execute_bash`，完整调用链另由 `examples/probe_agent_bash.py` 验证；现有 `execute_python` 仍使用独立执行与复制归档流程。API 仍保留 Workspace 互斥，跨 Thread 的 Agent 与前端并发留待 M4—M6 验收。
+2026-11-05 验收：上述容器层行为已通过真实 Docker 验证，补齐后的仓库 probe 也由用户运行通过。Agent 已接入 `execute_bash`，完整调用链另由 `examples/probe_agent_bash.py` 验证；现有 `execute_python` 仍使用独立执行与复制归档流程。该次验收时 API 仍为 Workspace 互斥；当前后端 Thread 并发进展见 M4 验收，前端并发与真实双研究验收仍待 M5—M6。
 
 ## 工作区文本写入与编辑
 
@@ -135,7 +155,7 @@ Edit 使用字面字符串匹配：`old_string` 不能为空，默认必须恰�
 
 M1、M2、M3 在上述范围内已验收。2026-11-06 核对：已通过 PR #1 合并到 main，合并提交为 `65b6c02`。M4—M6 在新分支 `xyt/feat-thread-concurrency` 上推进，M6 验收完成后再合并 PR。
 
-目前没有 RunCoordinator，API 仍为 Workspace 互斥；这份记录不覆盖 M4—M6 的多 Thread 并发、研究中上传及运行状态恢复。
+上述为 M1—M3 验收范围；后续 RunCoordinator 与 Thread 并发的进展见 M4 验收记录，M5—M6 尚未完成。
 
 ## 自动验收
 
@@ -154,7 +174,7 @@ uv run python -m unittest discover -s tests -v
 - `tests/test_workspace_agent.py` 使用替身模型运行真实框架循环，覆盖首条消息初始化及跨会话和部分填写的排除条件、对话修改研究信息与新会话读取、多轮上下文、SQLite 重开恢复、旧历史仅导入一次、不同 thread 的 checkpoint 隔离、工具结果落盘、可预期工具错误后的续聊、跨 Workspace 归属检查、非预期异常传播、模型调用上限和空回答。
 - `tests/test_api.py` 验收 HTTP 合同、研究信息部分更新与旧偏好路由兼容、偏好 JSON 类型与数值校验、文件上传下载、应用重建后的恢复、模型错误、并发限制和 CORS。
 
-自动测试中的模型为替身；真实模型的 HTTP 验收记录见 [后端接口文档](backend-api.md#已验证)。Agent 已可通过 Python 工具生成并登记报告产物，当前只保存初始假设，尚无正式假设修订版本或调度。执行协调器、流式、上下文和记忆的计划见 [开发路线与进度](roadmap.md)，不以业务 Run 管理为前置条件。
+自动测试中的模型为替身；真实模型的 HTTP 验收记录见 [后端接口文档](backend-api.md#已验证)。Agent 已可通过 Python 工具生成并登记报告产物，当前只保存初始假设，尚无正式假设修订版本或调度。执行协调器的收尾及后续流式、上下文和记忆计划见 [开发路线与进度](roadmap.md)，不以业务 Run 管理为前置条件。
 
 ## 代码中的数据对象
 
@@ -175,7 +195,7 @@ uv run python -m unittest discover -s tests -v
 
 ## 模型上下文与 LangChain 执行循环
 
-`workspace_agent.py` 负责组装研究上下文、注册工具、调用 Agent 并保存问答。Python 入口为 `ask_workspace(store, model, workspace_id, thread_id, question, checkpointer)`，`model` 是 LangChain 的 `BaseChatModel` 实例。checkpointer 接收框架的 BaseCheckpointSaver；HTTP 服务使用由 lifespan 管理的 SqliteSaver。
+`workspace_agent.py` 负责组装研究上下文、注册工具、保存用户问题并调用 Agent 生成回答；最终回答由 RunCoordinator 调用存储方法与成功状态一并保存。Python 入口为 `ask_workspace(store, model, workspace_id, thread_id, question, checkpointer)`，`model` 是 LangChain 的 `BaseChatModel` 实例。checkpointer 接收框架的 BaseCheckpointSaver；HTTP 服务使用由 lifespan 管理的 SqliteSaver。
 
 | 职责 | 实现 |
 | --- | --- |

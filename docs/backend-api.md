@@ -39,7 +39,7 @@ uv run uvicorn corpcom.api:create_app --factory --host 127.0.0.1 --port 8000
 | GET | `/api/workspaces/{wid}/files/{aid}` | 返回 `Artifact` 文件元信息 |
 | GET | `/api/workspaces/{wid}/files/{aid}/content` | 下载已保存文件的内容 |
 
-消息接口接收本轮用户文本。当前 thread 尚无 checkpoint 时，后端从业务库导入完整问答历史；已有 checkpoint 时，由框架恢复历史，仅输入本轮用户消息。模型成功回答后，后端将最终回答保存到业务库。前端无需传入历史、角色或模型配置。接口一次返回完整回答，尚未接入流式输出。
+消息接口接收本轮用户文本。当前 thread 尚无 checkpoint 时，后端从业务库导入完整问答历史；已有 checkpoint 时，由框架恢复历史，仅输入本轮用户消息。模型生成回答后，协调器在同一业务库事务中保存最终回答和 succeeded 状态。前端无需传入历史、角色或模型配置。接口一次返回完整回答，尚未接入流式输出。
 
 `corpcom.db` 保存 Workspace 标识、标题、时间、会话、文件索引及用户、最终助手消息；研究目标、初始假设、范围、观察周期和偏好统一保存于 `workspaces/<wid>/research.json`。同一数据目录下的 `checkpoints.sqlite` 保存 Agent 消息状态，包括工具调用和结果。服务通过 lifespan 管理 checkpoint 连接，使用 `workspace_id:thread_id` 标识执行历史。
 
@@ -107,12 +107,12 @@ curl -X POST "http://127.0.0.1:8000/api/workspaces/$workspace_id/files" \
 | 状态码 | 含义 |
 | --- | --- |
 | 404 | 研究、会话或文件不存在，或不属于请求中的 Workspace |
-| 409 | 同一 Workspace 已有 Agent 请求执行，本次提问尚未保存 |
+| 409 | 同一 Thread 已有执行，本次提问尚未保存（整体额度未满时） |
 | 422 | 请求字段不合法；`detail` 列出字段位置、原因和错误类型 |
 | 502 | 模型接口失败或达到十次调用上限；已保存用户提问，没有保存助手回答 |
-| 503 | 后端未配置模型，本次提问尚未保存 |
+| 503 | 后端未配置模型，或整体两轮额度已满；本次提问尚未保存 |
 
-HTTP 错误返回 `{"detail": ...}`；未处理的程序错误由服务器返回 500 并记录异常。请求失败后可读取 thread 查看已保存消息；当前没有请求去重和中断恢复，重新发送会新增一条用户消息。
+HTTP 错误返回 `{"detail": ...}`；未处理的程序错误由服务器返回 500 并记录异常。请求失败后可读取 thread 查看已保存消息；当前没有请求去重或自动续跑，重新发送会新增一条用户消息。启动时仅将遗留 running 标记为 interrupted。
 
 同步的 SQLite 和模型调用在请求工作线程内执行，模型等待不会占用 HTTP 事件循环。每个路由在执行线程内创建和关闭自己的数据库连接；Agent 工具也各自建立连接。
 
@@ -128,4 +128,10 @@ Agent 工具遇到 `RecordNotFoundError` 时，中间件返回匹配调用 ID、
 
 2026-11-05 产物主动登记验收：`tests/test_register_artifact.py` 的 7 项测试通过，包括已有文件原地登记、重复与并发登记复用 ID、编辑后通过 `/content` 读取最新内容及跨 Workspace 访问拒绝；现有工具测试 6 项也通过，覆盖旧 Python 归档流程。
 
-同日用户确认真实模型与前端联动验收完成：模型写报告、调用 `register_artifact`、前端文件列表显示、预览和下载通过。该项为用户实测确认；此前的 HTTP 自动测试与脚本化模型测试分别记录，不替代页面验收。当前 API 仍保留 Workspace 互斥。M1—M3 的完整证据与合并前待办见 [本地验收记录](workspace-local.md#m1m3-验收记录2026-11-05)。
+同日用户确认真实模型与前端联动验收完成：模型写报告、调用 `register_artifact`、前端文件列表显示、预览和下载通过。该项为用户实测确认；此前的 HTTP 自动测试与脚本化模型测试分别记录，不替代页面验收。该次验收时 API 仍为 Workspace 互斥。M1—M3 的完整证据见 [本地验收记录](workspace-local.md#m1m3-验收记录2026-11-05)。
+
+2026-11-10 M4 回归：全量 67 项中 66 通过、1 项真实金融接口测试按配置跳过，API 的 12 项测试全部通过。已验证同 Thread 冲突、同 Workspace 双 Thread 并行、跨 Workspace 共用两轮额度、满额拒绝不写数据、失败后额度复用、启动识别中断及终态保留。使用临时数据和脚本化模型，不作为前端或真实模型并发验收。
+
+Thread 响应新增 `execution_status`、`execution_started_at`、`execution_finished_at`、`execution_error`。未执行时均为空；状态取 running/succeeded/failed/interrupted，仅保留最近一轮。整体额度由应用启动时的 `RunCoordinator(..., max_concurrent_runs=2)` 设置，满额立即拒绝；整体满额检查先于 Thread 冲突检查。首版要求单进程运行。
+
+空 Workspace 并发首轮的重复初始化指令已修复：首条用户消息判断与消息插入在同一短事务内完成，并发回归确认只有首条用户消息触发初始化指令。验证记录和后续范围见 [本地执行协调器验收](workspace-local.md#m4-执行协调器与验收2026-11-10)。

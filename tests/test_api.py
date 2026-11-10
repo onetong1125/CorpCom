@@ -17,6 +17,7 @@ from openai import APIConnectionError
 
 from corpcom.api import create_app, get_model
 from corpcom.workspace_agent import ask_workspace
+from corpcom.workspace import WorkspaceStore
 
 
 class ApiTestModel(FakeMessagesListChatModel):
@@ -176,16 +177,59 @@ class ApiTests(unittest.TestCase):
         ).status_code, 422)
     self.assertEqual(self.client.get(self.url).json(), before)
 
-  def test_upstream_failure_returns_502_and_releases_workspace(self):
-    error = APIConnectionError(request=httpx.Request("POST", "http://model.invalid"))
+  def test_upstream_failure_marks_failed_and_releases_capacity(self):
+    error = APIConnectionError(
+        request=httpx.Request("POST", "http://model.invalid"),
+    )
+    questions = ["失败提问一", "失败提问二"]
+
     with patch.object(ApiTestModel, "_generate", side_effect=error):
-      with self.assertLogs("corpcom.api", level="ERROR"):
-        failed = self.client.post(self.thread_url + "/messages", json={"content": "失败的提问"})
-    self.assertEqual(failed.status_code, 502)
-    history = self.client.get(self.thread_url).json()["messages"]
-    self.assertEqual([(item["role"], item["content"]) for item in history], [("user", "失败的提问")])
-    next_turn = self.client.post(self.thread_url + "/messages", json={"content": "继续"})
-    self.assertEqual(next_turn.status_code, 201, next_turn.text)
+      for index, question in enumerate(questions, start=1):
+        with self.assertLogs("corpcom.api", level="ERROR"):
+          response = self.client.post(
+              self.thread_url + "/messages",
+              json={"content": question},
+          )
+        self.assertEqual(response.status_code, 502, response.text)
+
+        response = self.client.get(self.thread_url)
+        self.assertEqual(response.status_code, 200, response.text)
+        detail = response.json()
+
+        self.assertEqual(detail["execution_status"], "failed")
+        self.assertIsNotNone(detail["execution_started_at"])
+        self.assertIsNotNone(detail["execution_finished_at"])
+        self.assertEqual(detail["execution_error"], str(error))
+        self.assertEqual(
+            [(m["role"], m["content"]) for m in detail["messages"]],
+            [("user", q) for q in questions[:index]],
+        )
+
+    # 退出 patch，下一轮恢复正常模型调用。
+    response = self.client.post(
+        self.thread_url + "/messages",
+        json={"content": "继续"},
+    )
+    self.assertEqual(response.status_code, 201, response.text)
+    answer = response.json()
+
+    response = self.client.get(self.thread_url)
+    self.assertEqual(response.status_code, 200, response.text)
+    detail = response.json()
+
+    self.assertEqual(detail["execution_status"], "succeeded")
+    self.assertIsNone(detail["execution_error"])
+    self.assertIsNotNone(detail["execution_finished_at"])
+    self.assertEqual(detail["messages"][-1], answer)
+    self.assertEqual(
+        [(m["role"], m["content"]) for m in detail["messages"]],
+        [
+          ("user", "失败提问一"),
+          ("user", "失败提问二"),
+          ("user", "继续"),
+          ("assistant", "先核对现金流。"),
+        ],
+    )
 
   def test_overlapping_thread_turn_returns_409_without_duplicate_message(self):
     entered = Event()
@@ -413,6 +457,91 @@ class ApiTests(unittest.TestCase):
         ],
     )
 
+  def test_startup_marks_running_threads_interrupted(self):
+    data_dir = self.root / "restart-data"
+
+    # 准备遗留状态，此时还没有启动应用。
+    with WorkspaceStore(data_dir) as store:
+      workspace = store.create_workspace("重启测试")
+      running = store.create_thread(workspace.id, "执行中")
+      succeeded = store.create_thread(workspace.id, "已成功")
+      failed = store.create_thread(workspace.id, "已失败")
+      idle = store.create_thread(workspace.id, "未执行")
+
+      for thread in (running, succeeded, failed):
+        store.add_message(
+            workspace.id, thread.id, "user", "测试问题",
+        )
+        store.start_thread_execution(workspace.id, thread.id)
+
+      store.complete_thread_execution(
+          workspace.id, succeeded.id, "已保存的回答",
+      )
+      store.finish_thread_execution(
+          workspace.id, failed.id,
+          status="failed", error="测试失败",
+      )
+
+      before = {
+        thread.id: store.get_thread(
+            workspace.id, thread.id,
+        ).model_dump(mode="json")
+        for thread in (running, succeeded, failed, idle)
+      }
+
+    # 普通打开 Store 不应改变运行状态。
+    with WorkspaceStore(data_dir) as store:
+      self.assertEqual(
+          store.get_thread(
+              workspace.id, running.id,
+          ).model_dump(mode="json"),
+          before[running.id],
+      )
+
+    urls = {
+      thread_id: (
+        f"/api/workspaces/{workspace.id}/threads/{thread_id}"
+      )
+      for thread_id in before
+    }
+
+    # 进入 TestClient 上下文，实际执行 lifespan。
+    after = {}
+    with TestClient(create_app(data_dir)) as client:
+      for thread_id, url in urls.items():
+        response = client.get(url)
+        self.assertEqual(response.status_code, 200, response.text)
+        after[thread_id] = response.json()
+
+      interrupted = after[running.id]
+      original = before[running.id]
+
+      self.assertEqual(
+          interrupted["execution_status"], "interrupted",
+      )
+      self.assertEqual(
+          interrupted["execution_started_at"],
+          original["execution_started_at"],
+      )
+      self.assertIsNotNone(interrupted["execution_finished_at"])
+      self.assertEqual(
+          interrupted["execution_error"],
+          "后端重启，上次执行已中断",
+      )
+      self.assertEqual(
+          interrupted["messages"], original["messages"],
+      )
+
+      # 成功、失败和未执行的会话都不应改变。
+      for thread in (succeeded, failed, idle):
+        self.assertEqual(after[thread.id], before[thread.id])
+
+    # 再启动一次，已中断状态及其结束时间不应被刷新。
+    with TestClient(create_app(data_dir)) as client:
+      for thread_id, url in urls.items():
+        response = client.get(url)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), after[thread_id])
 
 
 if __name__ == "__main__":

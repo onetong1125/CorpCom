@@ -1,10 +1,12 @@
 """Exercise the real LangChain loop with a scripted model and temporary workspace storage."""
 
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
 import json
 from logging import setLoggerClass
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Barrier
 import unittest
 from unittest.mock import patch
 
@@ -50,6 +52,58 @@ class WorkspaceAgentTests(unittest.TestCase):
             self.thread = store.create_thread(self.workspace.id, "连续讨论")
         # Give each test an independent checkpoint store.
         self.checkpointer = InMemorySaver()
+
+    def test_concurrent_first_turns_only_instruct_one_research_initialization(self):
+        with WorkspaceStore(self.data) as store:
+            empty = store.create_workspace("并发首次研究")
+            threads = [store.create_thread(empty.id, str(i)) for i in range(2)]
+        models = [
+            ScriptedModel(responses=[AIMessage(content=f"回答 {i}")])
+            for i in range(2)
+        ]
+        ready = Barrier(2)
+        saved = Barrier(2)
+        original_add = WorkspaceStore.add_user_message
+
+        def save_before_prompt(store, workspace_id, thread_id, content):
+            result = original_add(store, workspace_id, thread_id, content)
+            # Both messages exist before either Agent builds its prompt; the
+            # first-message decision must survive beyond the insertion transaction.
+            saved.wait(timeout=5)
+            return result
+
+        checkpoint_path = str(self.data / "concurrent-checkpoints.sqlite")
+        with SqliteSaver.from_conn_string(checkpoint_path) as checkpointer:
+            coordinator = RunCoordinator(checkpointer, max_concurrent_runs=2)
+
+            def run(index):
+                with WorkspaceStore(self.data) as store:
+                    ready.wait(timeout=5)
+                    return coordinator.run(
+                        store, models[index], empty.id, threads[index].id,
+                        f"研究问题 {index}",
+                    )
+
+            with patch.object(WorkspaceStore, "add_user_message", new=save_before_prompt):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    answers = list(executor.map(run, range(2)))
+
+        initialize = [
+            "这是整个 Workspace 的第一条用户消息" in model.requests[0][0].content
+            for model in models
+        ]
+        self.assertEqual(sorted(initialize), [False, True])
+        with WorkspaceStore(self.data) as store:
+            details = [store.get_thread(empty.id, thread.id) for thread in threads]
+            first_index = min(range(2), key=lambda i: details[i].messages[0].id)
+            self.assertTrue(initialize[first_index])
+            for index, detail in enumerate(details):
+                self.assertEqual(detail.execution_status, "succeeded")
+                self.assertEqual(
+                    [(m.role, m.content) for m in detail.messages],
+                    [("user", f"研究问题 {index}"), ("assistant", f"回答 {index}")],
+                )
+                self.assertEqual(detail.messages[-1], answers[index])
 
     def test_first_workspace_message_initializes_empty_research_and_persists_it(self):
         generated = {
