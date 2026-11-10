@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 from uuid import uuid4
+from typing import Literal
 
 from pydantic import JsonValue
 
@@ -26,7 +27,11 @@ CREATE TABLE IF NOT EXISTS threads (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     title TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    execution_status TEXT CHECK (execution_status IN ('running', 'succeeded', 'failed', 'interrupted')),
+    execution_started_at TEXT,
+    execution_finished_at TEXT,
+    execution_error TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
@@ -53,6 +58,9 @@ class RecordNotFoundError(ValueError):
 class ArtifactRegistrationError(ValueError):
   """A supplied file or kind cannot be registered as a workspace artifact."""
 
+
+class ThreadBusyError(ValueError):
+  """The thread already has an execution in progress."""
 
 def _require_text(**fields: str) -> None:
   """Reject blank required input without changing valid text formatting."""
@@ -225,6 +233,32 @@ class WorkspaceStore:
     return Message.model_validate(dict(self.db.execute(
         "SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)
     ).fetchone()))
+
+  def add_user_message(
+    self,
+    workspace_id: str,
+    thread_id: str,
+    content: str,
+) -> tuple[Message, bool]:
+    """Save the user's message and return whether is's an initial message """
+    self._thread(workspace_id, thread_id)
+    _require_text(content=content)
+    with self.db:
+      # 先取得数据库写入资格
+      self.db.execute("BEGIN IMMEDIATE")
+      is_first = not self.has_user_messages(workspace_id)
+      cursor = self.db.execute(
+          "INSERT INTO messages (thread_id, role, content) VALUES (?, 'user', ?)",
+          (thread_id, content),
+      )
+      self._touch(workspace_id)
+      message = Message.model_validate(dict(self.db.execute(
+        "SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)
+      ).fetchone()))
+
+      return (message, is_first)
+
+
 
   def import_file(self, workspace_id: str, source: Path,
       kind: str) -> ArtifactFile:
@@ -438,3 +472,105 @@ class WorkspaceStore:
     if not path.is_file():
       raise FileNotFoundError(f"stored file is missing: {path}")
     return ArtifactFile(**artifact, path=path)
+
+  def start_thread_execution(
+      self, workspace_id: str, thread_id: str,
+  ) -> Thread:
+    """Claim execution and return the Thread snapshot from before the claim."""
+    with self.db:
+      # Read the old state under the same write lock as the admission update.
+      self.db.execute("BEGIN IMMEDIATE")
+      previous = self._thread(workspace_id, thread_id)
+      cursor = self.db.execute(
+          """
+          UPDATE threads
+          SET execution_status      = 'running',
+              execution_started_at  = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+              execution_finished_at = NULL,
+              execution_error       = NULL
+          WHERE workspace_id = ?
+            AND id = ?
+            AND (
+              execution_status IS NULL
+                  OR execution_status <> 'running'
+              )
+          """,
+          (workspace_id, thread_id),
+      )
+
+      if cursor.rowcount == 0:
+        raise ThreadBusyError(f"Thread is already running: {thread_id}")
+
+      return previous
+
+  def finish_thread_execution(
+      self,
+      workspace_id: str,
+      thread_id: str,
+      *,
+      status: Literal["succeeded", "failed"],
+      error: str | None = None,
+  ) -> Thread:
+    self._thread(workspace_id, thread_id)
+
+    with self.db:
+      self.db.execute(
+          """
+          UPDATE threads SET execution_status = ?,
+          execution_finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+          execution_error = ?
+          WHERE workspace_id = ? AND id = ?
+          """,
+          (status, error, workspace_id, thread_id),
+      )
+
+      return self._thread(workspace_id, thread_id)
+
+
+  def interrupt_running_executions(self) -> int:
+    with self.db:
+      cursor = self.db.execute(
+          """
+          UPDATE threads
+          SET execution_status = 'interrupted',
+              execution_finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+              execution_error = '后端重启，上次执行已中断'
+          WHERE execution_status = 'running'
+          """
+      )
+      return cursor.rowcount
+
+  def complete_thread_execution(
+      self,
+      workspace_id: str,
+      thread_id: str,
+      answer: str,
+  ) -> Message:
+    self._thread(workspace_id, thread_id)
+    _require_text(content=answer)
+    with self.db:
+      cursor = self.db.execute(
+          """
+          INSERT INTO messages (thread_id, role, content)
+          VALUES (?, 'assistant', ?);
+          """,
+          (thread_id, answer)
+      )
+      message_id = cursor.lastrowid
+
+      self.db.execute(
+          """
+          UPDATE threads
+          SET execution_status = 'succeeded',
+              execution_finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+              execution_error = NULL
+          WHERE workspace_id = ? AND id = ?;
+          """,
+          (workspace_id, thread_id),
+      )
+
+      self._touch(workspace_id)
+
+      return Message.model_validate(dict(self.db.execute(
+          "SELECT * FROM messages WHERE id = ?", (message_id,)
+      ).fetchone()))

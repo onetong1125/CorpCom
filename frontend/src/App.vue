@@ -23,13 +23,44 @@ const workspaces = ref([]);
 const workspace = ref(null);
 const thread = ref(null);
 const loading = ref(true);
-const sending = ref(false);
+const runs = reactive({});
+const drafts = reactive({});
+const uploads = reactive({});
 const saving = ref(false);
 const error = ref("");
 const search = ref("");
 const threadSearch = ref("");
-const draft = ref("");
-const pendingText = ref("");
+const pollError = ref("");
+let selectionVersion = 0;
+let refreshVersion = 0;
+const draft = computed({
+  get: () => drafts[thread.value?.id] || "",
+  set: (value) => {
+    drafts[thread.value.id] = value;
+  },
+});
+const sending = computed(
+  () => Boolean(runs[thread.value?.id]?.pending) ||
+    thread.value?.execution_status === "running",
+);
+const pendingText = computed(() => {
+  const run = runs[thread.value?.id];
+  // A refresh may already contain the persisted user message.
+  return run?.pending &&
+    thread.value.messages.filter((item) => item.role === "user").length === run.userMessageCount
+    ? run.content
+    : "";
+});
+const executionError = computed(() => {
+  const run = runs[thread.value?.id];
+  if (run?.error) return run.error;
+  if (run?.pending) return "";
+  if (thread.value?.execution_status === "failed")
+    return `上次研究失败：${thread.value.execution_error}`;
+  if (thread.value?.execution_status === "interrupted")
+    return `上次研究已中断：${thread.value.execution_error}`;
+  return "";
+});
 const sidebarOpen = ref(false);
 const messageEnd = ref(null);
 const modal = ref(null);
@@ -43,7 +74,7 @@ const form = reactive({
   observation_period: "",
   preferences: "{}",
 });
-const busy = computed(() => loading.value || saving.value || sending.value);
+const busy = computed(() => loading.value || saving.value);
 const filteredWorkspaces = computed(() =>
   workspaces.value.filter((item) =>
     `${item.title} ${item.goal}`
@@ -77,75 +108,98 @@ function rememberSelection() {
 }
 
 async function loadSelection(id, threadId) {
+  const version = ++selectionVersion;
+  loading.value = true;
+  pollError.value = "";
   threadSearch.value = "";
   workspace.value = null;
   thread.value = null;
-  draft.value = "";
-  const detail = await request(`/workspaces/${id}`);
-  workspace.value = detail;
-  const selected =
-    detail.threads.find((item) => item.id === threadId) ||
-    detail.threads.at(-1);
-  if (selected)
-    thread.value = await request(`/workspaces/${id}/threads/${selected.id}`);
-  rememberSelection();
+  try {
+    const detail = await request(`/workspaces/${id}`);
+    if (version !== selectionVersion) return;
+    const selected =
+      detail.threads.find((item) => item.id === threadId) || detail.threads.at(-1);
+    const selectedThread = selected
+      ? await request(`/workspaces/${id}/threads/${selected.id}`)
+      : null;
+    if (version !== selectionVersion) return;
+    workspace.value = detail;
+    thread.value = selectedThread;
+    rememberSelection();
+  } catch (err) {
+    if (version === selectionVersion) throw err;
+  } finally {
+    if (version === selectionVersion) loading.value = false;
+  }
 }
 
 async function initialize() {
+  let version = ++selectionVersion;
   loading.value = true;
   error.value = "";
   try {
-    workspaces.value = await request("/workspaces");
+    const list = await request("/workspaces");
+    if (version !== selectionVersion) return;
+    workspaces.value = list;
     const params = new URLSearchParams(window.location.search);
     const selected =
       workspaces.value.find((item) => item.id === params.get("workspace")) ||
       workspaces.value[0];
-    if (selected) await loadSelection(selected.id, params.get("thread"));
+    if (selected) {
+      const selection = loadSelection(selected.id, params.get("thread"));
+      version = selectionVersion;
+      await selection;
+    }
   } catch (err) {
-    error.value = err.message;
+    if (version === selectionVersion) error.value = err.message;
   } finally {
-    loading.value = false;
+    if (version === selectionVersion) loading.value = false;
   }
 }
 
-async function selectWorkspace(id) {
-  loading.value = true;
+async function selectWorkspace(id, threadId) {
   error.value = "";
   sidebarOpen.value = false;
   try {
-    await loadSelection(id);
+    await loadSelection(id, threadId);
   } catch (err) {
     error.value = err.message;
-  } finally {
-    loading.value = false;
   }
 }
 
 async function selectThread(id) {
+  const version = ++selectionVersion;
+  const workspaceId = workspace.value.id;
   loading.value = true;
   error.value = "";
   sidebarOpen.value = false;
-  draft.value = "";
   thread.value = null;
   try {
-    thread.value = await request(`${workspacePath.value}/threads/${id}`);
+    const selected = await request(`/workspaces/${workspaceId}/threads/${id}`);
+    if (version !== selectionVersion) return;
+    thread.value = selected;
     rememberSelection();
   } catch (err) {
-    error.value = err.message;
+    if (version === selectionVersion) error.value = err.message;
   } finally {
-    loading.value = false;
+    if (version === selectionVersion) loading.value = false;
   }
 }
 
-async function refreshResearch() {
-  // Reload both indexes and persisted messages, including after a failed model request.
-  const reads = [request(workspacePath.value), request("/workspaces")];
-  if (thread.value)
-    reads.push(request(`${workspacePath.value}/threads/${thread.value.id}`));
+async function refreshResearch(workspaceId = workspace.value.id) {
+  // Background work only refreshes its own workspace; navigation reloads other workspaces.
+  if (workspace.value?.id !== workspaceId) return;
+  const selection = selectionVersion;
+  const version = ++refreshVersion;
+  const threadId = thread.value?.id;
+  const path = `/workspaces/${workspaceId}`;
+  const reads = [request(path), request("/workspaces")];
+  if (threadId) reads.push(request(`${path}/threads/${threadId}`));
   const results = await Promise.allSettled(reads);
+  if (selection !== selectionVersion || version !== refreshVersion) return;
   if (results[0].status === "fulfilled") workspace.value = results[0].value;
   if (results[1].status === "fulfilled") workspaces.value = results[1].value;
-  if (thread.value && results[2].status === "fulfilled")
+  if (threadId && results[2].status === "fulfilled")
     thread.value = results[2].value;
   const failures = results.filter((result) => result.status === "rejected");
   if (failures.length)
@@ -153,40 +207,87 @@ async function refreshResearch() {
 }
 
 async function refresh() {
+  const version = selectionVersion;
   loading.value = true;
   error.value = "";
   try {
     await refreshResearch();
   } catch (err) {
-    error.value = err.message;
+    if (version === selectionVersion) error.value = err.message;
   } finally {
-    loading.value = false;
+    if (version === selectionVersion) loading.value = false;
   }
 }
 
 async function sendMessage() {
-  if (busy.value || !draft.value.trim() || !thread.value) return;
-  sending.value = true;
-  error.value = "";
-  pendingText.value = draft.value.trim();
+  if (busy.value || sending.value || !draft.value.trim() || !thread.value) return;
+  const workspaceId = workspace.value.id;
+  const threadId = thread.value.id;
+  runs[threadId] = {
+    pending: true,
+    content: draft.value.trim(),
+    userMessageCount: thread.value.messages.filter((item) => item.role === "user")
+      .length,
+    error: "",
+  };
+  const run = runs[threadId];
   try {
     await jsonRequest(
-      `${workspacePath.value}/threads/${thread.value.id}/messages`,
-      { content: pendingText.value },
+      `/workspaces/${workspaceId}/threads/${threadId}/messages`,
+      { content: run.content },
     );
-    draft.value = "";
+    drafts[threadId] = "";
   } catch (err) {
-    error.value = `${err.message}。请先核对消息记录；重新发送会发起新的请求。`;
+    run.error = `${err.message}。请先核对消息记录；重新发送会发起新的请求。`;
   }
   try {
-    await refreshResearch();
+    await refreshResearch(workspaceId);
   } catch (err) {
-    error.value += `${error.value ? " " : ""}刷新记录失败：${err.message}`;
+    run.error += `${run.error ? " " : ""}刷新记录失败：${err.message}`;
   } finally {
-    sending.value = false;
-    pendingText.value = "";
+    run.pending = false;
   }
 }
+
+function executionLabel(item) {
+  const status = runs[item.id]?.pending
+    ? "running"
+    : thread.value?.id === item.id
+      ? thread.value.execution_status
+      : item.execution_status;
+  return {
+    running: "研究中", succeeded: "已完成", failed: "失败", interrupted: "已中断",
+  }[status];
+}
+
+watch(
+  () => workspace.value && (
+    sending.value || workspace.value.threads.some((item) =>
+      item.execution_status === "running" || runs[item.id]?.pending,
+    )
+  ) ? workspace.value.id : null,
+  (workspaceId, _, onCleanup) => {
+    pollError.value = "";
+    if (!workspaceId) return;
+    let active = true;
+    let timer;
+    onCleanup(() => {
+      active = false;
+      clearTimeout(timer);
+    });
+    async function poll() {
+      try {
+        await refreshResearch(workspaceId);
+        if (active) pollError.value = "";
+      } catch (err) {
+        if (active) pollError.value = `自动刷新失败：${err.message}`;
+      } finally {
+        if (active) timer = setTimeout(poll, 2000);
+      }
+    }
+    timer = setTimeout(poll, 2000);
+  },
+);
 
 async function openModal(kind) {
   sidebarOpen.value = false;
@@ -258,6 +359,7 @@ async function saveModal() {
       });
       completed = true;
       modal.value.close();
+      ++selectionVersion;
       thread.value = { ...created, messages: [] };
       threadSearch.value = "";
       draft.value = "";
@@ -289,19 +391,21 @@ async function saveModal() {
 }
 
 async function uploadFile(file) {
-  saving.value = true;
-  error.value = "";
+  const workspaceId = workspace.value.id;
+  if (uploads[workspaceId]?.pending) return;
+  uploads[workspaceId] = { pending: true, error: "" };
+  const upload = uploads[workspaceId];
   let uploaded = false;
   try {
     const body = new FormData();
     body.append("file", file);
-    await request(`${workspacePath.value}/files`, { method: "POST", body });
+    await request(`/workspaces/${workspaceId}/files`, { method: "POST", body });
     uploaded = true;
-    await refreshResearch();
+    await refreshResearch(workspaceId);
   } catch (err) {
-    error.value = `${uploaded ? "文件已上传，但刷新失败：" : "上传失败："}${err.message}`;
+    upload.error = `${uploaded ? "文件已上传，但刷新失败：" : "上传失败："}${err.message}`;
   } finally {
-    saving.value = false;
+    upload.pending = false;
   }
 }
 
@@ -370,7 +474,7 @@ onMounted(initialize);
         <button
           v-for="item in filteredWorkspaces"
           :key="item.id"
-          :disabled="busy"
+          :disabled="saving"
           class="workspace-item"
           :class="{ active: workspace?.id === item.id }"
           :aria-current="workspace?.id === item.id ? 'page' : undefined"
@@ -411,6 +515,9 @@ onMounted(initialize);
             @click="selectThread(item.id)"
           >
             <MessageSquare :size="15" /><span>{{ item.title }}</span>
+            <small v-if="executionLabel(item)" class="thread-status">{{
+              executionLabel(item)
+            }}</small>
           </button>
           <p v-if="!filteredThreads.length" class="sidebar-empty">
             {{ threadSearch ? "没有匹配的会话" : "新建会话，开始第一次研究。" }}
@@ -484,6 +591,10 @@ onMounted(initialize);
           </div>
           <span v-if="thread">{{ thread.messages.length }} 条消息</span>
         </div>
+        <div v-if="executionError" class="error-banner" role="alert">
+          <CircleAlert :size="18" /><span>{{ executionError }}</span>
+        </div>
+        <div v-if="pollError" class="error-banner" role="alert">{{ pollError }}</div>
         <div
           class="messages"
           aria-label="对话记录"
@@ -529,7 +640,7 @@ onMounted(initialize);
             />
             <div v-else class="user-content">{{ message.content }}</div>
           </article>
-          <article v-if="sending" class="message user">
+          <article v-if="pendingText" class="message user">
             <div class="message-byline">
               <span class="avatar">你</span><strong>你</strong
               ><span class="muted">发送中</span>
@@ -540,7 +651,7 @@ onMounted(initialize);
             <span class="pulse-dot"></span>
             <div>
               <strong>正在研究，请稍候…</strong>
-              <p>完成后会显示回答并刷新研究产物。请保持页面打开。</p>
+              <p>可以切换会话、开展其他研究或上传资料；返回后会更新进度。</p>
             </div>
           </div>
           <div ref="messageEnd"></div>
@@ -550,7 +661,7 @@ onMounted(initialize);
             <textarea
               v-model="draft"
               aria-label="研究问题"
-              :disabled="busy || !thread"
+              :disabled="busy || sending || !thread"
               :placeholder="
                 thread
                   ? '提出新问题，或继续已有研究…'
@@ -567,7 +678,7 @@ onMounted(initialize);
                 class="send-button"
                 type="submit"
                 aria-label="发送研究任务"
-                :disabled="busy || !thread || !draft.trim()"
+                :disabled="busy || sending || !thread || !draft.trim()"
               >
                 <RefreshCw v-if="sending" class="spin" :size="18" /><ArrowUp
                   v-else
@@ -604,7 +715,8 @@ onMounted(initialize);
       v-if="workspace"
       :key="workspace.id"
       :workspace="workspace"
-      :busy="busy"
+      :busy="Boolean(uploads[workspace.id]?.pending)"
+      :upload-error="uploads[workspace.id]?.error || ''"
       @upload="uploadFile"
     />
 

@@ -31,19 +31,63 @@ data/
 
 创建时仅标题必填。更新只替换提交的字段，未提交字段保持原值；文本传 `""` 清空，偏好传 `{}` 清空。偏好对象仍整体替换，不合并键。用户可通过研究档案表单、HTTP 接口或对话中的 `update_research` 工具管理这些信息。整个 Workspace 的第一条用户消息到来时，如果五类研究信息全部为空（空白文本也视为空），Agent 根据该消息整理目标、范围和待验证初始假设，通过 `update_research` 保存后继续回答；观察周期和偏好只提取消息中有依据的内容。若消息没有研究主题，则先询问目标。已有任一字段或任一会话已有用户消息时，不再自动初始化，此后只按用户明确要求修改。新会话拥有独立消息列表，共享这些研究信息与文件。
 
-存储初始化只创建当前表结构，不包含旧结构的兼容或自动迁移逻辑。开发阶段已有旧数据库时，停止后端后手动运行一次：
-
-```bash
-.venv/bin/python scripts/migrate_workspace_research.py data
-```
-
-脚本将五个研究字段写入各 Workspace 的 `research.json`，直接删除数据库中的对应列；标识、标题、时间和关联记录保持不变。脚本针对旧表结构执行一次，不做版本判断或重复迁移。新建数据目录无需执行。迁移后列表、详情和 Agent 上下文均从该文件读取，文件缺失或格式错误会明确报错。
+存储初始化只创建当前表结构，不包含旧结构的兼容或自动迁移逻辑。五个研究字段保存在各 Workspace 的 `research.json` 中；列表、详情和 Agent 上下文均从该文件读取，文件缺失或格式错误会明确报错。
 
 接口和 Agent 工具共用 `WorkspaceStore.update_research`。更新在 SQLite 写事务内读取最新文件并合并指定字段，再通过临时文件替换完整 JSON，防止并发写入丢失其他字段或读到半份 JSON。文件替换与 SQLite 时间戳提交不构成跨介质原子事务；手工编辑文件也不更新数据库时间戳。
 
 文件导入时生成独立副本，原文件后来被修改或删除不影响副本；同名文件重复导入会生成不同 ID，保留各自内容。已登记的副本丢失时明确报错。
 
 所有会话和文件操作都检查所属 Workspace ID，跨 Workspace 读取会话、写消息或获取文件会失败。这是单用户应用的数据归属检查；同一操作系统用户仍可直接访问磁盘文件。
+
+## Thread 最近执行状态
+
+`Thread` 和 `threads` 表直接保存最近一轮的 `execution_status`、`execution_started_at`、`execution_finished_at`、`execution_error`，不另建执行表或执行 ID。状态可为 `running`、`succeeded`、`failed`、`interrupted`；尚未执行时四个字段均为空。每轮覆盖最近状态，消息历史仍保留在 `messages` 表。
+
+2026-11-06：已通过 DDL SQL（`ALTER TABLE threads ADD COLUMN`）为已有 `threads` 表增加上述四个字段，并同步更新 `Thread` 模型和新库建表语句。已核对本地 `data/corpcom.db` 的表结构；执行生命周期于后续 M4 接入，验收范围见下文。
+
+## M4 执行协调器与验收（2026-11-10）
+
+HTTP 消息接口通过应用共用的 `RunCoordinator` 执行研究。首版单进程，整体最多两轮，不排队；先获取额度，再通过数据库条件 UPDATE 取得 Thread 执行资格。同 Thread 冲突返回 409，整体满额返回 503（满额检查优先）；两种拒绝均发生在用户问题保存前。同 Workspace 的不同 Thread 可并行执行。
+
+`ask_workspace` 保存用户问题并生成回答，协调器通过 `complete_thread_execution` 在同一 SQLite 事务内插入最终回答、写入 succeeded 和结束时间并更新 Workspace 时间。失败时记录 failed 并原样抛出异常，finally 释放整体额度。业务库与 checkpoint 库之间仍没有跨库原子事务，也没有请求去重、自动重试或完整执行历史。
+
+现有 Thread 详情及 Workspace 的 Thread 列表返回最近执行状态。应用启动、接受请求前将遗留 running 改为 interrupted，保留开始时间和消息；结束时间是确认中断的时间。普通打开 Store 不触发此处理，重复启动不刷新已有终态。不支持多个服务进程同时使用同一数据目录。
+
+本次执行 `.venv/bin/python -m unittest discover -s tests -v`：67 项，66 通过、1 按配置跳过；跳过的是需 `CORPCOM_LIVE_TESTS=1` 的真实金融接口测试。模型测试使用脚本化替身。已补齐的仓库回归场景：
+
+| 工件 | 验收内容 |
+| --- | --- |
+| `tests/test_api.py`（12 项通过） | 同 Thread 拒绝重叠；同 Workspace 双 Thread 同时进入执行；跨 Workspace 共用两轮额度，第三轮拒绝且数据不变；额度复用；连续两次模型失败后的状态和消息；应用启动标记中断、其他终态不变、再次启动不刷新结束时间 |
+| `tests/test_workspace.py` | 在回答 INSERT 后用 SQLite 触发器拒绝状态 UPDATE，确认异常传播，回答和状态整体回滚；新连接读取仍与原快照一致 |
+| `examples/probe_agent_bash.py` | 前述接入步骤已运行通过：脚本化模型、真实 Docker、工具结果回传、问答与 checkpoint 落盘及容器复用；本次仅新增测试，未重复执行该 probe |
+
+**空 Workspace 并发首轮初始化竞态已修复并通过回归。** `add_user_message` 使用 `BEGIN IMMEDIATE`，在同一短事务内判断是否已有用户消息并插入本轮问题，返回消息及首条标记。`ask_workspace` 使用该标记和研究信息是否为空决定初始化指令。`tests/test_workspace.py` 验证并发插入只有一个首条标记；`tests/test_workspace_agent.py` 使用 Barrier 确保两个问题均已保存后才组装提示词，验证只有首条问题得到初始化指令、两轮均正常保存回答。测试使用临时数据库、真实框架和脚本化模型，不作为真实模型初始化质量证据。M4 已在后端执行协调范围内完成并验收。
+
+2026-11-10 收尾结论：M4 的 Thread 准入、全局两轮额度、状态查询、回答与成功状态原子保存、失败释放额度、启动识别中断，以及并发首轮初始化均已实现并通过上述回归。修复与测试见提交 `19a5693`；最终全量回归为 67 项，66 通过、1 项真实金融接口测试按配置跳过。
+
+M5 前端 Thread 状态展示、切换、并发研究、上传与刷新恢复已通过 27 项前端测试、构建及隔离浏览器验收，操作说明见 [前端说明](../frontend/README.md)。M6 真实研究并发与重启恢复也已完成验收，证据见下文。
+
+## M6 验收记录（2026-11-10）
+
+用户通过页面操作真实模型与 Docker，已确认并发运行和运行中上传成功。已读取业务库、checkpoint 和容器现场：两条会话共用 Workspace 容器，两者的工具结果都包含运行中上传文件的核验标记；A 达到调用上限时，B 正常完成。A 后续恢复成功；另一次双向读取报告的并发执行重叠约 18 秒，两条会话均 succeeded，各保存一条最终回答。
+
+每轮模型调用上限由 10 调整为 100，保留超限报错。真实重启验收发现：工具执行期间停止后端会留下缺少 ToolMessage 的 checkpoint，直接追加新问题导致模型接口返回 400。恢复现由协调器负责：`start_thread_execution` 在同一写事务中读取旧 Thread、取得执行资格并返回旧快照；仅旧状态为 interrupted 时，调用 `workspace_recovery` 补齐末尾工具调用的缺失结果，标记执行结果未知并独立保存 checkpoint，然后执行 `ask_workspace`。普通请求不额外扫描历史进行恢复，不修复 failed 等状态或更早的异常工具消息，不重放旧工具。
+
+`tests/test_workspace_recovery.py` 使用真实框架和重开的 SQLite 验证恢复结果在 ask 前提交、pending writes 中部分工具结果保留、普通工具异常不被修复、恢复失败时不执行 ask 且释放额度，以及首次 checkpoint 尚未建立时的中断恢复。部分结果测试通过 `put_writes` 写入真实 pending writes，并确认主 checkpoint 尚无该结果；恢复写回 live messages 时保留消息 ID，在 ask 前验证新 checkpoint 同时包含真实结果和缺失结果说明，下一轮也不重复消息或工具执行。存储测试另验证并发竞争执行资格时只有一个请求取得旧状态快照。
+
+另补充全部工具结果均位于 pending writes 的回归：即使无需补“结果未知”，恢复也先将 live messages 保存到主 checkpoint；测试核对原消息 ID、内容与成功状态保留，后续对话不重复消息或重放工具。修复后的全量回归 74 项，73 通过、1 项真实金融接口测试按配置跳过。旧 C 已因恢复请求报 400 而变为 failed，按上述边界不会自动修补，保留其失败记录。
+
+修复后，用户在同一 Workspace 新建 C2，确认 `sleep 80` 工具开始后强制停止后端，再启动并刷新页面。用户确认 C2 显示 interrupted、原问题保留且没有“等待完成”回答；随后两轮分别得到“恢复正常”“续聊正常”，A/B 的状态与历史保持不变。只读核对业务库、checkpoint 和 Docker 的结果如下：
+
+| 核对项 | 现场证据 |
+| --- | --- |
+| 验收 Workspace / C2 | `b43c575cc01446f88fcb41927b4cf418` / `d49a13bf8e2b4a3ba7bce379dfc043a2` |
+| 回答与终态 | C2 共三条用户消息、两条回答；两条回答各保存一次，最新状态 succeeded、错误为空，结束时间为北京时间 21:38:46 |
+| checkpoint 恢复 | 仅一次 `sleep 80` 调用；匹配的 ToolMessage 标记 error、说明执行结果未知，并位于新问题之前；两轮续聊均无工具调用，未重放旧工具 |
+| 其他 Thread | A/B 仍为 succeeded，开始与结束时间保持原值；旧 C 仍保留 failed 记录 |
+| 共享容器 | 容器 ID 仍为 `24fa33b3f403e2e2938a0b5bc45937d38f670cd8e29822a0e5ad9ffdf32032ac`，状态 running，原 Workspace 目录仍挂载到 `/workspace` |
+
+M6 已完成：真实并发研究、共享容器、独立任务文件与双向读取、运行中上传读取、失败隔离、刷新和重启续聊均通过。页面行为由用户确认，持久化结果由上述只读检查核对；本次收尾仅更新文档，未重复运行自动测试。M4—M6 已满足约定的验收门槛，进入 PR 审核与合并阶段。
 
 ## 共享容器与 Bash 验证
 
@@ -87,7 +131,7 @@ Bash 执行验证：
 - 一条命令超时后，另一条并行命令正常完成；忽略 TERM 的子进程及其 Bash 父进程均被终止并回收。
 - 超时后仍可执行命令，且获取到的容器 ID 保持不变。
 
-2026-11-05 验收：上述容器层行为已通过真实 Docker 验证，补齐后的仓库 probe 也由用户运行通过。Agent 已接入 `execute_bash`，完整调用链另由 `examples/probe_agent_bash.py` 验证；现有 `execute_python` 仍使用独立执行与复制归档流程。API 仍保留 Workspace 互斥，跨 Thread 的 Agent 与前端并发留待 M4—M6 验收。
+2026-11-05 验收：上述容器层行为已通过真实 Docker 验证，补齐后的仓库 probe 也由用户运行通过。Agent 已接入 `execute_bash`，完整调用链另由 `examples/probe_agent_bash.py` 验证；现有 `execute_python` 仍使用独立执行与复制归档流程。该次验收时 API 仍为 Workspace 互斥；后续 Thread 并发与真实双研究结果见 M4—M6 验收记录。
 
 ## 工作区文本写入与编辑
 
@@ -133,9 +177,9 @@ Edit 使用字面字符串匹配：`old_string` 不能为空，默认必须恰�
 
 本会话后续只增加 M1 probe 场景并更新文档，未修改产品实现。新增场景的完整 probe 已运行通过；手动停止／删除、暂不自动清理，以及正式依赖由镜像提供、临时安装依赖不保证恢复的策略已由用户确认。
 
-M1、M2、M3 在上述范围内已验收。当前仍在 `codex/workspace-container-reuse` 分支，尚未合并 main 或推送。
+M1、M2、M3 在上述范围内已验收。2026-11-06 核对：已通过 PR #1 合并到 main，合并提交为 `65b6c02`。M4—M6 在新分支 `xyt/feat-thread-concurrency` 上推进，M6 验收完成后再合并 PR。
 
-目前没有 RunCoordinator，API 仍为 Workspace 互斥；这份记录不覆盖 M4—M6 的多 Thread 并发、研究中上传及运行状态恢复。
+上述为 M1—M3 验收范围；RunCoordinator 与 Thread 并发的进展见 M4 验收记录。M5 前端并发交互与 M6 真实双研究、重启恢复均已验收。
 
 ## 自动验收
 
@@ -147,14 +191,14 @@ uv run python -m unittest discover -s tests -v
 
 测试使用临时数据目录，不修改已有研究资料：
 
-- `tests/test_workspace.py` 直接验收存储层：独立进程重开后恢复目标、偏好、假设、旧消息和文件，并建立新会话；还覆盖独立迁移脚本及初始化不自动迁移、文件作为统一来源、部分更新与清空、跨 Workspace 隔离、同名文件独立副本、原文件删除、非法输入不改状态及已保存文件丢失。
+- `tests/test_workspace.py` 直接验收存储层：独立进程重开后恢复目标、偏好、假设、旧消息和文件，并建立新会话；还覆盖文件作为统一来源、部分更新与清空、跨 Workspace 隔离、同名文件独立副本、原文件删除、非法输入不改状态及已保存文件丢失。
 - `tests/test_workspace_models.py` 验收重开后的对象类型与 JSON 序列化。
 - `tests/test_workspace_file_tools.py` 验收文本创建、覆盖、精确替换、路径限制，以及 Write/Edit 的单进程文件锁。
 - `tests/test_register_artifact.py` 验收主动登记、去重、并发与现有 HTTP 产物访问链路。
 - `tests/test_workspace_agent.py` 使用替身模型运行真实框架循环，覆盖首条消息初始化及跨会话和部分填写的排除条件、对话修改研究信息与新会话读取、多轮上下文、SQLite 重开恢复、旧历史仅导入一次、不同 thread 的 checkpoint 隔离、工具结果落盘、可预期工具错误后的续聊、跨 Workspace 归属检查、非预期异常传播、模型调用上限和空回答。
 - `tests/test_api.py` 验收 HTTP 合同、研究信息部分更新与旧偏好路由兼容、偏好 JSON 类型与数值校验、文件上传下载、应用重建后的恢复、模型错误、并发限制和 CORS。
 
-自动测试中的模型为替身；真实模型的 HTTP 验收记录见 [后端接口文档](backend-api.md#已验证)。Agent 已可通过 Python 工具生成并登记报告产物，当前只保存初始假设，尚无正式假设修订版本或调度。执行协调器、流式、上下文和记忆的计划见 [开发路线与进度](roadmap.md)，不以业务 Run 管理为前置条件。
+自动测试中的模型为替身；真实模型的 HTTP 验收记录见 [后端接口文档](backend-api.md#已验证)。Agent 已可通过 Python 工具生成并登记报告产物，当前只保存初始假设，尚无正式假设修订版本或调度。执行协调器的收尾及后续流式、上下文和记忆计划见 [开发路线与进度](roadmap.md)，不以业务 Run 管理为前置条件。
 
 ## 代码中的数据对象
 
@@ -175,7 +219,7 @@ uv run python -m unittest discover -s tests -v
 
 ## 模型上下文与 LangChain 执行循环
 
-`workspace_agent.py` 负责组装研究上下文、注册工具、调用 Agent 并保存问答。Python 入口为 `ask_workspace(store, model, workspace_id, thread_id, question, checkpointer)`，`model` 是 LangChain 的 `BaseChatModel` 实例。checkpointer 接收框架的 BaseCheckpointSaver；HTTP 服务使用由 lifespan 管理的 SqliteSaver。
+`workspace_agent.py` 负责组装研究上下文、注册工具、保存用户问题并调用 Agent 生成回答；最终回答由 RunCoordinator 调用存储方法与成功状态一并保存。Python 入口为 `ask_workspace(store, model, workspace_id, thread_id, question, checkpointer)`，`model` 是 LangChain 的 `BaseChatModel` 实例。checkpointer 接收框架的 BaseCheckpointSaver；HTTP 服务使用由 lifespan 管理的 SqliteSaver。
 
 | 职责 | 实现 |
 | --- | --- |
@@ -187,7 +231,7 @@ uv run python -m unittest discover -s tests -v
 
 模型收到目标、范围、观察周期、初始假设、偏好、当前会话消息，以及其他会话索引；每轮 context 不再注入完整文件索引。`create_workspace_tools(data_dir, workspace_id)` 返回绑定当前研究的工具，模型通过 `read_thread` 读取旧消息，通过 `execute_bash` 按路径发现和读取工作区文件。提示词说明上传或导入文件位于 `/workspace/files/<artifact_id>/<原文件名>`，任务产物（包括 Python 归档产物）位于 `/workspace/tasks/`；目录可能尚未创建，应先查看实际目录结构。`read_file(artifact_id)` 暂时注释并停止注册。Workspace ID 由程序绑定，不交给模型选择；Artifact 索引和前端文件查询、下载接口保留。`update_research(changes)` 将用户指定的字段保存到 `research.json`，返回更新后的全部研究信息，供本轮后续回答使用。工具在线程中运行，每次存储操作在执行线程内建立并关闭独立 SQLite 连接。
 
-每次提问最多调用模型十次，超限明确报错。工具参数不符合 schema 时，框架将校验错误反馈给模型；工具执行中的 `RecordNotFoundError` 由中间件转换为匹配调用 ID、`status="error"` 的 ToolMessage，模型可以据此修正调用或解释失败。后续模型调用仍计入十次上限。其他未处理异常向调用方抛出；调用中断时保留已写入的用户提问，不保存成功回答。
+每次提问最多调用模型 100 次，超限明确报错。工具参数不符合 schema 时，框架将校验错误反馈给模型；工具执行中的 `RecordNotFoundError` 由中间件转换为匹配调用 ID、`status="error"` 的 ToolMessage，模型可以据此修正调用或解释失败。后续模型调用仍计入本轮上限。其他未处理异常向调用方抛出；调用中断时保留已写入的用户提问，不保存成功回答。协调器只为旧状态为 interrupted 的 Thread 修复 checkpoint 末尾缺失的工具结果；普通工具异常保持失败，不自动修补或重放。
 
 当前 thread 尚无 checkpoint 时，从业务库导入已有问答，包括已经保存的本轮用户消息；之后每轮仅输入新用户消息，由 checkpoint 恢复此前的 Agent 消息。研究状态及其他会话索引仍在每轮刷新；文件通过工具按需发现，历史消息中的文件引用和工具结果仍随 checkpoint 恢复。
 

@@ -1,14 +1,16 @@
 """Verify durable storage and ownership without depending on a user interface."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import sqlite3
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from threading import Barrier
 import unittest
+import sqlite3
 
-from corpcom.workspace import RecordNotFoundError, WorkspaceStore
+from corpcom.workspace import RecordNotFoundError, ThreadBusyError, WorkspaceStore
 from corpcom.workspace_models import WorkspaceResearchInfo
 
 
@@ -28,6 +30,36 @@ class WorkspaceStoreTests(unittest.TestCase):
         initial_hypothesis="经营现金流能够持续覆盖经营投入",
         preferences={"报告语言": "中文", "关注指标": ["现金流"]},
     )
+
+  def test_concurrent_user_messages_have_one_first_message_per_workspace(self):
+    workspace = self.create()
+    threads = [self.store.create_thread(workspace.id, str(i)) for i in range(2)]
+    # Only prior user messages disqualify a new message from being the first.
+    self.store.add_message(workspace.id, threads[0].id, "assistant", "已有说明")
+    ready = Barrier(2)
+
+    def save(thread):
+      with WorkspaceStore(self.data) as store:
+        ready.wait(timeout=5)
+        return store.add_user_message(workspace.id, thread.id, thread.title)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+      results = list(executor.map(save, threads))
+
+    self.assertEqual(sorted(first for _, first in results), [False, True])
+    first_message = next(message for message, first in results if first)
+    self.assertEqual(first_message.id, min(message.id for message, _ in results))
+    with WorkspaceStore(self.data) as reopened:
+      for thread, (message, _) in zip(threads, results):
+        saved = reopened.get_thread(workspace.id, thread.id)
+        self.assertEqual([m for m in saved.messages if m.role == "user"], [message])
+        self.assertEqual(message.content, thread.title)
+      later = reopened.create_thread(workspace.id, "后续会话")
+      self.assertFalse(reopened.add_user_message(workspace.id, later.id, "继续")[1])
+
+      other = reopened.create_workspace("独立研究")
+      other_thread = reopened.create_thread(other.id, "首轮")
+      self.assertTrue(reopened.add_user_message(other.id, other_thread.id, "新问题")[1])
 
   def test_reopen_and_continue_in_a_new_thread(self):
     """A separate process restores prior material and creates an independent conversation."""
@@ -166,54 +198,6 @@ with WorkspaceStore(Path(sys.argv[1])) as store:
     with self.assertRaises(FileNotFoundError):
       self.store.get_workspace(workspace.id)
 
-  def test_legacy_research_columns_migrate_without_losing_related_records(self):
-    legacy = self.root / "legacy"
-    legacy.mkdir()
-    with sqlite3.connect(legacy / "corpcom.db") as db:
-      db.executescript("""
-        CREATE TABLE workspaces (
-          id TEXT PRIMARY KEY, title TEXT NOT NULL,
-          goal TEXT NOT NULL, scope TEXT NOT NULL,
-          observation_period TEXT NOT NULL, initial_hypothesis TEXT NOT NULL,
-          preferences TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        INSERT INTO workspaces VALUES (
-          'legacy-id', '旧研究', '旧目标', '旧范围', '三个月', '旧假设',
-          '{"报告语言":"中文"}', '2026-10-01T00:00:00.000Z', '2026-10-02T00:00:00.000Z'
-        );
-        CREATE TABLE threads (
-          id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-          title TEXT NOT NULL, created_at TEXT NOT NULL
-        );
-        INSERT INTO threads VALUES ('old-thread', 'legacy-id', '旧会话', '2026-10-01T00:00:00.000Z');
-      """)
-    with WorkspaceStore(legacy) as store:
-      # Opening storage no longer migrates a development database implicitly.
-      self.assertIn("goal", {row["name"] for row in store.db.execute("PRAGMA table_info(workspaces)")})
-      self.assertFalse((legacy / "workspaces" / "legacy-id" / "research.json").exists())
-    completed = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve().parents[1] / "scripts" / "migrate_workspace_research.py"), str(legacy)],
-        capture_output=True, text=True, timeout=10,
-    )
-    self.assertEqual(completed.returncode, 0, completed.stderr)
-    with WorkspaceStore(legacy) as store:
-      saved = store.get_workspace_detail("legacy-id")
-      self.assertEqual(saved.info.goal, "旧目标")
-      self.assertEqual(saved.info.scope, "旧范围")
-      self.assertEqual(saved.info.observation_period, "三个月")
-      self.assertEqual(saved.info.initial_hypothesis, "旧假设")
-      self.assertEqual(saved.info.preferences, {"报告语言": "中文"})
-      self.assertEqual(saved.threads[0].id, "old-thread")
-      self.assertEqual(saved.model_dump(mode="json")["updated_at"], "2026-10-02T00:00:00.000Z")
-      self.assertEqual(
-          {row["name"] for row in store.db.execute("PRAGMA table_info(workspaces)")},
-          {"id", "title", "created_at", "updated_at"},
-      )
-      self.assertEqual(store.db.execute("PRAGMA foreign_key_check").fetchall(), [])
-      store.update_research("legacy-id", WorkspaceResearchInfo(goal="新目标"))
-    with WorkspaceStore(legacy) as store:
-      self.assertEqual(store.get_workspace("legacy-id").info.goal, "新目标")
-
   def test_missing_stored_file_is_an_explicit_error(self):
     """Manual deletion must not leave an apparently readable file in the index."""
     wid = self.create().id
@@ -349,6 +333,82 @@ with WorkspaceStore(Path(sys.argv[1])) as store:
     self.assertEqual(first.read_text(encoding="utf-8"), "first output")
     self.assertEqual(outside.read_text(encoding="utf-8"), "outside output")
 
+  def test_start_execution_returns_prior_state_and_serializes_competing_claims(self):
+    workspace = self.create()
+    thread = self.store.create_thread(workspace.id, "竞争恢复资格")
+    self.assertEqual(self.store.start_thread_execution(workspace.id, thread.id), thread)
+    self.store.interrupt_running_executions()
+    previous = self.store.get_workspace_detail(workspace.id).threads[0]
+    ready = Barrier(2)
+
+    def claim():
+      with WorkspaceStore(self.data) as store:
+        ready.wait(timeout=5)
+        try:
+          return store.start_thread_execution(workspace.id, thread.id)
+        except ThreadBusyError:
+          return "busy"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+      results = list(executor.map(lambda _: claim(), range(2)))
+    self.assertEqual(results.count("busy"), 1)
+    self.assertEqual([result for result in results if result != "busy"], [previous])
+    current = self.store.get_thread(workspace.id, thread.id)
+    self.assertEqual(current.execution_status, "running")
+    self.assertIsNone(current.execution_finished_at)
+    self.assertIsNone(current.execution_error)
+
+  def test_complete_execution_rolls_back_answer_when_status_update_fails(self):
+    workspace = self.create()
+    thread = self.store.create_thread(workspace.id, "事务回滚测试")
+
+    self.store.start_thread_execution(workspace.id, thread.id)
+    self.store.add_message(
+        workspace.id, thread.id, "user", "测试问题",
+    )
+
+    before_thread = self.store.get_thread(workspace.id, thread.id)
+    before_workspace = self.store.get_workspace(workspace.id)
+
+    # 允许回答 INSERT 执行，再让后面的状态 UPDATE 失败。
+    with self.store.db:
+        self.store.db.execute("""
+            CREATE TRIGGER reject_execution_success
+            BEFORE UPDATE OF execution_status ON threads
+            WHEN NEW.execution_status = 'succeeded'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected status update failure');
+            END
+        """)
+
+    with self.assertRaisesRegex(
+        sqlite3.IntegrityError,
+        "injected status update failure",
+    ):
+        self.store.complete_thread_execution(
+            workspace.id, thread.id, "这条回答不应保存",
+        )
+
+    # 整体回滚：没有新增回答，Thread 和 Workspace 均保持原状。
+    self.assertEqual(
+        self.store.get_thread(workspace.id, thread.id),
+        before_thread,
+    )
+    self.assertEqual(
+        self.store.get_workspace(workspace.id),
+        before_workspace,
+    )
+
+    # 使用新连接确认数据库中也没有留下部分结果。
+    with WorkspaceStore(self.data) as reopened:
+        self.assertEqual(
+            reopened.get_thread(workspace.id, thread.id),
+            before_thread,
+        )
+        self.assertEqual(
+            reopened.get_workspace(workspace.id),
+            before_workspace,
+        )
 
 if __name__ == "__main__":
   unittest.main()

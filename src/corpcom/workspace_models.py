@@ -41,12 +41,16 @@ class Workspace(BaseModel):
 
 
 class Thread(BaseModel):
-    """A conversation belonging to one workspace; messages are loaded separately."""
+    """A conversation with its latest execution state; messages are loaded separately."""
 
     id: str
     workspace_id: str
     title: str
     created_at: Timestamp
+    execution_status: Literal["running", "succeeded", "failed", "interrupted"] | None = None
+    execution_started_at: Timestamp | None = None
+    execution_finished_at: Timestamp | None = None
+    execution_error: str | None = None
 
 
 class Message(BaseModel):

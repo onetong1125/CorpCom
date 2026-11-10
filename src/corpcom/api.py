@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
-from threading import Lock
 from typing import Annotated
 from contextlib import asynccontextmanager
 
@@ -21,11 +20,11 @@ from langchain_openai import ChatOpenAI
 from openai import APIError
 from pydantic import BaseModel, ConfigDict, Field
 
-from corpcom.workspace import RecordNotFoundError, WorkspaceStore
-from corpcom.workspace_agent import ask_workspace
+from corpcom.workspace import RecordNotFoundError, WorkspaceStore, ThreadBusyError
 from corpcom.workspace_models import (
     Artifact, Message, Thread, ThreadDetail, Workspace, WorkspaceDetail, WorkspaceResearchInfo, WorkspaceSummary,
 )
+from corpcom.run_coordinator import RunCoordinator, ExecutionCapacityError
 
 
 logger = logging.getLogger(__name__)
@@ -76,6 +75,10 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             str(root / "checkpoints.sqlite")
         ) as checkpointer:
             app.state.checkpointer = checkpointer
+            app.state.coordinator = RunCoordinator(
+                checkpointer, max_concurrent_runs=2)
+            with WorkspaceStore(root) as store:
+                store.interrupt_running_executions()
             yield
 
     app = FastAPI(
@@ -91,8 +94,6 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         allow_methods=["GET", "POST", "PUT"],
         allow_headers=["Content-Type"],
     )
-    active_workspaces: set[str] = set()
-    active_lock = Lock()
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request, exc):
@@ -155,23 +156,20 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         with WorkspaceStore(root) as store:
             store.get_thread(workspace_id, thread_id)
             # Reject overlapping turns before persisting a new user message.
-            with active_lock:
-                if workspace_id in active_workspaces:
-                    raise HTTPException(409, "A conversation is already running in this workspace")
-                active_workspaces.add(workspace_id)
             try:
-                ask_workspace(store, model, workspace_id, thread_id, body.content,
-                              app.state.checkpointer)
-                return store.get_thread(workspace_id, thread_id).messages[-1]
+                return app.state.coordinator.run(
+                    store, model, workspace_id, thread_id, body.content,
+                )
             except APIError as exc:
                 logger.exception("Model request failed")
                 raise HTTPException(502, "Model request failed; the user message was saved") from exc
             except ModelCallLimitExceededError as exc:
                 logger.exception("Agent exceeded its model call limit")
                 raise HTTPException(502, "Agent exceeded its model call limit; the user message was saved") from exc
-            finally:
-                with active_lock:
-                    active_workspaces.remove(workspace_id)
+            except ThreadBusyError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            except ExecutionCapacityError as exc:
+                raise HTTPException(503, str(exc)) from exc
 
     @app.post("/api/workspaces/{workspace_id}/files", status_code=201, response_model=Artifact)
     def upload_file(

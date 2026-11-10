@@ -94,7 +94,7 @@ describe("research workbench", () => {
     expect(window.location.search).toBe("?workspace=w1&thread=t1");
   });
 
-  it("disables duplicate sends and navigation while pending, then refreshes messages and artifacts", async () => {
+  it("disables duplicate sends but allows navigation while pending, then refreshes messages and artifacts", async () => {
     let finish;
     postHandler = () =>
       new Promise((resolve) => {
@@ -105,7 +105,7 @@ describe("research workbench", () => {
     expect(
       wrapper.get('button[aria-label="发送研究任务"]').attributes("disabled"),
     ).toBeDefined();
-    expect(wrapper.get(".workspace-item").attributes("disabled")).toBeDefined();
+    expect(wrapper.get(".workspace-item").attributes("disabled")).toBeUndefined();
     expect(wrapper.get('[role="status"]').text()).toContain("正在研究");
     await wrapper.get("form.composer").trigger("submit");
     expect(posted).toHaveLength(1);
