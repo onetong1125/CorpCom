@@ -16,6 +16,7 @@ import ArtifactTree from "./ArtifactTree.vue";
 const props = defineProps({
   workspace: { type: Object, required: true },
   busy: Boolean,
+  uploadError: { type: String, default: "" },
 });
 const emit = defineEmits(["upload"]);
 const selected = ref(null);
@@ -101,7 +102,8 @@ function upload(event) {
           :disabled="busy"
           @click="fileInput.click()"
         >
-          <Upload :size="17" />
+          <RefreshCw v-if="busy" class="spin" :size="17" />
+          <Upload v-else :size="17" />
         </button>
         <button
           class="icon-button"
@@ -119,9 +121,12 @@ function upload(event) {
         type="file"
         hidden
         aria-label="选择上传文件"
+        :disabled="busy"
         @change="upload"
       />
     </header>
+    <p v-if="busy" class="status-line muted" role="status">正在上传资料…</p>
+    <p v-if="uploadError" class="error-message" role="alert">{{ uploadError }}</p>
     <div v-if="selected" class="file-preview">
       <div class="preview-toolbar">
         <button class="text-button" @click="selected = null">

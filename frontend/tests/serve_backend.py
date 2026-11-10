@@ -21,8 +21,8 @@ from corpcom.api import create_app, get_model
 
 def scripted_research(store, model, workspace_id, thread_id, question, checkpointer):
     """Exercise HTTP, persistence and file archival while replacing Agent execution."""
-    store.add_message(workspace_id, thread_id, "user", question)
-    sleep(1)
+    store.add_user_message(workspace_id, thread_id, question)
+    sleep(15 if "慢速" in question else 1)
     if "模拟失败" in question:
         raise APIConnectionError(request=httpx.Request("POST", "http://model.invalid"))
 
@@ -46,7 +46,6 @@ def scripted_research(store, model, workspace_id, thread_id, question, checkpoin
         answer = f"已保存 **{version}** 验收报告、数据和代码。报告 ID：`{artifacts[0].id}`。"
     else:
         answer = "已读取当前研究。可以在新会话继续查看已有资料。（脚本化验收回答）"
-    store.add_message(workspace_id, thread_id, "assistant", answer)
     return answer
 
 
@@ -56,5 +55,5 @@ if __name__ == "__main__":
         app.dependency_overrides[get_model] = lambda: FakeMessagesListChatModel(
             responses=[AIMessage(content="unused")]
         )
-        with patch("corpcom.api.ask_workspace", side_effect=scripted_research):
+        with patch("corpcom.run_coordinator.ask_workspace", side_effect=scripted_research):
             uvicorn.run(app, host="127.0.0.1", port=8012)
