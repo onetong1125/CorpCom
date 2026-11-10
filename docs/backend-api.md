@@ -130,7 +130,7 @@ Agent 工具遇到 `RecordNotFoundError` 时，中间件返回匹配调用 ID、
 
 同日用户确认真实模型与前端联动验收完成：模型写报告、调用 `register_artifact`、前端文件列表显示、预览和下载通过。该项为用户实测确认；此前的 HTTP 自动测试与脚本化模型测试分别记录，不替代页面验收。该次验收时 API 仍为 Workspace 互斥。M1—M3 的完整证据见 [本地验收记录](workspace-local.md#m1m3-验收记录2026-11-05)。
 
-2026-11-10 M4 回归：全量 67 项中 66 通过、1 项真实金融接口测试按配置跳过，API 的 12 项测试全部通过。已验证同 Thread 冲突、同 Workspace 双 Thread 并行、跨 Workspace 共用两轮额度、满额拒绝不写数据、失败后额度复用、启动识别中断及终态保留。使用临时数据和脚本化模型，不作为前端或真实模型并发验收。
+2026-11-10 M4 后端执行协调已验收。全量回归：67 项中 66 通过、1 项真实金融接口测试按配置跳过，API 的 12 项测试全部通过。已验证同 Thread 冲突、同 Workspace 双 Thread 并行、跨 Workspace 共用两轮额度、满额拒绝不写数据、失败后额度复用、启动识别中断及终态保留。使用临时数据和脚本化模型，不作为前端或真实模型并发验收。
 
 Thread 响应新增 `execution_status`、`execution_started_at`、`execution_finished_at`、`execution_error`。未执行时均为空；状态取 running/succeeded/failed/interrupted，仅保留最近一轮。整体额度由应用启动时的 `RunCoordinator(..., max_concurrent_runs=2)` 设置，满额立即拒绝；整体满额检查先于 Thread 冲突检查。首版要求单进程运行。
 
