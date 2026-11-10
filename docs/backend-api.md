@@ -137,3 +137,5 @@ Agent 工具遇到 `RecordNotFoundError` 时，中间件返回匹配调用 ID、
 Thread 响应新增 `execution_status`、`execution_started_at`、`execution_finished_at`、`execution_error`。未执行时均为空；状态取 running/succeeded/failed/interrupted，仅保留最近一轮。整体额度由应用启动时的 `RunCoordinator(..., max_concurrent_runs=2)` 设置，满额立即拒绝；整体满额检查先于 Thread 冲突检查。首版要求单进程运行。
 
 空 Workspace 并发首轮的重复初始化指令已修复：首条用户消息判断与消息插入在同一短事务内完成，并发回归确认只有首条用户消息触发初始化指令。验证记录和后续范围见 [本地执行协调器验收](workspace-local.md#m4-执行协调器与验收2026-11-10)。
+
+2026-11-10 M6 真实并发验收完成：用户通过页面验证两条研究共享容器、运行中上传、文件互读、失败隔离、刷新与重启中断恢复。修复缺失工具结果后，新建 C2 的恢复与下一轮续聊均成功；只读核对确认匹配的 ToolMessage 已保存、旧工具未重放、回答未重复，A/B 终态及共享容器 ID 保持不变。修复后的后端回归为 74 项中 73 通过、1 项按配置跳过；现场证据见 [M6 验收记录](workspace-local.md#m6-验收记录2026-11-10)。
