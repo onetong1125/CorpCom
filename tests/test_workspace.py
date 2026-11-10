@@ -10,7 +10,7 @@ from threading import Barrier
 import unittest
 import sqlite3
 
-from corpcom.workspace import RecordNotFoundError, WorkspaceStore
+from corpcom.workspace import RecordNotFoundError, ThreadBusyError, WorkspaceStore
 from corpcom.workspace_models import WorkspaceResearchInfo
 
 
@@ -332,6 +332,31 @@ with WorkspaceStore(Path(sys.argv[1])) as store:
 
     self.assertEqual(first.read_text(encoding="utf-8"), "first output")
     self.assertEqual(outside.read_text(encoding="utf-8"), "outside output")
+
+  def test_start_execution_returns_prior_state_and_serializes_competing_claims(self):
+    workspace = self.create()
+    thread = self.store.create_thread(workspace.id, "竞争恢复资格")
+    self.assertEqual(self.store.start_thread_execution(workspace.id, thread.id), thread)
+    self.store.interrupt_running_executions()
+    previous = self.store.get_workspace_detail(workspace.id).threads[0]
+    ready = Barrier(2)
+
+    def claim():
+      with WorkspaceStore(self.data) as store:
+        ready.wait(timeout=5)
+        try:
+          return store.start_thread_execution(workspace.id, thread.id)
+        except ThreadBusyError:
+          return "busy"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+      results = list(executor.map(lambda _: claim(), range(2)))
+    self.assertEqual(results.count("busy"), 1)
+    self.assertEqual([result for result in results if result != "busy"], [previous])
+    current = self.store.get_thread(workspace.id, thread.id)
+    self.assertEqual(current.execution_status, "running")
+    self.assertIsNone(current.execution_finished_at)
+    self.assertIsNone(current.execution_error)
 
   def test_complete_execution_rolls_back_answer_when_status_update_fails(self):
     workspace = self.create()

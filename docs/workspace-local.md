@@ -67,6 +67,16 @@ HTTP 消息接口通过应用共用的 `RunCoordinator` 执行研究。首版单
 
 M5 前端 Thread 状态展示、切换、并发研究、上传与刷新恢复已通过 27 项前端测试、构建及隔离浏览器验收，操作说明见 [前端说明](../frontend/README.md)。两个真实研究任务的完整并发验收属于 M6，仍待完成；M6 验收后才合并 PR。
 
+## M6 验收进展（2026-11-10）
+
+用户通过页面操作真实模型与 Docker，已确认并发运行和运行中上传成功。已读取业务库、checkpoint 和容器现场：两条会话共用 Workspace 容器，两者的工具结果都包含运行中上传文件的核验标记；A 达到调用上限时，B 正常完成。A 后续恢复成功；另一次双向读取报告的并发执行重叠约 18 秒，两条会话均 succeeded，各保存一条最终回答。
+
+每轮模型调用上限由 10 调整为 100，保留超限报错。真实重启验收发现：工具执行期间停止后端会留下缺少 ToolMessage 的 checkpoint，直接追加新问题导致模型接口返回 400。恢复现由协调器负责：`start_thread_execution` 在同一写事务中读取旧 Thread、取得执行资格并返回旧快照；仅旧状态为 interrupted 时，调用 `workspace_recovery` 补齐末尾工具调用的缺失结果，标记执行结果未知并独立保存 checkpoint，然后执行 `ask_workspace`。普通请求不额外扫描历史进行恢复，不修复 failed 等状态或更早的异常工具消息，不重放旧工具。
+
+`tests/test_workspace_recovery.py` 使用真实框架和重开的 SQLite 验证恢复结果在 ask 前提交、pending writes 中部分工具结果保留、普通工具异常不被修复、恢复失败时不执行 ask 且释放额度，以及首次 checkpoint 尚未建立时的中断恢复。部分结果测试通过 `put_writes` 写入真实 pending writes，并确认主 checkpoint 尚无该结果；恢复写回 live messages 时保留消息 ID，在 ask 前验证新 checkpoint 同时包含真实结果和缺失结果说明，下一轮也不重复消息或工具执行。存储测试另验证并发竞争执行资格时只有一个请求取得旧状态快照。
+
+另补充全部工具结果均位于 pending writes 的回归：即使无需补“结果未知”，恢复也先将 live messages 保存到主 checkpoint；测试核对原消息 ID、内容与成功状态保留，后续对话不重复消息或重放工具。本次全量回归 74 项，73 通过、1 项真实金融接口测试按配置跳过。旧 C 已因恢复请求报 400 而变为 failed，按上述边界不会自动修补；现场数据库保持不变，后续使用新会话复测真正的 interrupted 恢复。修复后的真实页面恢复仍待复测，M6 尚未完成。
+
 ## 共享容器与 Bash 验证
 
 `sandbox.run_bash` 通过 `ensure_workspace_container` 获取同一 Workspace 的共享容器，再用 `docker exec` 执行命令。传入的 `workspace_dir` 挂载到容器的 `/workspace`，也是命令的工作目录；文件可跨调用读取，各次调用使用独立进程。返回值包含 `exit_code`、`stdout` 和 `stderr`。
@@ -209,7 +219,7 @@ uv run python -m unittest discover -s tests -v
 
 模型收到目标、范围、观察周期、初始假设、偏好、当前会话消息，以及其他会话索引；每轮 context 不再注入完整文件索引。`create_workspace_tools(data_dir, workspace_id)` 返回绑定当前研究的工具，模型通过 `read_thread` 读取旧消息，通过 `execute_bash` 按路径发现和读取工作区文件。提示词说明上传或导入文件位于 `/workspace/files/<artifact_id>/<原文件名>`，任务产物（包括 Python 归档产物）位于 `/workspace/tasks/`；目录可能尚未创建，应先查看实际目录结构。`read_file(artifact_id)` 暂时注释并停止注册。Workspace ID 由程序绑定，不交给模型选择；Artifact 索引和前端文件查询、下载接口保留。`update_research(changes)` 将用户指定的字段保存到 `research.json`，返回更新后的全部研究信息，供本轮后续回答使用。工具在线程中运行，每次存储操作在执行线程内建立并关闭独立 SQLite 连接。
 
-每次提问最多调用模型十次，超限明确报错。工具参数不符合 schema 时，框架将校验错误反馈给模型；工具执行中的 `RecordNotFoundError` 由中间件转换为匹配调用 ID、`status="error"` 的 ToolMessage，模型可以据此修正调用或解释失败。后续模型调用仍计入十次上限。其他未处理异常向调用方抛出；调用中断时保留已写入的用户提问，不保存成功回答。
+每次提问最多调用模型 100 次，超限明确报错。工具参数不符合 schema 时，框架将校验错误反馈给模型；工具执行中的 `RecordNotFoundError` 由中间件转换为匹配调用 ID、`status="error"` 的 ToolMessage，模型可以据此修正调用或解释失败。后续模型调用仍计入本轮上限。其他未处理异常向调用方抛出；调用中断时保留已写入的用户提问，不保存成功回答。协调器只为旧状态为 interrupted 的 Thread 修复 checkpoint 末尾缺失的工具结果；普通工具异常保持失败，不自动修补或重放。
 
 当前 thread 尚无 checkpoint 时，从业务库导入已有问答，包括已经保存的本轮用户消息；之后每轮仅输入新用户消息，由 checkpoint 恢复此前的 Agent 消息。研究状态及其他会话索引仍在每轮刷新；文件通过工具按需发现，历史消息中的文件引用和工具结果仍随 checkpoint 恢复。
 

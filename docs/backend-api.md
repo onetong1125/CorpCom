@@ -41,6 +41,8 @@ uv run uvicorn corpcom.api:create_app --factory --host 127.0.0.1 --port 8000
 
 消息接口接收本轮用户文本。当前 thread 尚无 checkpoint 时，后端从业务库导入完整问答历史；已有 checkpoint 时，由框架恢复历史，仅输入本轮用户消息。模型生成回答后，协调器在同一业务库事务中保存最终回答和 succeeded 状态。前端无需传入历史、角色或模型配置。接口一次返回完整回答，尚未接入流式输出。
 
+协调器在同一业务库写事务中取得 Thread 执行资格并保留更新前的状态。仅旧状态为 `interrupted` 时，才检查 checkpoint 末尾的工具调用，为缺失结果补入 `status="error"` 的 ToolMessage，说明后端中断、实际执行结果未知。写回时将 live state 中的原始消息（包括 pending writes 中已有的工具结果）沿用消息 ID 一并保存，再加入缺失结果，避免只保存补充消息而丢失已完成结果。恢复独立保存 checkpoint 后，再调用 `ask_workspace` 保存新问题并执行研究，不自动重放旧工具。`failed` 等其他状态不进入恢复，不修补更早的异常历史。恢复本身失败时记录 failed、释放额度，且不进入 Agent 执行。
+
 `corpcom.db` 保存 Workspace 标识、标题、时间、会话、文件索引及用户、最终助手消息；研究目标、初始假设、范围、观察周期和偏好统一保存于 `workspaces/<wid>/research.json`。同一数据目录下的 `checkpoints.sqlite` 保存 Agent 消息状态，包括工具调用和结果。服务通过 lifespan 管理 checkpoint 连接，使用 `workspace_id:thread_id` 标识执行历史。
 
 ## 从创建研究到连续对话
@@ -109,7 +111,7 @@ curl -X POST "http://127.0.0.1:8000/api/workspaces/$workspace_id/files" \
 | 404 | 研究、会话或文件不存在，或不属于请求中的 Workspace |
 | 409 | 同一 Thread 已有执行，本次提问尚未保存（整体额度未满时） |
 | 422 | 请求字段不合法；`detail` 列出字段位置、原因和错误类型 |
-| 502 | 模型接口失败或达到十次调用上限；已保存用户提问，没有保存助手回答 |
+| 502 | 模型接口失败或达到每轮 100 次调用上限；已保存用户提问，没有保存助手回答 |
 | 503 | 后端未配置模型，或整体两轮额度已满；本次提问尚未保存 |
 
 HTTP 错误返回 `{"detail": ...}`；未处理的程序错误由服务器返回 500 并记录异常。请求失败后可读取 thread 查看已保存消息；当前没有请求去重或自动续跑，重新发送会新增一条用户消息。启动时仅将遗留 running 标记为 interrupted。

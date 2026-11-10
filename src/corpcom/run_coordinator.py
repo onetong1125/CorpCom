@@ -5,6 +5,7 @@ from langchain_core.language_models import BaseChatModel
 from corpcom.workspace import WorkspaceStore
 from corpcom.workspace_models import Message
 from corpcom.workspace_agent import ask_workspace
+from corpcom.workspace_recovery import recover_interrupted_checkpoint
 
 
 class ExecutionCapacityError(ValueError):
@@ -31,9 +32,12 @@ class RunCoordinator:
       raise ExecutionCapacityError("Too many concurrent executions")
     try:
       # 准入
-      store.start_thread_execution(workspace_id, thread_id)
+      previous = store.start_thread_execution(workspace_id, thread_id)
 
       try:
+        if previous.execution_status == "interrupted":
+          recover_interrupted_checkpoint(
+              store, model, workspace_id, thread_id, self.checkpointer)
         answer = ask_workspace(
             store, model, workspace_id, thread_id, question, self.checkpointer)
         return store.complete_thread_execution(workspace_id, thread_id, answer)

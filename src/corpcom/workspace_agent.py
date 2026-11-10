@@ -50,24 +50,15 @@ def handle_workspace_tool_error(request, handler):
         )
 
 
-def ask_workspace(
+def create_workspace_agent(
     store: WorkspaceStore, model: BaseChatModel,
-    workspace_id: str, thread_id: str, question: str,
-    checkpointer: BaseCheckpointSaver,
-) -> str:
-    """Save user's question and generating the answer."""
-    logger.info(
-        "本轮开始 workspace=%s thread=%s",
-        workspace_id,
-        thread_id,
-    )
-    # Initialize once per workspace, including history in sibling conversations.
-    user_message, is_first = store.add_user_message(
-        workspace_id, thread_id, question,
-    )
+    workspace_id: str, thread_id: str, checkpointer: BaseCheckpointSaver,
+    *, is_first_message: bool = False,
+):
+    """Build the same graph for research execution and checkpoint recovery."""
     detail = store.get_workspace_detail(workspace_id)
 
-    initialize_research = is_first and not any(
+    initialize_research = is_first_message and not any(
         value.strip() if isinstance(value, str) else value
         for value in detail.info.model_dump().values()
     )
@@ -81,19 +72,31 @@ def ask_workspace(
             for item in detail.threads if item.id != thread_id
         ],
     }
-    agent = create_agent(
+    return create_agent(
         model,
         tools=create_workspace_tools(store.root, workspace_id),
         system_prompt=build_workspace_prompt(
             context, initialize_research=initialize_research
         ),
         middleware=[
-            ModelCallLimitMiddleware(run_limit=10, exit_behavior="error"),
+            ModelCallLimitMiddleware(run_limit=100, exit_behavior="error"),
             handle_workspace_tool_error,
         ],
         checkpointer=checkpointer,
     )
 
+
+def ask_workspace(
+    store: WorkspaceStore, model: BaseChatModel,
+    workspace_id: str, thread_id: str, question: str,
+    checkpointer: BaseCheckpointSaver,
+) -> str:
+    """Save the user's question and generate the answer."""
+    logger.info("本轮开始 workspace=%s thread=%s", workspace_id, thread_id)
+    user_message, is_first = store.add_user_message(workspace_id, thread_id, question)
+    agent = create_workspace_agent(
+        store, model, workspace_id, thread_id, checkpointer, is_first_message=is_first,
+    )
     config = {
         "configurable": {
             "thread_id": f"{workspace_id}:{thread_id}",
@@ -106,16 +109,14 @@ def ask_workspace(
         messages = store.get_thread(workspace_id, thread_id).messages
     else:
         messages = [user_message]
-    result = agent.invoke({
-        "messages": [
-            {
-                "id": f"business:{item.id}",
-                "role":item.role,
-                "content":item.content,
-            } for item in messages
-        ],
-
-    }, config,)
+    input_messages = [
+        {
+            "id": f"business:{item.id}",
+            "role": item.role,
+            "content": item.content,
+        } for item in messages
+    ]
+    result = agent.invoke({"messages": input_messages}, config)
     answer = result["messages"][-1].text
     if not answer.strip():
         raise RuntimeError("model returned no answer")

@@ -476,10 +476,11 @@ class WorkspaceStore:
   def start_thread_execution(
       self, workspace_id: str, thread_id: str,
   ) -> Thread:
-    # 检查会话存在且属于当前 Workspace。
-    self._thread(workspace_id, thread_id)
-
+    """Claim execution and return the Thread snapshot from before the claim."""
     with self.db:
+      # Read the old state under the same write lock as the admission update.
+      self.db.execute("BEGIN IMMEDIATE")
+      previous = self._thread(workspace_id, thread_id)
       cursor = self.db.execute(
           """
           UPDATE threads
@@ -500,7 +501,7 @@ class WorkspaceStore:
       if cursor.rowcount == 0:
         raise ThreadBusyError(f"Thread is already running: {thread_id}")
 
-      return self._thread(workspace_id, thread_id)
+      return previous
 
   def finish_thread_execution(
       self,
