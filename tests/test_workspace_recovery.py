@@ -80,12 +80,12 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                 store.start_thread_execution(workspace.id, thread.id)
                 store.interrupt_running_executions()
 
-                def check_before_ask(*args):
+                def check_before_ask(*args, **kwargs):
                     with SqliteSaver.from_conn_string(checkpoint_path) as reader:
                         saved = reader.get_tuple(config).checkpoint["channel_values"]["messages"]
                     # Equality checks IDs, contents and success statuses, with no unknown-result additions.
                     self.assertEqual([m for m in saved if m.type == "tool"], recorded)
-                    return ask_workspace(*args)
+                    return ask_workspace(*args, **kwargs)
 
                 recovery = ProtocolCheckingModel(responses=[
                     AIMessage(content="恢复正常"), AIMessage(content="续聊正常"),
@@ -144,13 +144,13 @@ class WorkspaceRecoveryTests(unittest.TestCase):
 
                 recovery = ProtocolCheckingModel(responses=[AIMessage(content="恢复正常")])
 
-                def check_before_ask(*args):
+                def check_before_ask(*args, **kwargs):
                     saved = saver.get_tuple(config).checkpoint["channel_values"]["messages"]
                     results = [m for m in saved if m.type == "tool"]
                     self.assertEqual([m.tool_call_id for m in results], ["recorded", "missing"])
                     self.assertEqual(results[0], recorded)
                     self.assertEqual(results[1].status, "error")
-                    return ask_workspace(*args)
+                    return ask_workspace(*args, **kwargs)
 
                 coordinator = RunCoordinator(saver, max_concurrent_runs=2)
                 with patch("corpcom.run_coordinator.ask_workspace", side_effect=check_before_ask):
@@ -208,7 +208,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                 store.interrupt_running_executions()
                 recovery = ProtocolCheckingModel(responses=[AIMessage(content="恢复正常")])
 
-                def check_before_ask(*args):
+                def check_before_ask(*args, **kwargs):
                     detail = store.get_thread(workspace.id, thread.id)
                     self.assertEqual(detail.execution_status, "running")
                     self.assertEqual(detail.messages[-1].content, "执行工具")
@@ -218,7 +218,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                     self.assertEqual(saved[-1].tool_call_id, "lost-result")
                     self.assertEqual(saved[-1].status, "error")
                     self.assertIn("未知", saved[-1].content)
-                    return ask_workspace(*args)
+                    return ask_workspace(*args, **kwargs)
 
                 coordinator = RunCoordinator(saver, max_concurrent_runs=2)
                 with patch("corpcom.run_coordinator.ask_workspace", side_effect=check_before_ask):

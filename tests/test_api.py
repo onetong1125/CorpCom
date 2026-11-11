@@ -235,11 +235,11 @@ class ApiTests(unittest.TestCase):
     entered = Event()
     release = Event()
 
-    def slow_ask(*args):
+    def slow_ask(*args, **kwargs):
       entered.set()
       if not release.wait(10):
         raise TimeoutError("Test did not release the model request")
-      return ask_workspace(*args)
+      return ask_workspace(*args, **kwargs)
 
     with patch("corpcom.run_coordinator.ask_workspace", side_effect=slow_ask):
       with ThreadPoolExecutor(max_workers=1) as executor:
@@ -293,13 +293,13 @@ class ApiTests(unittest.TestCase):
     release = Event()
 
     def slow_ask(store, model, workspace_id, thread_id, question,
-        checkpointer):
+        checkpointer, *, on_event):
       entered[thread_id].set()
       if not release.wait(15):
         raise TimeoutError("Test did not release the Agent")
       return ask_workspace(
           store, model, workspace_id, thread_id, question,
-          checkpointer,
+          checkpointer, on_event=on_event,
       )
 
     requests = [
@@ -394,12 +394,15 @@ class ApiTests(unittest.TestCase):
     }
     release = Event()
 
-    def slow_ask(store, model, workspace_id, thread_id, question, checkpointer):
+    def slow_ask(store, model, workspace_id, thread_id, question, checkpointer,
+      *, on_event
+    ):
       entered[thread_id].set()
       if not release.wait(15):
         raise TimeoutError("Test did not release the Agent")
       return ask_workspace(
           store, model, workspace_id, thread_id, question, checkpointer,
+          on_event=on_event,
       )
 
     with patch(
