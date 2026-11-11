@@ -38,6 +38,14 @@ class RunCoordinator:
       previous = store.start_thread_execution(workspace_id, thread_id)
 
       try:
+        if on_event is not None:
+          on_event({
+            "type": "started",
+            "workspace_id": workspace_id,
+            "thread_id": thread_id,
+          })
+
+        # 恢复中断后的工具结果
         if previous.execution_status == "interrupted":
           recover_interrupted_checkpoint(
               store, model, workspace_id, thread_id, self.checkpointer

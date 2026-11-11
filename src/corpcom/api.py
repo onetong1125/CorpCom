@@ -7,8 +7,11 @@ import shutil
 from tempfile import TemporaryDirectory
 from typing import Annotated
 from contextlib import asynccontextmanager
+from anyio import create_task_group
 
 from dotenv import load_dotenv
+from collections.abc import AsyncIterator
+from fastapi.sse import EventSourceResponse
 from fastapi import Depends, FastAPI, Form, HTTPException, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,7 +28,7 @@ from corpcom.workspace_models import (
     Artifact, Message, Thread, ThreadDetail, Workspace, WorkspaceDetail, WorkspaceResearchInfo, WorkspaceSummary,
 )
 from corpcom.run_coordinator import RunCoordinator, ExecutionCapacityError
-
+from corpcom.workspace_stream import research_events
 
 logger = logging.getLogger(__name__)
 RequiredText = Annotated[str, Field(min_length=1, pattern=r"\S")]
@@ -79,7 +82,9 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 checkpointer, max_concurrent_runs=2)
             with WorkspaceStore(root) as store:
                 store.interrupt_running_executions()
-            yield
+            async with create_task_group() as task_group:
+                app.state.research_tasks = task_group
+                yield
 
     app = FastAPI(
         title="CorpCom",
@@ -147,6 +152,42 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     def show_thread(workspace_id: str, thread_id: str) -> ThreadDetail:
         with WorkspaceStore(root) as store:
             return store.get_thread(workspace_id, thread_id)
+
+    async def get_research_events(
+        workspace_id: str, thread_id: str, body: MessageCreate,
+        model: Annotated[BaseChatModel, Depends(get_model)]
+    ):
+        """统一提供应用对象，并转换HTTPException"""
+        try:
+            async with research_events(
+                root,
+                app.state.coordinator,
+                app.state.research_tasks,
+                workspace_id,
+                thread_id,
+                body.content,
+                model
+            ) as events:
+                yield events
+        except ThreadBusyError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ExecutionCapacityError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except RecordNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/api/workspaces/{workspace_id}/threads/{thread_id}/messages/stream",
+              response_class=EventSourceResponse
+    )
+    async def stream_message(
+        events: Annotated[
+            AsyncIterator[dict[str, object]],
+            Depends(get_research_events, scope="request")
+        ]
+    ):
+        # 这里已经准入成功，进入SSE
+        async for event in events:
+            yield event
 
     @app.post("/api/workspaces/{workspace_id}/threads/{thread_id}/messages", status_code=201)
     def send_message(

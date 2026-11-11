@@ -739,13 +739,15 @@ class WorkspaceAgentTests(unittest.TestCase):
 
       detail = store.get_thread(self.workspace.id, self.thread.id)
 
+      self.assertEqual(events[0]["workspace_id"], self.workspace.id)
+      self.assertEqual(events[0]["thread_id"], self.thread.id)
       self.assertEqual(
           [event["type"] for event in events],
-          ["text_delta", "text_delta", "succeeded"],
+          ["started", "text_delta", "text_delta", "succeeded"],
       )
-      self.assertEqual([event["text"] for event in events[:2]], ["你", "好"])
-      self.assertEqual(events[0]["message_id"], events[1]["message_id"])
-      self.assertIsNotNone(events[0]["message_id"])
+      self.assertEqual([event["text"] for event in events[1:3]], ["你", "好"])
+      self.assertEqual(events[1]["message_id"], events[2]["message_id"])
+      self.assertIsNotNone(events[1]["message_id"])
 
       self.assertEqual(detail.execution_status, "succeeded")
 
@@ -781,11 +783,11 @@ class WorkspaceAgentTests(unittest.TestCase):
       detail = store.get_thread(self.workspace.id, self.thread.id)
       self.assertEqual(
           [event["type"] for event in events],
-          ["text_delta", "failed"],
+          ["started", "text_delta", "failed"],
       )
-      self.assertEqual(events[0]["text"], "你")
+      self.assertEqual(events[1]["text"], "你")
       self.assertEqual(detail.execution_status, "failed")
-      self.assertEqual(detail.execution_error, events[1]["error"])
+      self.assertEqual(detail.execution_error, events[-1]["error"])
       self.assertEqual([msg.role for msg in detail.messages], ["user"])
 
       model = StreamingModel(

@@ -18,6 +18,7 @@ from openai import APIConnectionError
 from corpcom.api import create_app, get_model
 from corpcom.workspace_agent import ask_workspace
 from corpcom.workspace import WorkspaceStore
+from corpcom.workspace_models import Thread
 
 
 class ApiTestModel(FakeMessagesListChatModel):
@@ -546,6 +547,62 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json(), after[thread_id])
 
+  def test_streaming_message_returns_events_and_saves_answer(self):
+    response = self.client.post(
+        self.thread_url + "/messages/stream",
+        json={"content": "测试流式回答"},
+    )
+    self.assertEqual(response.status_code, 200, response.text)
+    self.assertTrue(
+        response.headers["content-type"].startswith("text/event-stream")
+    )
+    events = [
+      json.loads(line[5:].strip())
+      for line in response.text.splitlines()
+      if line.startswith("data:")
+    ]
+    self.assertEqual(
+        [event["type"] for event in events],
+        ["started", "text_delta", "succeeded"]
+    )
+    self.assertEqual(
+        events[0]["workspace_id"], self.workspace["id"]
+    )
+    self.assertEqual(
+        events[0]["thread_id"], self.thread["id"]
+    )
+    self.assertEqual(
+        events[1]["text"], "先核对现金流。"
+    )
+    response = self.client.get(self.thread_url)
+    self.assertEqual(response.status_code, 200)
+    detail = response.json()
+    self.assertEqual(detail["execution_status"], "succeeded")
+    assistant_messages = [
+      msg for msg in detail["messages"] if msg["role"] == "assistant"
+    ]
+    self.assertEqual(len(assistant_messages), 1)
+    self.assertEqual(assistant_messages[0], events[-1]["message"])
+
+  def test_streaming_rejects_running_thread_before_sse(self):
+    with WorkspaceStore(self.root / "data") as store:
+      store.start_thread_execution(
+          self.workspace["id"], self.thread["id"],
+      )
+
+    before = self.client.get(self.thread_url).json()
+
+    response = self.client.post(
+        self.thread_url + "/messages/stream",
+        json={"content": "这条问题不应保存"},
+    )
+    self.assertEqual(response.status_code, 409, response.text)
+    self.assertTrue(
+        response.headers["content-type"].startswith("application/json")
+    )
+    self.assertIn("detail", response.json())
+    after = self.client.get(self.thread_url).json()
+    self.assertEqual(after, before)
 
 if __name__ == "__main__":
   unittest.main()
