@@ -4,15 +4,15 @@ import logging
 from collections.abc import Callable
 
 from langchain.agents import create_agent
-from langchain_core.language_models import BaseChatModel
-from langgraph.checkpoint.base import BaseCheckpointSaver
 from langchain.agents.middleware import ModelCallLimitMiddleware, wrap_tool_call
-from langchain_core.messages import ToolMessage
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore
-from corpcom.workspace_tools import create_workspace_tools
 from corpcom.workspace_prompt import build_workspace_prompt
+from corpcom.workspace_tools import create_workspace_tools
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,7 @@ def ask_workspace(
     workspace_id: str, thread_id: str, question: str,
     checkpointer: BaseCheckpointSaver, *,
     on_event: Callable[[dict[str, object]], None] | None = None,
-) -> str:
+) -> AIMessage:
   """Save the user's question and generate the answer."""
   logger.info("本轮开始 workspace=%s thread=%s", workspace_id, thread_id)
   user_message, is_first = store.add_user_message(workspace_id, thread_id, question)
@@ -143,13 +143,30 @@ def ask_workspace(
       "content": item.content,
     } for item in messages
   ]
-  answer = ""
+  answer: AIMessage | None = None
   for mode, data in agent.stream(
       {"messages": input_messages}, config,
-      stream_mode=["messages", "values"]
+      stream_mode=["messages", "updates"]
   ):
-    if mode == "values":
-      answer = data["messages"][-1].text
+    if mode == "updates":
+      if "model" not in data:
+        continue
+
+      message = data["model"]["messages"][-1]
+      if message.tool_calls:
+        # Persist completed text before executing its tool calls.
+        if message.text.strip():
+          store.add_message(
+              workspace_id,
+              thread_id,
+              "assistant",
+              message.text,
+              model_message_id=message.id,
+          )
+      else:
+        # The coordinator saves the final answer with the success status.
+        answer = message
+
     else:
       chunk, metadata = data
       if (
@@ -162,7 +179,7 @@ def ask_workspace(
           "message_id": chunk.id,
           "text": chunk.text,
         })
-  if not answer.strip():
+  if answer is None or not answer.text.strip():
     raise RuntimeError("model returned no answer")
   logger.info(
       "回答生成完成 workspace=%s thread=%s",

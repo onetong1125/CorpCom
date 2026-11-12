@@ -112,7 +112,7 @@ describe("research workbench", () => {
     expect(posted).toHaveLength(1);
     messages = [
       savedUser,
-      { ...savedUser, id: 2, role: "assistant", content: "报告已归档" },
+      { ...savedUser, id: 2, role: "assistant", content: "报告已归档", model_message_id: "model-answer" },
     ];
     detail.artifacts = [
       {

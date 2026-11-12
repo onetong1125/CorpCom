@@ -58,6 +58,7 @@ class Message(BaseModel):
 
     id: int
     thread_id: str
+    model_message_id: str | None = None
     role: Literal["user", "assistant"]
     content: str
     created_at: Timestamp

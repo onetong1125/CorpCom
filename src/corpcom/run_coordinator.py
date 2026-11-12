@@ -54,7 +54,8 @@ class RunCoordinator:
             store, model, workspace_id, thread_id, question, self.checkpointer,
             on_event=on_event
         )
-        message = store.complete_thread_execution(workspace_id, thread_id, answer)
+        message = store.complete_thread_execution(
+            workspace_id, thread_id, answer.text, model_message_id=answer.id)
 
       except Exception as e:
         store.finish_thread_execution(workspace_id, thread_id,

@@ -54,14 +54,6 @@ const displayedMessages = computed(() => {
     ? [{ id: `pending:${thread.value.id}`, role: "user", content: run.content, created_at: run.createdAt }] : [];
   return [...messages, ...question, run.answer];
 });
-const progressItems = computed(() => {
-  const run = currentRun.value;
-  if (!run) return [];
-  const saved = run.answer || thread.value.messages.filter((item) =>
-    item.role === "assistant").length > run.assistantMessageCount;
-  const lastText = saved ? run.items.findLast((item) => item.type === "text") : null;
-  return run.items.filter((item) => item !== lastText);
-});
 const pendingText = computed(() => {
   const run = runs[thread.value?.id];
   // A refresh may already contain the persisted user message.
@@ -69,6 +61,39 @@ const pendingText = computed(() => {
     thread.value.messages.filter((item) => item.role === "user").length === run.userMessageCount
     ? run.content
     : "";
+});
+const conversationEntries = computed(() => {
+  const entries = displayedMessages.value.map((message) => ({
+    type: "message", key: `message:${message.id}`, message,
+  }));
+  if (pendingText.value) entries.push({ type: "pending", key: "pending" });
+  const run = currentRun.value;
+  if (!run) return entries;
+
+  // Preserve event order around saved messages, including a final answer received
+  // before the preceding plan has been read back from storage.
+  const textIds = new Set(run.items.filter((item) => item.type === "text").map((item) => item.id));
+  const firstSaved = entries.findIndex((entry) => entry.type === "message" &&
+    textIds.has(entry.message.model_message_id));
+  let insertAt = firstSaved === -1 ? entries.length : firstSaved;
+  let progress = null;
+  for (const item of run.items) {
+    if (item.type === "text") {
+      const saved = entries.findIndex((entry) => entry.type === "message" &&
+        entry.message.model_message_id === item.id);
+      if (saved !== -1) {
+        insertAt = saved + 1;
+        progress = null;
+        continue;
+      }
+    }
+    if (!progress) {
+      progress = { type: "progress", key: `progress:${item.type}:${item.id}`, items: [] };
+      entries.splice(insertAt++, 0, progress);
+    }
+    progress.items.push(item);
+  }
+  return entries;
 });
 const executionError = computed(() => {
   const run = runs[thread.value?.id];
@@ -274,7 +299,6 @@ async function sendMessage() {
     status: "connecting",
     items: [],
     answer: null,
-    assistantMessageCount: thread.value.messages.filter((item) => item.role === "assistant").length,
     reconciling: false,
   };
   const run = runs[threadId];
@@ -714,55 +738,56 @@ onBeforeUnmount(() => {
               <Plus :size="16" />新建会话
             </button>
           </div>
-          <article
-            v-for="message in displayedMessages"
-            :key="message.id"
-            class="message"
-            :class="message.role"
-          >
-            <div class="message-byline">
-              <span class="avatar">{{
-                message.role === "assistant" ? "C" : "你"
-              }}</span
-              ><strong>{{
-                message.role === "assistant" ? "CorpCom" : "你"
-              }}</strong
-              ><time>{{
-                new Date(message.created_at).toLocaleTimeString("zh-CN", {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })
-              }}</time>
-            </div>
-            <MarkdownContent
-              v-if="message.role === 'assistant'"
-              :content="message.content"
-            />
-            <div v-else class="user-content">{{ message.content }}</div>
-          </article>
-          <article v-if="pendingText" class="message user">
-            <div class="message-byline">
-              <span class="avatar">你</span><strong>你</strong
-              ><span class="muted">发送中</span>
-            </div>
-            <div class="user-content">{{ pendingText }}</div>
-          </article>
-          <details v-if="progressItems.length" class="research-progress"
-            :open="currentRun.status !== 'succeeded'">
-            <summary>{{ currentRun.status === 'succeeded' ? '查看本轮研究过程' :
-              currentRun.status === 'failed' ? '研究过程（未完成）' :
-              currentRun.status === 'disconnected' ? '已收到的研究过程（连接中断）' : '研究过程' }}</summary>
-            <div v-for="item in progressItems" :key="`${item.type}:${item.id}`" class="progress-item">
-              <MarkdownContent v-if="item.type === 'text'" :content="item.text" />
-              <div v-else class="tool-event" :class="item.status">
-                <span>{{ item.name }}</span>
-                <span>{{ item.status === 'running' ?
-                  (currentRun.pending ? '执行中' : '结果未收到') :
-                  item.status === 'returned' ? '已返回' : '执行异常' }}</span>
-                <p v-if="item.error">{{ item.error }}</p>
+          <template v-for="entry in conversationEntries" :key="entry.key">
+            <article
+              v-if="entry.type === 'message'"
+              class="message"
+              :class="entry.message.role"
+            >
+              <div class="message-byline">
+                <span class="avatar">{{
+                  entry.message.role === "assistant" ? "C" : "你"
+                }}</span
+                ><strong>{{
+                  entry.message.role === "assistant" ? "CorpCom" : "你"
+                }}</strong
+                ><time>{{
+                  new Date(entry.message.created_at).toLocaleTimeString("zh-CN", {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })
+                }}</time>
               </div>
-            </div>
-          </details>
+              <MarkdownContent
+                v-if="entry.message.role === 'assistant'"
+                :content="entry.message.content"
+              />
+              <div v-else class="user-content">{{ entry.message.content }}</div>
+            </article>
+            <article v-else-if="entry.type === 'pending'" class="message user">
+              <div class="message-byline">
+                <span class="avatar">你</span><strong>你</strong
+                ><span class="muted">发送中</span>
+              </div>
+              <div class="user-content">{{ pendingText }}</div>
+            </article>
+            <details v-else class="research-progress"
+              :open="currentRun.status !== 'succeeded'">
+              <summary>{{ currentRun.status === 'succeeded' ? '查看本轮研究过程' :
+                currentRun.status === 'failed' ? '研究过程（未完成）' :
+                currentRun.status === 'disconnected' ? '已收到的研究过程（连接中断）' : '研究过程' }}</summary>
+              <div v-for="item in entry.items" :key="`${item.type}:${item.id}`" class="progress-item">
+                <MarkdownContent v-if="item.type === 'text'" :content="item.text" />
+                <div v-else class="tool-event" :class="item.status">
+                  <span>{{ item.name }}</span>
+                  <span>{{ item.status === 'running' ?
+                    (currentRun.pending ? '执行中' : '结果未收到') :
+                    item.status === 'returned' ? '已返回' : '执行异常' }}</span>
+                  <p v-if="item.error">{{ item.error }}</p>
+                </div>
+              </div>
+            </details>
+          </template>
           <div v-if="sending" class="researching" role="status">
             <span class="pulse-dot"></span>
             <div>

@@ -23,8 +23,8 @@ function deferred() {
   return { promise, resolve };
 }
 
-function message(id, role, content) {
-  return { id, role, content, created_at: "2026-11-10T00:00:00Z" };
+function message(id, role, content, modelMessageId = role === "assistant" ? `model-${id}` : null) {
+  return { id, role, content, model_message_id: modelMessageId, created_at: "2026-11-10T00:00:00Z" };
 }
 
 beforeEach(() => {
@@ -109,14 +109,162 @@ it("streams text and tool events into the original thread and replaces the final
   await selectThread("a");
   expect(wrapper.get(".research-progress").text()).toContain("最终回答");
   expect(wrapper.get(".tool-event").text()).toContain("已返回");
-  threads.a.messages = [message(1, "user", "问题 A"), message(2, "assistant", "最终回答")];
+  threads.a.messages = [
+    message(1, "user", "问题 A"),
+    message(2, "assistant", "先查资料", "intro"),
+    message(3, "assistant", "最终回答", "answer"),
+  ];
   threads.a.execution_status = "succeeded";
-  stream.emit({ type: "succeeded", message: { ...threads.a.messages[1], thread_id: "a" } });
+  stream.emit({ type: "succeeded", message: { ...threads.a.messages[2], thread_id: "a" } });
   await flushPromises();
-  expect(wrapper.findAll(".message.assistant")).toHaveLength(1);
-  expect(wrapper.get(".message.assistant").text()).toContain("最终回答");
+  expect(wrapper.findAll(".message.assistant").map((item) => item.text())).toEqual([
+    expect.stringContaining("先查资料"), expect.stringContaining("最终回答"),
+  ]);
+  expect(wrapper.get(".research-progress").text()).not.toContain("先查资料");
   expect(wrapper.get(".research-progress").text()).not.toContain("最终回答");
   expect(wrapper.get(".research-progress").element.open).toBe(false);
+  expect(wrapper.findAll(".messages > .message, .messages > .research-progress")
+    .map((item) => item.text())).toEqual([
+    expect.stringContaining("问题 A"),
+    expect.stringContaining("先查资料"),
+    expect.stringContaining("bash"),
+    expect.stringContaining("最终回答"),
+  ]);
+});
+
+it("places each tool exchange after its own saved plan", async () => {
+  const stream = controlledStream();
+  writeHandler = () => stream.response;
+  await openApp();
+  await send("问题 A");
+  stream.emit({ type: "started", workspace_id: "w1", thread_id: "a" });
+  for (const [id, text, name] of [["plan1", "读取年报", "read_report"], ["plan2", "计算比率", "calculate"]]) {
+    stream.emit({ type: "text_delta", message_id: id, text });
+    stream.emit({ type: "tool_start", tool_run_id: name, name });
+    stream.emit({ type: "tool_end", tool_run_id: name });
+  }
+  stream.emit({ type: "text_delta", message_id: "answer", text: "最终结论" });
+  threads.a.messages = [
+    message(1, "user", "问题 A"),
+    message(2, "assistant", "读取年报", "plan1"),
+    message(3, "assistant", "计算比率", "plan2"),
+    message(4, "assistant", "最终结论", "answer"),
+  ];
+  threads.a.execution_status = "succeeded";
+  stream.emit({ type: "succeeded", message: { ...threads.a.messages[3], thread_id: "a" } });
+  await flushPromises();
+  expect(wrapper.findAll(".messages > .message, .messages > .research-progress")
+    .map((item) => item.text())).toEqual([
+    expect.stringContaining("问题 A"),
+    expect.stringContaining("读取年报"),
+    expect.stringContaining("read_report"),
+    expect.stringContaining("计算比率"),
+    expect.stringContaining("calculate"),
+    expect.stringContaining("最终结论"),
+  ]);
+});
+
+it("keeps the streamed plan and tools before the final answer when storage refresh fails", async () => {
+  const stream = controlledStream();
+  writeHandler = () => stream.response;
+  await openApp();
+  await send("问题 A");
+  stream.emit({ type: "started", workspace_id: "w1", thread_id: "a" });
+  stream.emit({ type: "text_delta", message_id: "plan", text: "先查资料" });
+  stream.emit({ type: "tool_start", tool_run_id: "t", name: "bash" });
+  stream.emit({ type: "tool_end", tool_run_id: "t" });
+  stream.emit({ type: "text_delta", message_id: "answer", text: "最终回答" });
+  readHandler = () => Promise.reject(new Error("读回失败"));
+  stream.emit({ type: "succeeded", message: { ...message(3, "assistant", "最终回答", "answer"), thread_id: "a" } });
+  await flushPromises();
+  expect(wrapper.findAll(".messages > .message, .messages > .research-progress")
+    .map((item) => item.text())).toEqual([
+    expect.stringContaining("问题 A"),
+    expect.stringContaining("先查资料"),
+    expect.stringContaining("最终回答"),
+  ]);
+  expect(wrapper.get(".research-progress").text()).toContain("bash");
+  expect(wrapper.get(".research-progress").text()).not.toContain("最终回答");
+});
+
+it("keeps a later streamed answer visible when polling saves an earlier plan", async () => {
+  vi.useFakeTimers();
+  const stream = controlledStream();
+  writeHandler = () => stream.response;
+  await openApp();
+  await send("问题 A");
+  stream.emit({ type: "started", workspace_id: "w1", thread_id: "a" });
+  stream.emit({ type: "text_delta", message_id: "plan", text: "核对资料" });
+  stream.emit({ type: "tool_start", tool_run_id: "t", name: "bash" });
+  stream.emit({ type: "tool_end", tool_run_id: "t" });
+  // The text can match the plan; identity, not content or message count, decides replacement.
+  stream.emit({ type: "text_delta", message_id: "answer", text: "核对资料" });
+  threads.a.messages = [message(1, "user", "问题 A"), message(2, "assistant", "核对资料", "plan")];
+  threads.a.execution_status = "running";
+  await vi.advanceTimersByTimeAsync(2000);
+  await flushPromises();
+  expect(wrapper.findAll(".message.assistant")).toHaveLength(1);
+  expect(wrapper.get(".research-progress").text().match(/核对资料/g)).toHaveLength(1);
+  expect(wrapper.get(".message.assistant").element.nextElementSibling)
+    .toBe(wrapper.get(".research-progress").element);
+
+  stream.emit({ type: "text_delta", message_id: "answer", text: "后得出结论" });
+  threads.a.messages.push(message(3, "assistant", "核对资料后得出结论", "answer"));
+  threads.a.execution_status = "succeeded";
+  stream.emit({ type: "succeeded", message: { ...threads.a.messages[2], thread_id: "a" } });
+  await flushPromises();
+  expect(wrapper.findAll(".message.assistant")).toHaveLength(2);
+  expect(wrapper.get(".research-progress").text()).not.toContain("核对资料");
+
+  wrapper.unmount();
+  await openApp();
+  expect(wrapper.findAll(".message.assistant").map((item) => item.text())).toEqual([
+    expect.stringContaining("核对资料"), expect.stringContaining("核对资料后得出结论"),
+  ]);
+  expect(wrapper.find(".research-progress").exists()).toBe(false);
+  expect(writes).toHaveLength(1);
+});
+
+it("restores a saved plan on reload while research is still running", async () => {
+  vi.useFakeTimers();
+  threads.a.execution_status = "running";
+  threads.a.messages = [message(1, "user", "问题 A"), message(2, "assistant", "先查资料", "plan")];
+  await openApp();
+  expect(wrapper.get(".message.assistant").text()).toContain("先查资料");
+  expect(wrapper.get("textarea").element.disabled).toBe(true);
+  expect(wrapper.find(".research-progress").exists()).toBe(false);
+  threads.a.messages.push(message(3, "assistant", "研究结论", "answer"));
+  threads.a.execution_status = "succeeded";
+  await vi.advanceTimersByTimeAsync(2000);
+  await flushPromises();
+  expect(wrapper.findAll(".message.assistant")).toHaveLength(2);
+  expect(wrapper.get("textarea").element.disabled).toBe(false);
+  expect(writes).toHaveLength(0);
+});
+
+it("retains a committed plan after failure while only unsaved text stays in progress", async () => {
+  const stream = controlledStream();
+  writeHandler = () => stream.response;
+  await openApp();
+  await send("问题 A");
+  stream.emit({ type: "started", workspace_id: "w1", thread_id: "a" });
+  stream.emit({ type: "text_delta", message_id: "plan", text: "先查资料" });
+  stream.emit({ type: "text_delta", message_id: "answer", text: "未完成结论" });
+  threads.a.messages = [message(1, "user", "问题 A"), message(2, "assistant", "先查资料", "plan")];
+  threads.a.execution_status = "failed";
+  threads.a.execution_error = "模型连接失败";
+  stream.emit({ type: "failed", error: "模型连接失败" });
+  await flushPromises();
+  expect(wrapper.get(".message.assistant").text()).toContain("先查资料");
+  expect(wrapper.get(".research-progress").text()).not.toContain("先查资料");
+  expect(wrapper.get(".research-progress").text()).toContain("未完成结论");
+
+  wrapper.unmount();
+  await openApp();
+  expect(wrapper.get(".message.assistant").text()).toContain("先查资料");
+  expect(wrapper.get('[role="alert"]').text()).toContain("模型连接失败");
+  expect(wrapper.find(".research-progress").exists()).toBe(false);
+  expect(writes).toHaveLength(1);
 });
 
 it("keeps partial output and tool errors after a streamed failure without saving them as an answer", async () => {
@@ -154,7 +302,7 @@ it("recovers a disconnected stream through polling without resending", async () 
   await flushPromises();
   expect(wrapper.get('[role="alert"]').text()).toContain("连接已中断");
   expect(wrapper.get("textarea").element.disabled).toBe(true);
-  threads.a.messages.push(message(2, "assistant", "完整回答"));
+  threads.a.messages.push(message(2, "assistant", "完整回答", "m"));
   threads.a.execution_status = "succeeded";
   await vi.advanceTimersByTimeAsync(2000);
   await flushPromises();
@@ -172,12 +320,13 @@ it("shows the committed answer once even if refreshing storage fails after succe
   stream.emit({ type: "started", workspace_id: "w1", thread_id: "a" });
   stream.emit({ type: "text_delta", message_id: "m", text: "完整回答" });
   readHandler = () => Promise.reject(new Error("读回失败"));
-  stream.emit({ type: "succeeded", message: { ...message(2, "assistant", "完整回答"), thread_id: "a" } });
+  stream.emit({ type: "succeeded", message: { ...message(2, "assistant", "完整回答", "m"), thread_id: "a" } });
   await flushPromises();
   expect(wrapper.findAll(".message").map((item) => item.text())).toEqual([
     expect.stringContaining("问题 A"), expect.stringContaining("完整回答"),
   ]);
   expect(wrapper.get('[role="alert"]').text()).toContain("刷新记录失败");
+  expect(wrapper.find(".research-progress").exists()).toBe(false);
   expect(wrapper.get("textarea").element.value).toBe("");
 });
 

@@ -34,7 +34,8 @@ class ProtocolCheckingModel(FakeMessagesListChatModel):
                     pending = {call["id"] for call in message.tool_calls}
         if pending:
             raise ValueError("insufficient tool messages following tool_calls message")
-        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        return result.model_copy(deep=True)
 
 
 class WorkspaceRecoveryTests(unittest.TestCase):

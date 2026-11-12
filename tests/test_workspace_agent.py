@@ -17,6 +17,7 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import Field
+from langchain_core.tools import tool
 
 from corpcom.run_coordinator import RunCoordinator
 from corpcom.workspace import WorkspaceStore
@@ -609,7 +610,7 @@ class WorkspaceAgentTests(unittest.TestCase):
     with WorkspaceStore(self.data) as store:
       answer = ask_workspace(store, model, self.workspace.id, self.thread.id,
                              "写入并编辑笔记", self.checkpointer)
-      self.assertEqual(answer, "文件已更新。")
+      self.assertEqual(answer.text, "文件已更新。")
       self.assertEqual(store.get_workspace_detail(self.workspace.id).artifacts, [])
     path = self.data / "workspaces" / self.workspace.id / "tasks/demo/note.txt"
     self.assertEqual(path.read_text(encoding="utf-8"), "更新")
@@ -646,7 +647,7 @@ class WorkspaceAgentTests(unittest.TestCase):
           store, model, self.workspace.id, self.thread.id,
           "读取不存在的会话", checkpointer,
       )
-      self.assertEqual(answer, "找不到指定资料，请核对 ID。")
+      self.assertEqual(answer.text, "找不到指定资料，请核对 ID。")
       self.assertEqual(len(model.requests), 2)
 
       # The model must receive a result matching its failed tool call.
@@ -682,7 +683,7 @@ class WorkspaceAgentTests(unittest.TestCase):
           store, next_model, self.workspace.id, self.thread.id,
           "继续研究", checkpointer,
       )
-      self.assertEqual(answer, "可以继续研究。")
+      self.assertEqual(answer.text, "可以继续研究。")
       self.assertEqual(
           next_model.requests[0][1:-1],
           messages,
@@ -802,6 +803,118 @@ class WorkspaceAgentTests(unittest.TestCase):
           "succeeded",
       )
 
+  def test_plan_is_committed_before_tool_and_retained_after_completion(self):
+    observed = []
+
+    @tool
+    def inspect_record() -> str:
+      """Inspect a research record."""
+      with WorkspaceStore(self.data) as reader:
+        observed.append(
+            reader.get_thread(self.workspace.id, self.thread.id)
+        )
+      return "已核对"
+
+    model = ScriptedModel(responses=[
+      AIMessage(
+          id="plan-1",
+          content="先核对记录。",
+          tool_calls=[{
+            "id": "call-1",
+            "name": "inspect_record",
+            "args": {},
+          }],
+      ),
+      AIMessage(id="answer-1", content="核对完成。"),
+    ])
+    coordinator = RunCoordinator(
+        self.checkpointer, max_concurrent_runs=1,
+    )
+
+    with (
+      WorkspaceStore(self.data) as store,
+      patch(
+          "corpcom.workspace_agent.create_workspace_tools",
+          return_value=[inspect_record],
+      ),
+    ):
+      answer = coordinator.run(
+          store, model, self.workspace.id, self.thread.id, "开始",
+      )
+
+    # A separate connection saw the committed plan during tool execution.
+    self.assertEqual(len(observed), 1)
+    during_tool = observed[0]
+    self.assertEqual(during_tool.execution_status, "running")
+    self.assertEqual(
+        [m.content for m in during_tool.messages],
+        ["开始", "先核对记录。"],
+    )
+    self.assertEqual(
+        during_tool.messages[-1].model_message_id, "plan-1",
+    )
+
+    with WorkspaceStore(self.data) as reader:
+      detail = reader.get_thread(self.workspace.id, self.thread.id)
+
+    self.assertEqual(detail.execution_status, "succeeded")
+    self.assertEqual(
+        [(m.role, m.content, m.model_message_id) for m in detail.messages],
+        [
+          ("user", "开始", None),
+          ("assistant", "先核对记录。", "plan-1"),
+          ("assistant", "核对完成。", "answer-1"),
+        ],
+    )
+    self.assertEqual(detail.messages[-1], answer)
+
+  def test_completed_plan_survives_tool_failure(self):
+    @tool
+    def inspect_record() -> str:
+      """Inspect a research record."""
+      raise RuntimeError("record lookup failed")
+
+    model = ScriptedModel(responses=[
+      AIMessage(
+          id="plan-1",
+          content="先核对记录。",
+          tool_calls=[{
+            "id": "call-1",
+            "name": "inspect_record",
+            "args": {},
+          }],
+      ),
+    ])
+    coordinator = RunCoordinator(
+        self.checkpointer, max_concurrent_runs=1,
+    )
+
+    with (
+      WorkspaceStore(self.data) as store,
+      patch(
+          "corpcom.workspace_agent.create_workspace_tools",
+          return_value=[inspect_record],
+      ),
+    ):
+      with self.assertRaisesRegex(RuntimeError, "record lookup failed"):
+        coordinator.run(
+            store, model, self.workspace.id, self.thread.id, "开始",
+        )
+
+    # Completed messages remain readable after a later execution failure.
+    with WorkspaceStore(self.data) as reader:
+      detail = reader.get_thread(self.workspace.id, self.thread.id)
+
+    self.assertEqual(detail.execution_status, "failed")
+    self.assertEqual(detail.execution_error, "record lookup failed")
+    self.assertEqual(
+        [(m.role, m.content, m.model_message_id) for m in detail.messages],
+        [
+          ("user", "开始", None),
+          ("assistant", "先核对记录。", "plan-1"),
+        ],
+    )
+    self.assertEqual(len(model.requests), 1)
 
 if __name__ == "__main__":
   unittest.main()

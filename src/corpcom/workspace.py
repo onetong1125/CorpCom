@@ -36,10 +36,13 @@ CREATE TABLE IF NOT EXISTS threads (
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
     thread_id TEXT NOT NULL REFERENCES threads(id),
+    model_message_id TEXT,
     role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
     content TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_thread_model_message
+ON messages (thread_id, model_message_id);
 CREATE TABLE IF NOT EXISTS artifacts (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
@@ -219,15 +222,23 @@ class WorkspaceStore:
         (workspace_id,),
     ).fetchone() is not None
 
-  def add_message(self, workspace_id: str, thread_id: str, role: str,
-      content: str) -> Message:
+  def add_message(
+      self,
+      workspace_id: str,
+      thread_id: str,
+      role: str,
+      content: str,
+      *,
+      model_message_id: str | None = None,
+  ) -> Message:
     """Save supplied message text without calling a model or generating a reply."""
     self._thread(workspace_id, thread_id)
     _require_text(content=content)
     with self.db:
       cursor = self.db.execute(
-          "INSERT INTO messages (thread_id, role, content) VALUES (?, ?, ?)",
-          (thread_id, role, content),
+          "INSERT INTO messages (thread_id, role, content, model_message_id) "
+          "VALUES (?, ?, ?, ?)",
+          (thread_id, role, content, model_message_id),
       )
       self._touch(workspace_id)
     return Message.model_validate(dict(self.db.execute(
@@ -545,16 +556,18 @@ class WorkspaceStore:
       workspace_id: str,
       thread_id: str,
       answer: str,
+      *,
+      model_message_id: str | None = None,
   ) -> Message:
     self._thread(workspace_id, thread_id)
     _require_text(content=answer)
     with self.db:
       cursor = self.db.execute(
           """
-          INSERT INTO messages (thread_id, role, content)
-          VALUES (?, 'assistant', ?);
+          INSERT INTO messages (thread_id, role, content, model_message_id)
+          VALUES (?, 'assistant', ?, ?);
           """,
-          (thread_id, answer)
+          (thread_id, answer, model_message_id)
       )
       message_id = cursor.lastrowid
 
