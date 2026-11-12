@@ -61,6 +61,7 @@ class Message(BaseModel):
     model_message_id: str | None = None
     role: Literal["user", "assistant"]
     content: str
+    tool_calls: list[dict[str, JsonValue]] = Field(default_factory=list)
     created_at: Timestamp
 
 

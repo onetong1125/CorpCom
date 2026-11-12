@@ -39,10 +39,26 @@ CREATE TABLE IF NOT EXISTS messages (
     model_message_id TEXT,
     role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
     content TEXT NOT NULL,
+    tool_calls TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_thread_model_message
 ON messages (thread_id, model_message_id);
+CREATE TABLE IF NOT EXISTS tool_executions (
+    id TEXT PRIMARY KEY,
+    message_id INTEGER NOT NULL REFERENCES messages(id),
+    tool_call_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('running', 'returned', 'error', 'interrupted')
+    ),
+    output TEXT,
+    error TEXT,
+    started_at TEXT NOT NULL DEFAULT (
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    ),
+    finished_at TEXT,
+    UNIQUE (message_id, tool_call_id)
+);
 CREATE TABLE IF NOT EXISTS artifacts (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
@@ -70,6 +86,12 @@ def _require_text(**fields: str) -> None:
   for name, value in fields.items():
     if not value.strip():
       raise ValueError(f"{name} must not be empty")
+
+def _message_from_row(row: sqlite3.Row) -> Message:
+  """Decode stored tool calls before building a message."""
+  data = dict(row)
+  data["tool_calls"] = json.loads(data["tool_calls"])
+  return Message.model_validate(data)
 
 
 class WorkspaceStore:
@@ -209,7 +231,7 @@ class WorkspaceStore:
     """Return a conversation with history messages."""
     thread = self._thread(workspace_id, thread_id)
     # Message IDs preserve insertion order even when timestamps share a millisecond.
-    messages = [Message.model_validate(dict(row)) for row in self.db.execute(
+    messages = [_message_from_row(row) for row in self.db.execute(
         "SELECT * FROM messages WHERE thread_id = ? ORDER BY id", (thread_id,)
     )]
     return ThreadDetail(**thread.model_dump(), messages=messages)
@@ -230,20 +252,29 @@ class WorkspaceStore:
       content: str,
       *,
       model_message_id: str | None = None,
+      tool_calls: list[dict[str, JsonValue]] | None = None,
   ) -> Message:
-    """Save supplied message text without calling a model or generating a reply."""
+    """Save message text and model tool-call declarations."""
     self._thread(workspace_id, thread_id)
-    _require_text(content=content)
+    calls = [] if tool_calls is None else tool_calls
+
+    # Assistant tool calls form a message even without text.
+    if role != "assistant" or not calls:
+      _require_text(content=content)
+
+    encoded_calls = json.dumps(calls, ensure_ascii=False, allow_nan=False,)
     with self.db:
       cursor = self.db.execute(
-          "INSERT INTO messages (thread_id, role, content, model_message_id) "
-          "VALUES (?, ?, ?, ?)",
-          (thread_id, role, content, model_message_id),
+          "INSERT INTO messages "
+          "(thread_id, role, content, model_message_id, tool_calls) "
+          "VALUES (?, ?, ?, ?, ?)",
+          (thread_id, role, content, model_message_id, encoded_calls),
       )
       self._touch(workspace_id)
-    return Message.model_validate(dict(self.db.execute(
+
+    return _message_from_row(self.db.execute(
         "SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)
-    ).fetchone()))
+    ).fetchone())
 
   def add_user_message(
     self,
@@ -263,11 +294,11 @@ class WorkspaceStore:
           (thread_id, content),
       )
       self._touch(workspace_id)
-      message = Message.model_validate(dict(self.db.execute(
+      message = _message_from_row(self.db.execute(
         "SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)
-      ).fetchone()))
+      ).fetchone())
 
-      return (message, is_first)
+      return message, is_first
 
 
 
@@ -584,6 +615,6 @@ class WorkspaceStore:
 
       self._touch(workspace_id)
 
-      return Message.model_validate(dict(self.db.execute(
+      return _message_from_row(self.db.execute(
           "SELECT * FROM messages WHERE id = ?", (message_id,)
-      ).fetchone()))
+      ).fetchone())

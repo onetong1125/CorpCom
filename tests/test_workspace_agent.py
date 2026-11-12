@@ -36,7 +36,9 @@ class ScriptedModel(FakeMessagesListChatModel):
   def _generate(self, messages, stop=None, run_manager=None, **kwargs):
     # Keep the input before the framework adds later replies and tool results.
     self.requests.append(deepcopy(messages))
-    return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+    result = super()._generate(
+        messages, stop=stop, run_manager=run_manager, **kwargs)
+    return result.model_copy(deep=True)
 
 class StreamingModel(FakeListChatModel):
   def bind_tools(self, tools, **kwargs):
@@ -360,11 +362,19 @@ class WorkspaceAgentTests(unittest.TestCase):
       }
       self.assertEqual(results["old_thread"]["messages"], [{"role": "user", "content": "先核对现金流"}])
       # self.assertEqual(results["plan_file"]["content"], "# 原始计划\n检查现金流。\n")
+      messages = store.get_thread(self.workspace.id, second.id).messages
       self.assertEqual(
-          [(item.role, item.content) for item in store.get_thread(self.workspace.id, second.id).messages],
-          [("user", "继续昨天的研究"), ("assistant", answer)],
+          [(item.role, item.content) for item in messages],
+          [
+            ("user", "继续昨天的研究"),
+            ("assistant", ""),
+            ("assistant", answer),
+          ],
       )
-      self.assertEqual(len(store.get_thread(self.workspace.id, self.thread.id).messages), 1)
+      self.assertEqual(
+          messages[1].tool_calls,
+          model.responses[0].tool_calls,
+      )
 
     # Read from a fresh connection to verify tool messages reached disk.
     with SqliteSaver.from_conn_string(checkpoint_path) as checkpointer:
@@ -459,7 +469,7 @@ class WorkspaceAgentTests(unittest.TestCase):
                   self.workspace.id, thread.id,
               ).messages
               ],
-              ["user", "assistant"],
+              ["user", "assistant", "assistant"],
           )
 
       self.assertEqual(len(store.get_thread(other.id, private_thread.id).messages), 1)
@@ -474,10 +484,19 @@ class WorkspaceAgentTests(unittest.TestCase):
         ask_workspace(store, model, self.workspace.id, self.thread.id,
                       "反复读取", self.checkpointer)
       self.assertEqual(len(model.requests), 100)
+      messages = store.get_thread(
+          self.workspace.id, self.thread.id,
+      ).messages
       self.assertEqual(
-          [item.role for item in store.get_thread(self.workspace.id, self.thread.id).messages],
-          ["user"],
+          [item.role for item in messages],
+          ["user"] + ["assistant"] * 100,
       )
+      for message in messages[1:]:
+        self.assertEqual(message.content, "")
+        self.assertEqual(
+            message.tool_calls,
+            model.responses[0].tool_calls,
+        )
 
   def test_empty_model_answer_is_not_saved(self):
     model = ScriptedModel(responses=[AIMessage(content="")])
@@ -716,14 +735,16 @@ class WorkspaceAgentTests(unittest.TestCase):
           )
 
       self.assertEqual(len(model.requests), 1)
+      messages = store.get_thread(
+          self.workspace.id, self.thread.id,
+      ).messages
       self.assertEqual(
-          [
-            item.role
-            for item in store.get_thread(
-              self.workspace.id, self.thread.id,
-          ).messages
-          ],
-          ["user"],
+          [item.role for item in messages],
+          ["user", "assistant"],
+      )
+      self.assertEqual(
+          messages[-1].tool_calls,
+          model.responses[0].tool_calls,
       )
 
   def test_streaming_success_events_and_saved_answer(self):

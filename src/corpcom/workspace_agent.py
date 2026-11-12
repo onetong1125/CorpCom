@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore
+from corpcom.workspace_models import Message
 from corpcom.workspace_prompt import build_workspace_prompt
 from corpcom.workspace_tools import create_workspace_tools
 
@@ -155,14 +156,14 @@ def ask_workspace(
       message = data["model"]["messages"][-1]
       if message.tool_calls:
         # Persist completed text before executing its tool calls.
-        if message.text.strip():
-          store.add_message(
-              workspace_id,
-              thread_id,
-              "assistant",
-              message.text,
-              model_message_id=message.id,
-          )
+        store.add_message(
+            workspace_id,
+            thread_id,
+            "assistant",
+            message.text,
+            model_message_id=message.id,
+            tool_calls=message.tool_calls,
+        )
       else:
         # The coordinator saves the final answer with the success status.
         answer = message
