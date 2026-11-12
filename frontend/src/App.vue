@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onBeforeUnmount, reactive, ref, watch } from "vue";
 import {
   ArrowUp,
   Plus,
@@ -15,7 +15,7 @@ import {
   Layers,
   ChevronRight,
 } from "@lucide/vue";
-import { jsonRequest, request } from "./api";
+import { jsonRequest, request, streamRequest } from "./api";
 import MarkdownContent from "./components/MarkdownContent.vue";
 import ArtifactPanel from "./components/ArtifactPanel.vue";
 
@@ -31,6 +31,8 @@ const error = ref("");
 const search = ref("");
 const threadSearch = ref("");
 const pollError = ref("");
+const connections = new Set();
+let disposed = false;
 let selectionVersion = 0;
 let refreshVersion = 0;
 const draft = computed({
@@ -43,10 +45,27 @@ const sending = computed(
   () => Boolean(runs[thread.value?.id]?.pending) ||
     thread.value?.execution_status === "running",
 );
+const currentRun = computed(() => runs[thread.value?.id]);
+const displayedMessages = computed(() => {
+  const messages = thread.value?.messages || [];
+  const run = currentRun.value;
+  if (!run?.answer || messages.some((item) => item.id === run.answer.id)) return messages;
+  const question = messages.filter((item) => item.role === "user").length === run.userMessageCount
+    ? [{ id: `pending:${thread.value.id}`, role: "user", content: run.content, created_at: run.createdAt }] : [];
+  return [...messages, ...question, run.answer];
+});
+const progressItems = computed(() => {
+  const run = currentRun.value;
+  if (!run) return [];
+  const saved = run.answer || thread.value.messages.filter((item) =>
+    item.role === "assistant").length > run.assistantMessageCount;
+  const lastText = saved ? run.items.findLast((item) => item.type === "text") : null;
+  return run.items.filter((item) => item !== lastText);
+});
 const pendingText = computed(() => {
   const run = runs[thread.value?.id];
   // A refresh may already contain the persisted user message.
-  return run?.pending &&
+  return run?.pending && !run.answer &&
     thread.value.messages.filter((item) => item.role === "user").length === run.userMessageCount
     ? run.content
     : "";
@@ -107,6 +126,18 @@ function rememberSelection() {
   window.history.replaceState(null, "", url);
 }
 
+function reconcileRun(detail) {
+  const run = runs[detail.id];
+  if (!run || (!run.reconciling && run.status !== "disconnected")) return;
+  run.reconciling = false;
+  if (run.status === "disconnected" &&
+      detail.messages.filter((item) => item.role === "user").length > run.userMessageCount &&
+      ["succeeded", "failed", "interrupted"].includes(detail.execution_status)) {
+    run.status = detail.execution_status;
+    run.error = detail.execution_status === "succeeded" ? "" : detail.execution_error;
+  }
+}
+
 async function loadSelection(id, threadId) {
   const version = ++selectionVersion;
   loading.value = true;
@@ -125,6 +156,7 @@ async function loadSelection(id, threadId) {
     if (version !== selectionVersion) return;
     workspace.value = detail;
     thread.value = selectedThread;
+    if (selectedThread) reconcileRun(selectedThread);
     rememberSelection();
   } catch (err) {
     if (version === selectionVersion) throw err;
@@ -178,6 +210,7 @@ async function selectThread(id) {
     const selected = await request(`/workspaces/${workspaceId}/threads/${id}`);
     if (version !== selectionVersion) return;
     thread.value = selected;
+    reconcileRun(selected);
     rememberSelection();
   } catch (err) {
     if (version === selectionVersion) error.value = err.message;
@@ -197,10 +230,18 @@ async function refreshResearch(workspaceId = workspace.value.id) {
   if (threadId) reads.push(request(`${path}/threads/${threadId}`));
   const results = await Promise.allSettled(reads);
   if (selection !== selectionVersion || version !== refreshVersion) return;
-  if (results[0].status === "fulfilled") workspace.value = results[0].value;
+  if (results[0].status === "fulfilled") {
+    workspace.value = results[0].value;
+    // Non-selected threads are observed through the workspace status list.
+    for (const item of workspace.value.threads) {
+      if (item.id !== threadId && runs[item.id]) runs[item.id].reconciling = false;
+    }
+  }
   if (results[1].status === "fulfilled") workspaces.value = results[1].value;
-  if (threadId && results[2].status === "fulfilled")
+  if (threadId && results[2].status === "fulfilled") {
     thread.value = results[2].value;
+    reconcileRun(thread.value);
+  }
   const failures = results.filter((result) => result.status === "rejected");
   if (failures.length)
     throw new Error(failures.map((result) => result.reason.message).join("；"));
@@ -226,20 +267,74 @@ async function sendMessage() {
   runs[threadId] = {
     pending: true,
     content: draft.value.trim(),
+    createdAt: new Date().toISOString(),
     userMessageCount: thread.value.messages.filter((item) => item.role === "user")
       .length,
     error: "",
+    status: "connecting",
+    items: [],
+    answer: null,
+    assistantMessageCount: thread.value.messages.filter((item) => item.role === "assistant").length,
+    reconciling: false,
   };
   const run = runs[threadId];
+  const controller = new AbortController();
+  connections.add(controller);
   try {
-    await jsonRequest(
-      `/workspaces/${workspaceId}/threads/${threadId}/messages`,
+    const terminal = await streamRequest(
+      `/workspaces/${workspaceId}/threads/${threadId}/messages/stream`,
       { content: run.content },
+      (event) => {
+        switch (event.type) {
+          case "started":
+            if (event.workspace_id !== workspaceId || event.thread_id !== threadId)
+              throw new Error("研究事件归属不匹配。");
+            run.status = "running";
+            break;
+          case "text_delta": {
+            let item = run.items.find((item) => item.type === "text" && item.id === event.message_id);
+            if (!item) {
+              run.items.push({ type: "text", id: event.message_id, text: "" });
+              item = run.items.at(-1);
+            }
+            item.text += event.text;
+            break;
+          }
+          case "tool_start":
+            run.items.push({ type: "tool", id: event.tool_run_id, name: event.name, status: "running" });
+            break;
+          case "tool_end":
+          case "tool_error": {
+            const item = run.items.find((item) => item.type === "tool" && item.id === event.tool_run_id);
+            item.status = event.type === "tool_end" ? "returned" : "error";
+            item.error = event.error;
+            break;
+          }
+          case "succeeded":
+            run.status = "succeeded";
+            run.answer = event.message;
+            break;
+          case "failed":
+            run.status = "failed";
+            run.error = `研究失败：${event.error || "后端执行失败"} 请核对消息记录后再决定是否重发。`;
+            break;
+          default:
+            throw new Error(`无法识别研究事件：${event.type}`);
+        }
+      },
+      controller.signal,
     );
-    drafts[threadId] = "";
+    if (terminal.type === "succeeded") drafts[threadId] = "";
   } catch (err) {
-    run.error = `${err.message}。请先核对消息记录；重新发送会发起新的请求。`;
+    if (disposed) return;
+    run.status = err.status ? "rejected" : "disconnected";
+    run.reconciling = true;
+    const detail = err.status ? err.message : `事件连接中断，研究可能仍在后台进行。${err.message}`;
+    run.error = `${detail} 请先核对消息记录；重新发送会发起新的请求。`;
+  } finally {
+    connections.delete(controller);
   }
+  if (disposed) return;
   try {
     await refreshResearch(workspaceId);
   } catch (err) {
@@ -263,7 +358,7 @@ function executionLabel(item) {
 watch(
   () => workspace.value && (
     sending.value || workspace.value.threads.some((item) =>
-      item.execution_status === "running" || runs[item.id]?.pending,
+      item.execution_status === "running" || runs[item.id]?.pending || runs[item.id]?.reconciling,
     )
   ) ? workspace.value.id : null,
   (workspaceId, _, onCleanup) => {
@@ -421,13 +516,18 @@ function composerKeydown(event) {
 }
 
 watch(
-  () => [thread.value?.id, thread.value?.messages.length, sending.value],
+  () => [thread.value?.id, displayedMessages.value.length, sending.value,
+    currentRun.value?.items.map((item) => item.text || item.status).join("")],
   async () => {
     await nextTick();
     messageEnd.value?.scrollIntoView({ behavior: "smooth", block: "end" });
   },
 );
 onMounted(initialize);
+onBeforeUnmount(() => {
+  disposed = true;
+  for (const controller of connections) controller.abort();
+});
 </script>
 
 <template>
@@ -615,7 +715,7 @@ onMounted(initialize);
             </button>
           </div>
           <article
-            v-for="message in thread?.messages || []"
+            v-for="message in displayedMessages"
             :key="message.id"
             class="message"
             :class="message.role"
@@ -647,6 +747,22 @@ onMounted(initialize);
             </div>
             <div class="user-content">{{ pendingText }}</div>
           </article>
+          <details v-if="progressItems.length" class="research-progress"
+            :open="currentRun.status !== 'succeeded'">
+            <summary>{{ currentRun.status === 'succeeded' ? '查看本轮研究过程' :
+              currentRun.status === 'failed' ? '研究过程（未完成）' :
+              currentRun.status === 'disconnected' ? '已收到的研究过程（连接中断）' : '研究过程' }}</summary>
+            <div v-for="item in progressItems" :key="`${item.type}:${item.id}`" class="progress-item">
+              <MarkdownContent v-if="item.type === 'text'" :content="item.text" />
+              <div v-else class="tool-event" :class="item.status">
+                <span>{{ item.name }}</span>
+                <span>{{ item.status === 'running' ?
+                  (currentRun.pending ? '执行中' : '结果未收到') :
+                  item.status === 'returned' ? '已返回' : '执行异常' }}</span>
+                <p v-if="item.error">{{ item.error }}</p>
+              </div>
+            </div>
+          </details>
           <div v-if="sending" class="researching" role="status">
             <span class="pulse-dot"></span>
             <div>

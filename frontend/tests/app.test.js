@@ -3,6 +3,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import App from "../src/App.vue";
 import MarkdownContent from "../src/components/MarkdownContent.vue";
 import ArtifactPanel from "../src/components/ArtifactPanel.vue";
+import { successResponse } from "./stream-fixtures";
 
 const workspace = {
   id: "w1",
@@ -122,7 +123,7 @@ describe("research workbench", () => {
         created_at: savedUser.created_at,
       },
     ];
-    finish(response(messages[1], 201));
+    finish(successResponse(messages[1], "w1", "t1"));
     await flushPromises();
     expect(wrapper.findAll(".message")).toHaveLength(2);
     expect(wrapper.text()).toContain("report.md");

@@ -19,11 +19,17 @@ from openai import APIConnectionError
 from corpcom.api import create_app, get_model
 
 
-def scripted_research(store, model, workspace_id, thread_id, question, checkpointer):
+def scripted_research(store, model, workspace_id, thread_id, question, checkpointer, *, on_event=None):
     """Exercise HTTP, persistence and file archival while replacing Agent execution."""
     store.add_user_message(workspace_id, thread_id, question)
+    tool_id = uuid4().hex
+    if on_event is not None:
+        on_event({"type": "text_delta", "message_id": uuid4().hex, "text": "正在核对本次研究资料。"})
+        on_event({"type": "tool_start", "tool_run_id": tool_id, "name": "整理研究资料"})
     sleep(15 if "慢速" in question else 1)
     if "模拟失败" in question:
+        if on_event is not None:
+            on_event({"type": "tool_error", "tool_run_id": tool_id, "error": "脚本化工具失败"})
         raise APIConnectionError(request=httpx.Request("POST", "http://model.invalid"))
 
     if "v1" in question or "v2" in question:
@@ -46,6 +52,12 @@ def scripted_research(store, model, workspace_id, thread_id, question, checkpoin
         answer = f"已保存 **{version}** 验收报告、数据和代码。报告 ID：`{artifacts[0].id}`。"
     else:
         answer = "已读取当前研究。可以在新会话继续查看已有资料。（脚本化验收回答）"
+    if on_event is not None:
+        on_event({"type": "tool_end", "tool_run_id": tool_id})
+        message_id = uuid4().hex
+        for offset in range(0, len(answer), 4):
+            on_event({"type": "text_delta", "message_id": message_id, "text": answer[offset:offset + 4]})
+            sleep(0.12)
     return answer
 
 

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import App from "../src/App.vue";
 import ArtifactPanel from "../src/components/ArtifactPanel.vue";
+import { successResponse, controlledStream } from "./stream-fixtures";
 
 let wrapper;
 let spaces;
@@ -88,11 +89,168 @@ async function selectWorkspace(id) {
   await flushPromises();
 }
 
+it("streams text and tool events into the original thread and replaces the final increment once", async () => {
+  const stream = controlledStream();
+  writeHandler = () => stream.response;
+  await openApp();
+  await send("问题 A");
+  stream.emit({ type: "started", workspace_id: "w1", thread_id: "a" });
+  stream.emit({ type: "text_delta", message_id: "intro", text: "先查资料" });
+  stream.emit({ type: "tool_start", tool_run_id: "tool1", name: "bash" });
+  await flushPromises();
+  expect(wrapper.get(".research-progress").text()).toContain("先查资料");
+  expect(wrapper.get(".tool-event").text()).toContain("执行中");
+  await selectThread("b");
+  stream.emit({ type: "tool_end", tool_run_id: "tool1" });
+  stream.emit({ type: "text_delta", message_id: "answer", text: "最终" });
+  stream.emit({ type: "text_delta", message_id: "answer", text: "回答" });
+  await flushPromises();
+  expect(wrapper.find(".research-progress").exists()).toBe(false);
+  await selectThread("a");
+  expect(wrapper.get(".research-progress").text()).toContain("最终回答");
+  expect(wrapper.get(".tool-event").text()).toContain("已返回");
+  threads.a.messages = [message(1, "user", "问题 A"), message(2, "assistant", "最终回答")];
+  threads.a.execution_status = "succeeded";
+  stream.emit({ type: "succeeded", message: { ...threads.a.messages[1], thread_id: "a" } });
+  await flushPromises();
+  expect(wrapper.findAll(".message.assistant")).toHaveLength(1);
+  expect(wrapper.get(".message.assistant").text()).toContain("最终回答");
+  expect(wrapper.get(".research-progress").text()).not.toContain("最终回答");
+  expect(wrapper.get(".research-progress").element.open).toBe(false);
+});
+
+it("keeps partial output and tool errors after a streamed failure without saving them as an answer", async () => {
+  const stream = controlledStream();
+  writeHandler = () => stream.response;
+  await openApp();
+  await send("问题 A");
+  stream.emit({ type: "started", workspace_id: "w1", thread_id: "a" });
+  stream.emit({ type: "text_delta", message_id: "m", text: "未完成内容" });
+  stream.emit({ type: "tool_start", tool_run_id: "t", name: "bash" });
+  stream.emit({ type: "tool_error", tool_run_id: "t", error: "工具出错" });
+  threads.a.messages = [message(1, "user", "问题 A")];
+  threads.a.execution_status = "failed";
+  stream.emit({ type: "failed", error: "研究出错" });
+  await flushPromises();
+  expect(wrapper.get('[role="alert"]').text()).toContain("研究出错");
+  expect(wrapper.get(".research-progress").text()).toContain("未完成内容");
+  expect(wrapper.get(".tool-event").text()).toContain("工具出错");
+  expect(wrapper.findAll(".message.assistant")).toHaveLength(0);
+  expect(wrapper.get("textarea").element.value).toBe("问题 A");
+  expect(writes).toHaveLength(1);
+});
+
+it("recovers a disconnected stream through polling without resending", async () => {
+  vi.useFakeTimers();
+  const stream = controlledStream();
+  writeHandler = () => stream.response;
+  await openApp();
+  await send("问题 A");
+  stream.emit({ type: "started", workspace_id: "w1", thread_id: "a" });
+  stream.emit({ type: "text_delta", message_id: "m", text: "部分回答" });
+  threads.a.messages = [message(1, "user", "问题 A")];
+  threads.a.execution_status = "running";
+  stream.close();
+  await flushPromises();
+  expect(wrapper.get('[role="alert"]').text()).toContain("连接已中断");
+  expect(wrapper.get("textarea").element.disabled).toBe(true);
+  threads.a.messages.push(message(2, "assistant", "完整回答"));
+  threads.a.execution_status = "succeeded";
+  await vi.advanceTimersByTimeAsync(2000);
+  await flushPromises();
+  expect(wrapper.find('[role="alert"]').exists()).toBe(false);
+  expect(wrapper.get(".message.assistant").text()).toContain("完整回答");
+  expect(wrapper.find(".research-progress").exists()).toBe(false);
+  expect(writes).toHaveLength(1);
+});
+
+it("shows the committed answer once even if refreshing storage fails after success", async () => {
+  const stream = controlledStream();
+  writeHandler = () => stream.response;
+  await openApp();
+  await send("问题 A");
+  stream.emit({ type: "started", workspace_id: "w1", thread_id: "a" });
+  stream.emit({ type: "text_delta", message_id: "m", text: "完整回答" });
+  readHandler = () => Promise.reject(new Error("读回失败"));
+  stream.emit({ type: "succeeded", message: { ...message(2, "assistant", "完整回答"), thread_id: "a" } });
+  await flushPromises();
+  expect(wrapper.findAll(".message").map((item) => item.text())).toEqual([
+    expect.stringContaining("问题 A"), expect.stringContaining("完整回答"),
+  ]);
+  expect(wrapper.get('[role="alert"]').text()).toContain("刷新记录失败");
+  expect(wrapper.get("textarea").element.value).toBe("");
+});
+
+it("keeps polling when both the event stream and the immediate state refresh fail", async () => {
+  vi.useFakeTimers();
+  const stream = controlledStream();
+  writeHandler = () => stream.response;
+  await openApp();
+  await send("问题 A");
+  stream.emit({ type: "started", workspace_id: "w1", thread_id: "a" });
+  threads.a.messages = [message(1, "user", "问题 A")];
+  threads.a.execution_status = "running";
+  readHandler = () => Promise.reject(new TypeError("offline"));
+  stream.close();
+  await flushPromises();
+  readHandler = () => undefined;
+  threads.a.messages.push(message(2, "assistant", "后台已完成"));
+  threads.a.execution_status = "succeeded";
+  await vi.advanceTimersByTimeAsync(2000);
+  await flushPromises();
+  expect(wrapper.get(".message.assistant").text()).toContain("后台已完成");
+  expect(wrapper.find('[role="alert"]').exists()).toBe(false);
+  expect(writes).toHaveLength(1);
+});
+
+it("closes the streaming connection on unmount without additional reads or retries", async () => {
+  const stream = controlledStream();
+  let signal;
+  writeHandler = (url, options) => {
+    signal = options.signal;
+    signal.addEventListener("abort", () => stream.fail(new DOMException("Aborted", "AbortError")));
+    return stream.response;
+  };
+  await openApp();
+  await send("问题 A");
+  const calls = fetch.mock.calls.length;
+  wrapper.unmount();
+  wrapper = null;
+  await flushPromises();
+  expect(signal.aborted).toBe(true);
+  expect(fetch).toHaveBeenCalledTimes(calls);
+});
+
+it("stops reconciliation polling after a disconnected background thread finishes", async () => {
+  vi.useFakeTimers();
+  const stream = controlledStream();
+  writeHandler = () => stream.response;
+  await openApp();
+  await send("问题 A");
+  stream.emit({ type: "started", workspace_id: "w1", thread_id: "a" });
+  threads.a.messages = [message(1, "user", "问题 A")];
+  threads.a.execution_status = "running";
+  await selectThread("b");
+  stream.close();
+  await flushPromises();
+  threads.a.execution_status = "succeeded";
+  threads.a.messages.push(message(2, "assistant", "后台 A 回答"));
+  await vi.advanceTimersByTimeAsync(2000);
+  await flushPromises();
+  const calls = fetch.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(4000);
+  expect(fetch).toHaveBeenCalledTimes(calls);
+  expect(wrapper.get(".chat-heading").text()).toContain("会话 b");
+  await selectThread("a");
+  expect(wrapper.get(".message.assistant").text()).toContain("后台 A 回答");
+  expect(wrapper.find('[role="alert"]').exists()).toBe(false);
+});
+
 it("runs two threads concurrently and keeps late answers, drafts and optimistic messages in their thread", async () => {
   vi.useFakeTimers();
   const pending = { a: deferred(), b: deferred() };
   writeHandler = (url, options) => {
-    const id = url.split("/").at(-2);
+    const id = url.split("/").at(-3);
     threads[id].execution_status = "running";
     threads[id].messages.push(message(1, "user", JSON.parse(options.body).content));
     return pending[id].promise;
@@ -105,17 +263,17 @@ it("runs two threads concurrently and keeps late answers, drafts and optimistic 
   await selectThread("b");
   await send("问题 B");
   expect(writes.map((item) => item.url)).toEqual([
-    "/api/workspaces/w1/threads/a/messages", "/api/workspaces/w1/threads/b/messages",
+    "/api/workspaces/w1/threads/a/messages/stream", "/api/workspaces/w1/threads/b/messages/stream",
   ]);
   expect(wrapper.findAll(".thread-status").map((item) => item.text())).toEqual(["研究中", "研究中"]);
   threads.b.execution_status = "succeeded";
   threads.b.messages.push(message(2, "assistant", "回答 B"));
-  pending.b.resolve(response(threads.b.messages[1], 201));
+  pending.b.resolve(successResponse(threads.b.messages[1], "w1", "b"));
   await flushPromises();
   await wrapper.get('textarea[aria-label="研究问题"]').setValue("B 的下一轮草稿");
   threads.a.execution_status = "succeeded";
   threads.a.messages.push(message(2, "assistant", "回答 A"));
-  pending.a.resolve(response(threads.a.messages[1], 201));
+  pending.a.resolve(successResponse(threads.a.messages[1], "w1", "a"));
   await flushPromises();
   expect(wrapper.get(".messages").text()).toContain("回答 B");
   expect(wrapper.get(".messages").text()).not.toContain("回答 A");
@@ -150,7 +308,12 @@ it("keeps late failures in the originating workspace and restores them on return
 it("uploads while research is running, allows another research during upload, and scopes upload failures", async () => {
   const research = deferred();
   const upload = deferred();
-  writeHandler = (url) => url.endsWith("/files") ? upload.promise : research.promise;
+  writeHandler = async (url) => {
+    if (url.endsWith("/files")) return upload.promise;
+    await research.promise;
+    return successResponse(message(2, "assistant", "完成"),
+      url.includes("/w2/") ? "w2" : "w1", url.split("/").at(-3));
+  };
   await openApp();
   await send("问题 A");
   expect(wrapper.get('button[aria-label="上传资料"]').element.disabled).toBe(false);
@@ -162,7 +325,7 @@ it("uploads while research is running, allows another research during upload, an
   await selectWorkspace("w2");
   expect(wrapper.get('button[aria-label="上传资料"]').element.disabled).toBe(false);
   await send("问题 C");
-  expect(writes[2].url).toBe("/api/workspaces/w2/threads/c/messages");
+  expect(writes[2].url).toBe("/api/workspaces/w2/threads/c/messages/stream");
   upload.resolve(response({ detail: "资料过大" }, 413));
   await flushPromises();
   expect(wrapper.find('[role="alert"]').exists()).toBe(false);
@@ -263,7 +426,7 @@ it("can create and start a new thread while another is running", async () => {
       threads.d = { ...threads.b, id: "d", title: JSON.parse(options.body).title };
       return response(threads.d, 201);
     }
-    return pending.promise;
+    return pending.promise.then(() => successResponse(message(2, "assistant", "完成"), "w1", url.split("/").at(-3)));
   };
   await openApp();
   await send("问题 A");
@@ -274,8 +437,8 @@ it("can create and start a new thread while another is running", async () => {
   expect(wrapper.get(".chat-heading").text()).toContain("新会话 D");
   await send("问题 D");
   expect(writes.map((item) => item.url)).toEqual([
-    "/api/workspaces/w1/threads/a/messages", "/api/workspaces/w1/threads",
-    "/api/workspaces/w1/threads/d/messages",
+    "/api/workspaces/w1/threads/a/messages/stream", "/api/workspaces/w1/threads",
+    "/api/workspaces/w1/threads/d/messages/stream",
   ]);
   pending.resolve(response({}, 201));
   await flushPromises();
