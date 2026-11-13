@@ -297,6 +297,8 @@ async function sendMessage() {
       .length,
     error: "",
     status: "connecting",
+    runId: null,
+    lastEventId: null,
     items: [],
     answer: null,
     reconciling: false,
@@ -308,12 +310,13 @@ async function sendMessage() {
     const terminal = await streamRequest(
       `/workspaces/${workspaceId}/threads/${threadId}/messages/stream`,
       { content: run.content },
-      (event) => {
+      (event, eventId) => {
         switch (event.type) {
           case "started":
             if (event.workspace_id !== workspaceId || event.thread_id !== threadId)
               throw new Error("研究事件归属不匹配。");
             run.status = "running";
+            run.runId = event.run_id;
             break;
           case "text_delta": {
             let item = run.items.find((item) => item.type === "text" && item.id === event.message_id);
@@ -345,6 +348,8 @@ async function sendMessage() {
           default:
             throw new Error(`无法识别研究事件：${event.type}`);
         }
+        // Advance only after the event has been applied to this run.
+        if (eventId !== null) run.lastEventId = eventId;
       },
       controller.signal,
     );

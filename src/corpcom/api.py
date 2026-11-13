@@ -12,8 +12,8 @@ from redis import Redis
 
 from dotenv import load_dotenv
 from collections.abc import AsyncIterator
-from fastapi.sse import EventSourceResponse
-from fastapi import Depends, FastAPI, Form, HTTPException, UploadFile
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+from fastapi import Depends, FastAPI, Form, HTTPException, UploadFile, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -24,6 +24,7 @@ from langchain_openai import ChatOpenAI
 from openai import APIError
 from pydantic import BaseModel, ConfigDict, Field
 
+from corpcom.run_events import RunEventStream
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore, ThreadBusyError
 from corpcom.workspace_models import (
     Artifact, Message, Thread, ThreadDetail, Workspace, WorkspaceDetail, WorkspaceResearchInfo, WorkspaceSummary,
@@ -195,7 +196,50 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     ):
         # 这里已经准入成功，进入SSE
         async for event in events:
-            yield event
+            payload = event.copy()
+            event_id = payload.pop("event_id", None)
+            yield ServerSentEvent(data=payload, id=event_id)
+
+    @app.get(
+        "/api/workspaces/{workspace_id}/threads/{thread_id}"
+        "/runs/{run_id}/events"
+    )
+    def read_run_events(
+        workspace_id: str,
+        thread_id: str,
+        run_id: str,
+        after: Annotated[
+            str, Query(pattern=r"^[0-9]+-[0-9]+$")
+        ] = "0-0",
+    ) -> list[dict[str, object]]:
+        with WorkspaceStore(root) as store:
+            store.get_research_run(workspace_id, thread_id, run_id)
+
+        stream = RunEventStream(app.state.redis, run_id)
+        return [
+            {"id": event_id, "data": event}
+            for event_id, event in stream.read_after(after)
+        ]
+
+    @app.get(
+        "/api/workspaces/{workspace_id}/threads/{thread_id}"
+        "/runs/{run_id}"
+    )
+    def read_run_status(
+        workspace_id: str,
+        thread_id: str,
+        run_id: str,
+    ) -> dict[str, object]:
+        with WorkspaceStore(root) as store:
+            run = store.get_research_run(
+                workspace_id, thread_id, run_id,
+            )
+
+        return {
+            "id": run.id,
+            "status": run.status,
+            "error": run.error,
+        }
 
     @app.post("/api/workspaces/{workspace_id}/threads/{thread_id}/messages", status_code=201)
     def send_message(

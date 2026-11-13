@@ -12,6 +12,7 @@ from pydantic import JsonValue
 from corpcom.workspace_models import (
   Artifact, ArtifactFile, Message, Thread, ThreadDetail,
   Workspace, WorkspaceDetail, WorkspaceResearchInfo, WorkspaceSummary,
+  ResearchRun
 )
 
 # Threads and files belong to a workspace; messages belong through their thread.
@@ -540,6 +541,33 @@ class WorkspaceStore:
     if not path.is_file():
       raise FileNotFoundError(f"stored file is missing: {path}")
     return ArtifactFile(**artifact, path=path)
+
+  def get_research_run(
+      self,
+      workspace_id: str,
+      thread_id: str,
+      run_id: str,
+  ) -> ResearchRun:
+    """Read a run within its owning workspace and thread."""
+    self._thread(workspace_id, thread_id)
+    row = self.db.execute(
+        """
+        SELECT * FROM research_runs
+        WHERE id = ? AND thread_id = ?
+        """,
+        (run_id, thread_id),
+    ).fetchone()
+
+    if row is None:
+      raise RecordNotFoundError(
+          f"research run not found in thread: {run_id}"
+      )
+
+    data = dict(row)
+    if data["sse_events"] is not None:
+      data["sse_events"] = json.loads(data["sse_events"])
+
+    return ResearchRun.model_validate(data)
 
   def start_thread_execution(
       self, workspace_id: str, thread_id: str,

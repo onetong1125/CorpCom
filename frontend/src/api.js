@@ -42,6 +42,7 @@ export async function streamRequest(path, body, onEvent, signal) {
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let buffer = "";
   let data = [];
+  let lastEventId = null;
   // The server sends LF or CRLF-delimited SSE, including keepalive comments.
   // Async iteration cancels the body when a terminal event or parsing error ends it.
   for await (const bytes of response.body) {
@@ -53,10 +54,13 @@ export async function streamRequest(path, body, onEvent, signal) {
       if (line === "" && data.length) {
         const event = JSON.parse(data.join("\n"));
         data = [];
-        onEvent(event);
+        onEvent(event, lastEventId);
         if (event.type === "succeeded" || event.type === "failed") return event;
       } else if (line.startsWith("data:")) {
         data.push(line.slice(5).replace(/^ /, ""));
+      } else if (line === "id" || line.startsWith("id:")) {
+        const value = line === "id" ? "" : line.slice(3).replace(/^ /, "");
+        if (!value.includes("\0")) lastEventId = value;
       }
     }
   }

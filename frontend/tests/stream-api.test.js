@@ -4,6 +4,38 @@ import { controlledStream } from "./stream-fixtures";
 
 afterEach(() => vi.unstubAllGlobals());
 
+it("delivers Redis cursors with fragmented frames and retains the cursor on an id-less terminal", async () => {
+  const wire = 'id: 123-0\r\ndata: {"type":"started","run_id":"run-1"}\r\n\r\n' +
+    'data: {"type":"text_delta","text":"中文"}\r\nid: 123-1\r\n\r\n' +
+    ': keepalive\r\n\r\ndata: {"type":"succeeded"}\r\n\r\n';
+  const body = new ReadableStream({
+    start(controller) {
+      for (const byte of new TextEncoder().encode(wire)) controller.enqueue(Uint8Array.of(byte));
+    },
+  });
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(body, {
+    headers: { "Content-Type": "text/event-stream" },
+  })));
+  const received = [];
+  await streamRequest("/stream", {}, (event, id) => received.push([event.type, id]));
+  expect(received).toEqual([["started", "123-0"], ["text_delta", "123-1"], ["succeeded", "123-1"]]);
+});
+
+it("ignores invalid cursor fields, supports cursor reset and isolates separate streams", async () => {
+  const wire = 'id: 123-0\ndata: {"type":"started"}\n\n' +
+    'id: bad\0id\ndata: {"type":"text_delta"}\n\n' +
+    'id\ndata: {"type":"succeeded"}\n\n';
+  vi.stubGlobal("fetch", vi.fn()
+    .mockResolvedValueOnce(new Response(wire, { headers: { "Content-Type": "text/event-stream" } }))
+    .mockResolvedValueOnce(new Response('data: {"type":"succeeded"}\n\n', {
+      headers: { "Content-Type": "text/event-stream" },
+    })));
+  const ids = [];
+  await streamRequest("/first", {}, (_, id) => ids.push(id));
+  await streamRequest("/second", {}, (_, id) => ids.push(id));
+  expect(ids).toEqual(["123-0", "123-0", "", null]);
+});
+
 it("decodes fragmented UTF-8, CRLF frames, keepalives and multiline data without waiting for EOF", async () => {
   const cancel = vi.fn();
   const events = [{ type: "text_delta", message_id: "m", text: "中文😀" },
