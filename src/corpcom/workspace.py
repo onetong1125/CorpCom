@@ -44,6 +44,22 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_thread_model_message
 ON messages (thread_id, model_message_id);
+CREATE TABLE IF NOT EXISTS research_runs (
+    id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES threads(id),
+    user_message_id INTEGER UNIQUE REFERENCES messages(id),
+    status TEXT NOT NULL DEFAULT 'running' CHECK (
+        status IN ('running', 'succeeded', 'failed', 'interrupted')
+    ),
+    started_at TEXT NOT NULL DEFAULT (
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    ),
+    finished_at TEXT,
+    error TEXT,
+    sse_events TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_research_runs_thread
+ON research_runs (thread_id);
 CREATE TABLE IF NOT EXISTS tool_executions (
     id TEXT PRIMARY KEY,
     message_id INTEGER NOT NULL REFERENCES messages(id),
@@ -293,6 +309,16 @@ class WorkspaceStore:
           "INSERT INTO messages (thread_id, role, content) VALUES (?, 'user', ?)",
           (thread_id, content),
       )
+      # Save the question and its run association in one transaction.
+      self.db.execute(
+          """
+          UPDATE research_runs
+          SET user_message_id = ?
+          WHERE thread_id = ?
+            AND status = 'running'
+          """,
+          (cursor.lastrowid, thread_id),
+      )
       self._touch(workspace_id)
       message = _message_from_row(self.db.execute(
         "SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)
@@ -517,8 +543,11 @@ class WorkspaceStore:
 
   def start_thread_execution(
       self, workspace_id: str, thread_id: str,
+      *, run_id: str,
   ) -> Thread:
     """Claim execution and return the Thread snapshot from before the claim."""
+    if run_id is None:
+      raise ValueError("run_id must not be None")
     with self.db:
       # Read the old state under the same write lock as the admission update.
       self.db.execute("BEGIN IMMEDIATE")
@@ -543,6 +572,12 @@ class WorkspaceStore:
       if cursor.rowcount == 0:
         raise ThreadBusyError(f"Thread is already running: {thread_id}")
 
+      # Admission and run creation must commit or roll back together.
+      self.db.execute(
+          "INSERT INTO research_runs (id, thread_id) VALUES (?, ?)",
+          (run_id, thread_id),
+      )
+
       return previous
 
   def finish_thread_execution(
@@ -552,9 +587,15 @@ class WorkspaceStore:
       *,
       status: Literal["succeeded", "failed"],
       error: str | None = None,
+      sse_events: list[dict[str, JsonValue]] | None = None,
   ) -> Thread:
     self._thread(workspace_id, thread_id)
-
+    # serialize events
+    encoded_events = (
+        None
+        if sse_events is None
+        else json.dumps(sse_events, ensure_ascii=False, allow_nan=False)
+    )
     with self.db:
       self.db.execute(
           """
@@ -564,6 +605,17 @@ class WorkspaceStore:
           WHERE workspace_id = ? AND id = ?
           """,
           (status, error, workspace_id, thread_id),
+      )
+      self.db.execute(
+          """
+          UPDATE research_runs
+          SET status = ?,
+              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+              error = ?,
+              sse_events = ?
+          WHERE thread_id = ? AND status = 'running'
+          """,
+          (status, error, encoded_events, thread_id),
       )
 
       return self._thread(workspace_id, thread_id)
@@ -580,6 +632,15 @@ class WorkspaceStore:
           WHERE execution_status = 'running'
           """
       )
+      self.db.execute(
+          """
+          UPDATE research_runs
+          SET status = 'interrupted',
+              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+              error = '后端重启，上次执行已中断'
+          WHERE status = 'running'
+          """
+      )
       return cursor.rowcount
 
   def complete_thread_execution(
@@ -589,9 +650,17 @@ class WorkspaceStore:
       answer: str,
       *,
       model_message_id: str | None = None,
+      sse_events: list[dict[str, JsonValue]] | None = None,
   ) -> Message:
     self._thread(workspace_id, thread_id)
     _require_text(content=answer)
+
+    # serialize events
+    encoded_events = (
+      None
+      if sse_events is None
+      else json.dumps(sse_events, ensure_ascii=False, allow_nan=False)
+    )
     with self.db:
       cursor = self.db.execute(
           """
@@ -611,6 +680,17 @@ class WorkspaceStore:
           WHERE workspace_id = ? AND id = ?;
           """,
           (workspace_id, thread_id),
+      )
+      self.db.execute(
+          """
+          UPDATE research_runs
+          SET status = 'succeeded',
+              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+              error = NULL,
+              sse_events = ?
+          WHERE thread_id = ? AND status = 'running'
+          """,
+          (encoded_events, thread_id),
       )
 
       self._touch(workspace_id)

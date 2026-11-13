@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 from threading import Barrier
 import unittest
 import sqlite3
+from uuid import uuid4
 
 from corpcom.workspace import RecordNotFoundError, ThreadBusyError, WorkspaceStore
 from corpcom.workspace_models import WorkspaceResearchInfo
@@ -336,7 +337,9 @@ with WorkspaceStore(Path(sys.argv[1])) as store:
   def test_start_execution_returns_prior_state_and_serializes_competing_claims(self):
     workspace = self.create()
     thread = self.store.create_thread(workspace.id, "竞争恢复资格")
-    self.assertEqual(self.store.start_thread_execution(workspace.id, thread.id), thread)
+    self.assertEqual(
+        self.store.start_thread_execution(workspace.id, thread.id, run_id=uuid4().hex),
+        thread)
     self.store.interrupt_running_executions()
     previous = self.store.get_workspace_detail(workspace.id).threads[0]
     ready = Barrier(2)
@@ -345,7 +348,7 @@ with WorkspaceStore(Path(sys.argv[1])) as store:
       with WorkspaceStore(self.data) as store:
         ready.wait(timeout=5)
         try:
-          return store.start_thread_execution(workspace.id, thread.id)
+          return store.start_thread_execution(workspace.id, thread.id, run_id=uuid4().hex)
         except ThreadBusyError:
           return "busy"
 
@@ -362,7 +365,7 @@ with WorkspaceStore(Path(sys.argv[1])) as store:
     workspace = self.create()
     thread = self.store.create_thread(workspace.id, "事务回滚测试")
 
-    self.store.start_thread_execution(workspace.id, thread.id)
+    self.store.start_thread_execution(workspace.id, thread.id, run_id=uuid4().hex)
     self.store.add_message(
         workspace.id, thread.id, "user", "测试问题",
     )
@@ -409,6 +412,62 @@ with WorkspaceStore(Path(sys.argv[1])) as store:
             reopened.get_workspace(workspace.id),
             before_workspace,
         )
+
+  def test_start_execution_rejects_none_run_id_without_changes(self):
+    workspace = self.create()
+    thread = self.store.create_thread(workspace.id, "无效运行 ID")
+
+    with self.assertRaisesRegex(ValueError, "run_id must not be None"):
+      self.store.start_thread_execution(
+          workspace.id, thread.id, run_id=None,
+      )
+
+    self.assertEqual(
+        self.store.get_thread(workspace.id, thread.id).execution_status,
+        None,
+    )
+    self.assertFalse(self.store.db.in_transaction)
+    self.assertEqual(
+        self.store.db.execute(
+            "SELECT COUNT(*) FROM research_runs"
+        ).fetchone()[0],
+        0,
+    )
+
+  def test_each_run_keeps_its_own_user_message(self):
+    workspace = self.create()
+    thread = self.store.create_thread(workspace.id, "连续研究")
+
+    self.store.start_thread_execution(
+        workspace.id, thread.id, run_id="first",
+    )
+    first, _ = self.store.add_user_message(
+        workspace.id, thread.id, "第一轮问题",
+    )
+    self.store.complete_thread_execution(
+        workspace.id, thread.id, "第一轮回答",
+    )
+
+    self.store.start_thread_execution(
+        workspace.id, thread.id, run_id="second",
+    )
+    second, _ = self.store.add_user_message(
+        workspace.id, thread.id, "第二轮问题",
+    )
+
+    # Verify committed associations using a new connection.
+    with WorkspaceStore(self.data) as reopened:
+      rows = reopened.db.execute(
+          "SELECT id, user_message_id, status FROM research_runs"
+      ).fetchall()
+      self.assertEqual(
+          {row["id"]: (row["user_message_id"], row["status"])
+           for row in rows},
+          {
+              "first": (first.id, "succeeded"),
+              "second": (second.id, "running"),
+          },
+      )
 
 if __name__ == "__main__":
   unittest.main()

@@ -64,6 +64,17 @@ class Message(BaseModel):
     tool_calls: list[dict[str, JsonValue]] = Field(default_factory=list)
     created_at: Timestamp
 
+class ResearchRun(BaseModel):
+    """One research execution and its archived stream events."""
+
+    id: str
+    thread_id: str
+    user_message_id: int | None = None
+    status: Literal["running", "succeeded", "failed", "interrupted"]
+    started_at: Timestamp
+    finished_at: Timestamp | None = None
+    error: str | None = None
+    sse_events: list[dict[str, JsonValue]] | None = None
 
 class Artifact(BaseModel):
     """File metadata with a path relative to the data directory."""

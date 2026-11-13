@@ -7,7 +7,8 @@ from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Barrier
-from unittest.mock import patch
+from unittest.mock import patch, Mock
+from redis import Redis
 
 from langchain.agents.middleware.model_call_limit import \
   ModelCallLimitExceededError
@@ -18,6 +19,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import Field
 from langchain_core.tools import tool
+from langchain_core.outputs import ChatGeneration, ChatResult
 
 from corpcom.run_coordinator import RunCoordinator
 from corpcom.workspace import WorkspaceStore
@@ -80,7 +82,8 @@ class WorkspaceAgentTests(unittest.TestCase):
 
     checkpoint_path = str(self.data / "concurrent-checkpoints.sqlite")
     with SqliteSaver.from_conn_string(checkpoint_path) as checkpointer:
-      coordinator = RunCoordinator(checkpointer, max_concurrent_runs=2)
+      coordinator = RunCoordinator(
+          checkpointer, Mock(spec=Redis),max_concurrent_runs=2)
 
       def run(index):
         with WorkspaceStore(self.data) as store:
@@ -252,7 +255,8 @@ class WorkspaceAgentTests(unittest.TestCase):
       SqliteSaver.from_conn_string(checkpoint_path) as checkpointer
     ):
       self.assertEqual(
-          RunCoordinator(checkpointer, max_concurrent_runs=2).run(
+          RunCoordinator(checkpointer, Mock(spec=Redis), max_concurrent_runs=2)
+          .run(
               store, model, self.workspace.id, self.thread.id, first_question
           ).content,
           first_answer,
@@ -269,7 +273,8 @@ class WorkspaceAgentTests(unittest.TestCase):
           side_effect=AssertionError("第二轮不应从业务库重新加载历史"),
       ):
         self.assertEqual(
-            RunCoordinator(checkpointer, max_concurrent_runs=2).run(
+            RunCoordinator(checkpointer, Mock(spec=Redis), max_concurrent_runs=2)
+            .run(
                 store, model, self.workspace.id, self.thread.id,
                 second_question
             ).content,
@@ -334,7 +339,7 @@ class WorkspaceAgentTests(unittest.TestCase):
       WorkspaceStore(self.data) as store,
       SqliteSaver.from_conn_string(checkpoint_path) as checkpointer,
     ):
-      answer = RunCoordinator(checkpointer, max_concurrent_runs=2).run(
+      answer = RunCoordinator(checkpointer, Mock(spec=Redis), max_concurrent_runs=2).run(
           store, model, self.workspace.id, second.id,
           "继续昨天的研究"
       ).content
@@ -432,7 +437,8 @@ class WorkspaceAgentTests(unittest.TestCase):
               "args": arguments},]),
             AIMessage(content="当前 Workspace 中找不到指定资料。"),
           ])
-          answer = RunCoordinator(self.checkpointer, max_concurrent_runs=2).run(
+          answer = RunCoordinator(
+              self.checkpointer, Mock(spec=Redis), max_concurrent_runs=2).run(
               store, model, self.workspace.id, thread.id,"读取指定资料"
           ).content
           self.assertEqual(
@@ -450,7 +456,7 @@ class WorkspaceAgentTests(unittest.TestCase):
           self.assertEqual(error.status, "error")
           self.assertEqual(
               error.content,
-              f"thread not found in workspace: {private_thread.id}",
+              f"RecordNotFoundError: thread not found in workspace: {private_thread.id}",
           )
 
           # Neither context nor tool results may expose foreign material.
@@ -678,7 +684,7 @@ class WorkspaceAgentTests(unittest.TestCase):
       self.assertEqual(error.tool_call_id, "missing_read")
       self.assertEqual(error.name, "read_thread")
       self.assertEqual(error.status, "error")
-      self.assertEqual(error.content, "thread not found in workspace: missing")
+      self.assertEqual(error.content, "RecordNotFoundError: thread not found in workspace: missing")
       self.assertNotIn(str(self.data), error.content)
 
     # Reopen SQLite to verify persistence and continuation.
@@ -708,50 +714,70 @@ class WorkspaceAgentTests(unittest.TestCase):
           messages,
       )
 
-  def test_unexpected_tool_error_propagates(self):
+  def test_tool_error_is_checkpointed_and_model_can_continue(self):
     model = ScriptedModel(responses=[
-      AIMessage(content="", tool_calls=[
-        {
-          "id": "broken_read",
-          "name": "update_research",
-          "args": {"changes": {"goal": "更新目标"}},
-        },
-      ]),
+      AIMessage(content="", tool_calls=[{
+        "id": "broken_read",
+        "name": "update_research",
+        "args": {"changes": {"goal": "更新目标"}},
+      }]),
+      AIMessage(content="研究信息更新失败，暂时保留原目标。"),
     ])
+    checkpoint_path = str(self.data / "tool-error.sqlite")
+    config = {
+      "configurable": {
+        "thread_id": f"{self.workspace.id}:{self.thread.id}",
+      },
+    }
 
-    with WorkspaceStore(self.data) as store:
-      # Patch the class because tool workers create their own store instances.
-      with patch.object(
+    with (
+      WorkspaceStore(self.data) as store,
+      SqliteSaver.from_conn_string(checkpoint_path) as checkpointer,
+      patch.object(
           WorkspaceStore,
           "update_research",
           side_effect=RuntimeError("unexpected storage failure"),
-      ):
-        with self.assertRaisesRegex(
-            RuntimeError, "unexpected storage failure",
-        ):
-          ask_workspace(
-              store, model, self.workspace.id, self.thread.id,
-              "读取资料", self.checkpointer,
-          )
+      ),
+    ):
+      answer = RunCoordinator(
+          checkpointer, Mock(spec=Redis), max_concurrent_runs=1,
+      ).run(
+          store, model, self.workspace.id, self.thread.id, "更新目标",
+      )
+      self.assertEqual(
+          answer.content, "研究信息更新失败，暂时保留原目标。",
+      )
+      self.assertEqual(
+          store.get_thread(
+              self.workspace.id, self.thread.id,
+          ).execution_status,
+          "succeeded",
+      )
 
-      self.assertEqual(len(model.requests), 1)
-      messages = store.get_thread(
-          self.workspace.id, self.thread.id,
-      ).messages
-      self.assertEqual(
-          [item.role for item in messages],
-          ["user", "assistant"],
-      )
-      self.assertEqual(
-          messages[-1].tool_calls,
-          model.responses[0].tool_calls,
-      )
+    # The next model call receives the failed tool's result.
+    self.assertEqual(len(model.requests), 2)
+    received = [m for m in model.requests[1] if m.type == "tool"]
+    self.assertEqual(len(received), 1)
+    self.assertEqual(received[0].tool_call_id, "broken_read")
+    self.assertEqual(received[0].status, "error")
+    self.assertEqual(
+        received[0].content,
+        "RuntimeError: unexpected storage failure",
+    )
+
+    # Reopening the checkpoint proves the error survives this execution.
+    with SqliteSaver.from_conn_string(checkpoint_path) as reader:
+      messages = reader.get_tuple(config).checkpoint["channel_values"]["messages"]
+    self.assertEqual(
+        [m for m in messages if m.type == "tool"],
+        received,
+    )
 
   def test_streaming_success_events_and_saved_answer(self):
     events = []
     model = StreamingModel(responses=["你好"])
     coordinator = RunCoordinator(
-        self.checkpointer, max_concurrent_runs=1
+        self.checkpointer, Mock(spec=Redis), max_concurrent_runs=1
     )
     with WorkspaceStore(self.data) as store:
       message = coordinator.run(
@@ -794,7 +820,7 @@ class WorkspaceAgentTests(unittest.TestCase):
     )
     events = []
     coordinator = RunCoordinator(
-        self.checkpointer, max_concurrent_runs=1
+        self.checkpointer, Mock(spec=Redis), max_concurrent_runs=1
     )
     with WorkspaceStore(self.data) as store:
       with self.assertRaises(FakeListChatModelError):
@@ -849,7 +875,7 @@ class WorkspaceAgentTests(unittest.TestCase):
       AIMessage(id="answer-1", content="核对完成。"),
     ])
     coordinator = RunCoordinator(
-        self.checkpointer, max_concurrent_runs=1,
+        self.checkpointer, Mock(spec=Redis), max_concurrent_runs=1,
     )
 
     with (
@@ -889,7 +915,7 @@ class WorkspaceAgentTests(unittest.TestCase):
     )
     self.assertEqual(detail.messages[-1], answer)
 
-  def test_completed_plan_survives_tool_failure(self):
+  def test_completed_plan_survives_model_failure_after_tool_error(self):
     @tool
     def inspect_record() -> str:
       """Inspect a research record."""
@@ -907,7 +933,7 @@ class WorkspaceAgentTests(unittest.TestCase):
       ),
     ])
     coordinator = RunCoordinator(
-        self.checkpointer, max_concurrent_runs=1,
+        self.checkpointer, Mock(spec=Redis), max_concurrent_runs=1,
     )
 
     with (
@@ -916,8 +942,18 @@ class WorkspaceAgentTests(unittest.TestCase):
           "corpcom.workspace_agent.create_workspace_tools",
           return_value=[inspect_record],
       ),
+      patch.object(
+          ScriptedModel,
+          "_generate",
+          side_effect=[
+            ChatResult(generations=[
+              ChatGeneration(message=model.responses[0]),
+            ]),
+            RuntimeError("model unavailable"),
+          ],
+      ) as generate,
     ):
-      with self.assertRaisesRegex(RuntimeError, "record lookup failed"):
+      with self.assertRaisesRegex(RuntimeError, "model unavailable"):
         coordinator.run(
             store, model, self.workspace.id, self.thread.id, "开始",
         )
@@ -927,7 +963,7 @@ class WorkspaceAgentTests(unittest.TestCase):
       detail = reader.get_thread(self.workspace.id, self.thread.id)
 
     self.assertEqual(detail.execution_status, "failed")
-    self.assertEqual(detail.execution_error, "record lookup failed")
+    self.assertEqual(detail.execution_error, "model unavailable")
     self.assertEqual(
         [(m.role, m.content, m.model_message_id) for m in detail.messages],
         [
@@ -935,7 +971,25 @@ class WorkspaceAgentTests(unittest.TestCase):
           ("assistant", "先核对记录。", "plan-1"),
         ],
     )
-    self.assertEqual(len(model.requests), 1)
+    self.assertEqual(generate.call_count, 2)
+
+    config = {
+      "configurable": {
+        "thread_id": f"{self.workspace.id}:{self.thread.id}",
+      },
+    }
+    messages = self.checkpointer.get_tuple(config).checkpoint[
+      "channel_values"
+    ]["messages"]
+    results = [m for m in messages if m.type == "tool"]
+
+    self.assertEqual(len(results), 1)
+    self.assertEqual(results[0].tool_call_id, "call-1")
+    self.assertEqual(results[0].status, "error")
+    self.assertEqual(
+        results[0].content,
+        "RuntimeError: record lookup failed",
+    )
 
 if __name__ == "__main__":
   unittest.main()

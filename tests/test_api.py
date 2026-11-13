@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from threading import Event
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 import httpx
@@ -33,8 +34,16 @@ class ApiTests(unittest.TestCase):
     temporary = TemporaryDirectory()
     self.addCleanup(temporary.cleanup)
     self.root = Path(temporary.name)
-    with patch.dict(os.environ, {"CORPCOM_CORS_ORIGINS": "http://localhost:5173"}):
-      self.app = create_app(self.root / "data")
+    self.enterContext(patch.dict(os.environ, {
+      "CORPCOM_CORS_ORIGINS": "http://localhost:5173",
+      "CORPCOM_REDIS_URL": "redis://127.0.0.1:6380/0",
+    }))
+    redis_factory = self.enterContext(
+        patch("corpcom.api.Redis.from_url")
+    )
+    self.redis = redis_factory.return_value.__enter__.return_value
+    self.redis.xadd.return_value = "1-0"
+    self.app = create_app(self.root / "data")
     self.model = ApiTestModel(responses=[AIMessage(content="先核对现金流。")])
     self.app.dependency_overrides[get_model] = lambda: self.model
     self.client = self.enterContext(TestClient(self.app))
@@ -86,9 +95,16 @@ class ApiTests(unittest.TestCase):
     # A fresh app reads persisted records without retaining the first app's objects.
     with TestClient(create_app(self.root / "data")) as reopened:
       messages = reopened.get(second_url).json()["messages"]
-      self.assertEqual([m["role"] for m in messages], ["user", "assistant", "user", "assistant"])
-      self.assertEqual(messages[1], continued.json())
-      self.assertEqual(messages[3], followup.json())
+      self.assertEqual(
+          [m["role"] for m in messages],
+          ["user", "assistant", "assistant", "user", "assistant"],
+      )
+      self.assertEqual(
+          messages[1]["tool_calls"],
+          self.model.responses[0].tool_calls,
+      )
+      self.assertEqual(messages[2], continued.json())
+      self.assertEqual(messages[4], followup.json())
       self.assertEqual(reopened.get(self.url).json()["artifacts"], [artifact])
       self.assertEqual(reopened.get(self.url + f"/files/{artifact['id']}").json(), artifact)
       download = reopened.get(self.url + f"/files/{artifact['id']}/content")
@@ -476,7 +492,7 @@ class ApiTests(unittest.TestCase):
         store.add_message(
             workspace.id, thread.id, "user", "测试问题",
         )
-        store.start_thread_execution(workspace.id, thread.id)
+        store.start_thread_execution(workspace.id, thread.id, run_id=uuid4().hex)
 
       store.complete_thread_execution(
           workspace.id, succeeded.id, "已保存的回答",
@@ -587,7 +603,7 @@ class ApiTests(unittest.TestCase):
   def test_streaming_rejects_running_thread_before_sse(self):
     with WorkspaceStore(self.root / "data") as store:
       store.start_thread_execution(
-          self.workspace["id"], self.thread["id"],
+          self.workspace["id"], self.thread["id"], run_id=uuid4().hex
       )
 
     before = self.client.get(self.thread_url).json()

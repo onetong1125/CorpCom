@@ -1,12 +1,15 @@
+from uuid import uuid4
 from threading import BoundedSemaphore
 from collections.abc import Callable
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langchain_core.language_models import BaseChatModel
+from redis import Redis
 
 from corpcom.workspace import WorkspaceStore
 from corpcom.workspace_models import Message
 from corpcom.workspace_agent import ask_workspace
 from corpcom.workspace_recovery import recover_interrupted_checkpoint
+from corpcom.run_events import RunEventStream
 
 
 class ExecutionCapacityError(ValueError):
@@ -16,10 +19,12 @@ class ExecutionCapacityError(ValueError):
 class RunCoordinator:
   def __init__(self,
       checkpointer: BaseCheckpointSaver,
+      redis_client: Redis,
       *,
       max_concurrent_runs: int,
   ):
     self.checkpointer = checkpointer
+    self._redis = redis_client
     self._slots = BoundedSemaphore(max_concurrent_runs)
 
   def run(self,
@@ -35,15 +40,27 @@ class RunCoordinator:
       raise ExecutionCapacityError("Too many concurrent executions")
     try:
       # 准入
-      previous = store.start_thread_execution(workspace_id, thread_id)
+      run_id = uuid4().hex
+      previous = store.start_thread_execution(
+          workspace_id, thread_id, run_id=run_id,
+      )
 
       try:
-        if on_event is not None:
-          on_event({
-            "type": "started",
-            "workspace_id": workspace_id,
-            "thread_id": thread_id,
-          })
+        event_stream = RunEventStream(self._redis, run_id)
+
+        def emit_event(event: dict[str, object]) -> None:
+          """Persist each event before notifying the subscriber."""
+          event_stream.append(event)
+          if on_event is not None:
+            on_event(event)
+
+        started_event = {
+          "type": "started",
+          "workspace_id": workspace_id,
+          "thread_id": thread_id,
+          "run_id": run_id,
+        }
+        emit_event(started_event)
 
         # 恢复中断后的工具结果
         if previous.execution_status == "interrupted":
@@ -52,7 +69,7 @@ class RunCoordinator:
           )
         answer = ask_workspace(
             store, model, workspace_id, thread_id, question, self.checkpointer,
-            on_event=on_event
+            on_event=emit_event
         )
         message = store.complete_thread_execution(
             workspace_id, thread_id, answer.text, model_message_id=answer.id)

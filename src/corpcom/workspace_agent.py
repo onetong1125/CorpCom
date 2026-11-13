@@ -2,6 +2,7 @@
 
 import logging
 from collections.abc import Callable
+from redis.exceptions import RedisError
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware, wrap_tool_call
@@ -9,9 +10,9 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.errors import GraphBubbleUp
 
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore
-from corpcom.workspace_models import Message
 from corpcom.workspace_prompt import build_workspace_prompt
 from corpcom.workspace_tools import create_workspace_tools
 
@@ -19,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 
 class ToolLogHandler(BaseCallbackHandler):
+  # Propagate event persistence failures to the run coordinator.
+  raise_error = True
   def __init__(
       self,
       on_event: Callable[[dict[str, object]], None] | None = None,
@@ -63,12 +66,19 @@ class ToolLogHandler(BaseCallbackHandler):
 
 @wrap_tool_call
 def handle_workspace_tool_error(request, handler):
-  """Return expected lookup failures as tool results the model can act on."""
+  """Return tool failures as messages while preserving graph control flow."""
   try:
     return handler(request)
-  except RecordNotFoundError as exc:
+  except (GraphBubbleUp, RedisError):
+    raise
+  except Exception as exc:
+    logger.exception(
+        "工具执行失败 name=%s tool_call_id=%s",
+        request.tool_call["name"],
+        request.tool_call["id"],
+    )
     return ToolMessage(
-        content=str(exc),
+        content=f"{type(exc).__name__}: {exc}",
         tool_call_id=request.tool_call["id"],
         name=request.tool_call["name"],
         status="error",

@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from typing import Annotated
 from contextlib import asynccontextmanager
 from anyio import create_task_group
+from redis import Redis
 
 from dotenv import load_dotenv
 from collections.abc import AsyncIterator
@@ -74,12 +75,19 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         root.mkdir(parents=True, exist_ok=True)
         # Keep the checkpoint connection open for the application's lifetime.
-        with SqliteSaver.from_conn_string(
+        with (
+            Redis.from_url(
+                os.environ["CORPCOM_REDIS_URL"],
+                decode_responses=True,
+            ) as redis_client,
+            SqliteSaver.from_conn_string(
             str(root / "checkpoints.sqlite")
-        ) as checkpointer:
+        ) as checkpointer,
+        ):
+            app.state.redis = redis_client
             app.state.checkpointer = checkpointer
             app.state.coordinator = RunCoordinator(
-                checkpointer, max_concurrent_runs=2)
+                checkpointer, redis_client, max_concurrent_runs=2)
             with WorkspaceStore(root) as store:
                 store.interrupt_running_executions()
             async with create_task_group() as task_group:
