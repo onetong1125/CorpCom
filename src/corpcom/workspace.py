@@ -12,7 +12,7 @@ from pydantic import JsonValue
 from corpcom.workspace_models import (
   Artifact, ArtifactFile, Message, Thread, ThreadDetail,
   Workspace, WorkspaceDetail, WorkspaceResearchInfo, WorkspaceSummary,
-  ResearchRun
+  ResearchRun, ResearchRunSummary
 )
 
 # Threads and files belong to a workspace; messages belong through their thread.
@@ -48,6 +48,7 @@ ON messages (thread_id, model_message_id);
 CREATE TABLE IF NOT EXISTS research_runs (
     id TEXT PRIMARY KEY,
     thread_id TEXT NOT NULL REFERENCES threads(id),
+    run_index INTEGER NOT NULL CHECK (run_index >= 0),
     user_message_id INTEGER UNIQUE REFERENCES messages(id),
     status TEXT NOT NULL DEFAULT 'running' CHECK (
         status IN ('running', 'succeeded', 'failed', 'interrupted')
@@ -57,7 +58,8 @@ CREATE TABLE IF NOT EXISTS research_runs (
     ),
     finished_at TEXT,
     error TEXT,
-    sse_events TEXT
+    sse_events TEXT,
+    UNIQUE (thread_id, run_index)
 );
 CREATE INDEX IF NOT EXISTS ix_research_runs_thread
 ON research_runs (thread_id);
@@ -569,6 +571,29 @@ class WorkspaceStore:
 
     return ResearchRun.model_validate(data)
 
+  def list_research_runs(
+      self,
+      workspace_id: str,
+      thread_id: str,
+  ) -> list[ResearchRunSummary]:
+    """List this thread's runs in insertion order."""
+    self._thread(workspace_id, thread_id)
+    rows = self.db.execute(
+        """
+        SELECT id, thread_id, run_index, user_message_id, status,
+               started_at, finished_at, error
+        FROM research_runs
+        WHERE thread_id = ?
+        ORDER BY run_index
+        """,
+        (thread_id,),
+    ).fetchall()
+
+    return [
+        ResearchRunSummary.model_validate(dict(row))
+        for row in rows
+    ]
+
   def start_thread_execution(
       self, workspace_id: str, thread_id: str,
       *, run_id: str,
@@ -600,10 +625,15 @@ class WorkspaceStore:
       if cursor.rowcount == 0:
         raise ThreadBusyError(f"Thread is already running: {thread_id}")
 
-      # Admission and run creation must commit or roll back together.
+      # Allocate the thread-local index under the admission write lock.
       self.db.execute(
-          "INSERT INTO research_runs (id, thread_id) VALUES (?, ?)",
-          (run_id, thread_id),
+          """
+          INSERT INTO research_runs (id, thread_id, run_index)
+          SELECT ?, ?, COALESCE(MAX(run_index), -1) + 1
+          FROM research_runs
+          WHERE thread_id = ?
+          """,
+          (run_id, thread_id, thread_id),
       )
 
       return previous

@@ -50,6 +50,7 @@ beforeEach(() => {
     }
     const intercepted = readHandler(url);
     if (intercepted) return intercepted;
+    if (url.endsWith("/runs")) return response([]);
     if (url === "/api/workspaces") return response(spaces);
     const space = spaces.find((item) => url === `/api/workspaces/${item.id}`);
     if (space) return response({ ...space, threads: Object.values(threads)
@@ -88,6 +89,88 @@ async function selectWorkspace(id) {
   await wrapper.findAll(".workspace-item").find((item) => item.text().includes(`研究 ${id}`)).trigger("click");
   await flushPromises();
 }
+
+it("rebuilds completed and active runs after page load without posting a question", async () => {
+  const active = controlledStream();
+  const replayUrls = [];
+  const records = [
+    { id: "old-run", run_index: 0, user_message_id: 1, status: "succeeded" },
+    { id: "active-run", run_index: 1, user_message_id: 3, status: "running" },
+  ];
+  threads.a.messages = [message(1, "user", "旧问题"), message(2, "assistant", "旧答案", "old-answer"), message(3, "user", "新问题")];
+  threads.a.execution_status = "running";
+  readHandler = (url) => {
+    if (url.endsWith("/threads/a/runs")) return response(records);
+    if (url.includes("/runs/")) {
+      replayUrls.push(url);
+      if (url.includes("/old-run/")) return new Response([
+        { type: "started", workspace_id: "w1", thread_id: "a", run_id: "old-run" },
+        { type: "tool_start", tool_run_id: "old-tool", name: "old_lookup" },
+        { type: "tool_end", tool_run_id: "old-tool" },
+        { type: "text_delta", message_id: "old-answer", text: "旧答案" },
+        { type: "run_finished", run_id: "old-run", status: "succeeded", error: null },
+      ].map((event, index) => `id: 100-${index}\ndata: ${JSON.stringify(event)}\n\n`).join(""), {
+        headers: { "Content-Type": "text/event-stream" },
+      });
+      return active.response;
+    }
+  };
+  await openApp();
+  await flushPromises();
+  expect(replayUrls).toEqual([
+    "/api/workspaces/w1/threads/a/runs/old-run/events?after=0-0",
+    "/api/workspaces/w1/threads/a/runs/active-run/events?after=0-0",
+  ]);
+  active.emit({ type: "started", workspace_id: "w1", thread_id: "a", run_id: "active-run" }, "200-0");
+  active.emit({ type: "text_delta", message_id: "plan", text: "正在核对" }, "200-1");
+  active.emit({ type: "tool_start", tool_run_id: "current-tool", name: "new_lookup" }, "200-2");
+  await flushPromises();
+  expect(wrapper.text().match(/旧答案/g)).toHaveLength(1);
+  expect(wrapper.text()).toContain("正在核对");
+  expect(wrapper.text()).toContain("old_lookup");
+  expect(wrapper.get("textarea").element.disabled).toBe(true);
+  const text = wrapper.text();
+  expect(text.indexOf("old_lookup")).toBeLessThan(text.indexOf("旧答案"));
+  expect(text.indexOf("旧答案")).toBeLessThan(text.indexOf("新问题"));
+  await selectThread("b");
+  await selectThread("a");
+  expect(replayUrls).toHaveLength(2);
+  threads.a.messages.push(message(4, "assistant", "正在核对", "plan"), message(5, "assistant", "核对结束", "answer"));
+  threads.a.execution_status = "succeeded";
+  active.emit({ type: "tool_end", tool_run_id: "current-tool" }, "200-3");
+  active.emit({ type: "text_delta", message_id: "answer", text: "核对结束" }, "200-4");
+  active.emit({ type: "run_finished", run_id: "active-run", status: "succeeded", error: null });
+  await flushPromises();
+  expect(wrapper.text().match(/正在核对/g)).toHaveLength(1);
+  expect(wrapper.text().match(/核对结束/g)).toHaveLength(1);
+  expect(wrapper.get("textarea").element.disabled).toBe(false);
+  expect(writes).toHaveLength(0);
+});
+
+it("restores partial output and tool errors from an already failed run on reload", async () => {
+  threads.a.messages = [message(1, "user", "失败的问题")];
+  threads.a.execution_status = "failed";
+  threads.a.execution_error = "模型失败";
+  readHandler = (url) => {
+    if (url.endsWith("/threads/a/runs")) return response([{ id: "failed-run", run_index: 0, user_message_id: 1, status: "failed" }]);
+    if (url.includes("/runs/failed-run/events")) return new Response([
+      { type: "started", workspace_id: "w1", thread_id: "a", run_id: "failed-run" },
+      { type: "text_delta", message_id: "partial", text: "未完成的计划" },
+      { type: "tool_start", tool_run_id: "failed-tool", name: "lookup" },
+      { type: "tool_error", tool_run_id: "failed-tool", error: "文件不存在" },
+      { type: "run_finished", run_id: "failed-run", status: "failed", error: "模型失败" },
+    ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+      headers: { "Content-Type": "text/event-stream" },
+    });
+  };
+  await openApp();
+  await flushPromises();
+  expect(wrapper.text()).toContain("未完成的计划");
+  expect(wrapper.get(".tool-event").text()).toContain("文件不存在");
+  expect(wrapper.get('[role="alert"]').text()).toContain("模型失败");
+  expect(wrapper.get("textarea").element.disabled).toBe(false);
+  expect(writes).toHaveLength(0);
+});
 
 it("streams text and tool events into the original thread and replaces the final increment once", async () => {
   const stream = controlledStream();

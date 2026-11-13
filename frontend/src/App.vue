@@ -24,6 +24,7 @@ const workspace = ref(null);
 const thread = ref(null);
 const loading = ref(true);
 const runs = reactive({});
+const runHistory = reactive({});
 const drafts = reactive({});
 const uploads = reactive({});
 const saving = ref(false);
@@ -67,31 +68,34 @@ const conversationEntries = computed(() => {
     type: "message", key: `message:${message.id}`, message,
   }));
   if (pendingText.value) entries.push({ type: "pending", key: "pending" });
-  const run = currentRun.value;
-  if (!run) return entries;
+  const allRuns = [...(runHistory[thread.value?.id] || []), currentRun.value].filter(Boolean);
+  for (const run of allRuns) {
 
-  // Preserve event order around saved messages, including a final answer received
-  // before the preceding plan has been read back from storage.
-  const textIds = new Set(run.items.filter((item) => item.type === "text").map((item) => item.id));
-  const firstSaved = entries.findIndex((entry) => entry.type === "message" &&
-    textIds.has(entry.message.model_message_id));
-  let insertAt = firstSaved === -1 ? entries.length : firstSaved;
-  let progress = null;
-  for (const item of run.items) {
-    if (item.type === "text") {
-      const saved = entries.findIndex((entry) => entry.type === "message" &&
-        entry.message.model_message_id === item.id);
-      if (saved !== -1) {
-        insertAt = saved + 1;
-        progress = null;
-        continue;
+    // Preserve event order around saved messages, including a final answer received
+    // before the preceding plan has been read back from storage.
+    const textIds = new Set(run.items.filter((item) => item.type === "text").map((item) => item.id));
+    const firstSaved = entries.findIndex((entry) => entry.type === "message" &&
+      textIds.has(entry.message.model_message_id));
+    const question = entries.findIndex((entry) => entry.type === "message" &&
+      entry.message.id === run.userMessageId);
+    let insertAt = firstSaved !== -1 ? firstSaved : question !== -1 ? question + 1 : entries.length;
+    let progress = null;
+    for (const item of run.items) {
+      if (item.type === "text") {
+        const saved = entries.findIndex((entry) => entry.type === "message" &&
+          entry.message.model_message_id === item.id);
+        if (saved !== -1) {
+          insertAt = saved + 1;
+          progress = null;
+          continue;
+        }
       }
+      if (!progress) {
+        progress = { type: "progress", key: `progress:${item.type}:${item.id}`, items: [] };
+        entries.splice(insertAt++, 0, progress);
+      }
+      progress.items.push(item);
     }
-    if (!progress) {
-      progress = { type: "progress", key: `progress:${item.type}:${item.id}`, items: [] };
-      entries.splice(insertAt++, 0, progress);
-    }
-    progress.items.push(item);
   }
   return entries;
 });
@@ -153,6 +157,9 @@ function rememberSelection() {
 
 function reconcileRun(detail) {
   const run = runs[detail.id];
+  if (run && run.userMessageId == null) {
+    run.userMessageId = detail.messages.filter((message) => message.role === "user")[run.userMessageCount]?.id ?? null;
+  }
   if (!run || (!run.reconciling && run.status !== "disconnected")) return;
   run.reconciling = false;
   if (run.status === "disconnected" &&
@@ -178,11 +185,15 @@ async function loadSelection(id, threadId) {
     const selectedThread = selected
       ? await request(`/workspaces/${id}/threads/${selected.id}`)
       : null;
+    const records = selectedThread && !runs[selectedThread.id]
+      ? await request(`/workspaces/${id}/threads/${selectedThread.id}/runs`)
+      : null;
     if (version !== selectionVersion) return;
     workspace.value = detail;
     thread.value = selectedThread;
     if (selectedThread) reconcileRun(selectedThread);
     rememberSelection();
+    if (records?.length) restoreRunHistory(id, selectedThread, records);
   } catch (err) {
     if (version === selectionVersion) throw err;
   } finally {
@@ -285,10 +296,43 @@ async function refresh() {
   }
 }
 
+async function restoreRunHistory(workspaceId, detail, records) {
+  const restored = records.map((record) => {
+    const questionIndex = detail.messages.findIndex((message) => message.id === record.user_message_id);
+    const question = detail.messages[questionIndex];
+    return {
+      pending: true,
+      content: question?.content || "",
+      createdAt: record.started_at,
+      userMessageId: record.user_message_id,
+      userMessageCount: (questionIndex === -1 ? detail.messages : detail.messages.slice(0, questionIndex))
+        .filter((message) => message.role === "user").length,
+      error: "",
+      status: record.status,
+      runId: record.id,
+      lastEventId: null,
+      items: [],
+      answer: null,
+      reconciling: false,
+    };
+  });
+  runHistory[detail.id] = restored.slice(0, -1);
+  runs[detail.id] = restored.at(-1);
+  // Rebuild empty page state from the start; keep each run's cursor separate.
+  for (let index = 0; index < restored.length; index += 1) {
+    if (disposed) return;
+    const run = index === restored.length - 1 ? runs[detail.id] : runHistory[detail.id][index];
+    await followRun(workspaceId, detail.id, run, true);
+  }
+}
+
 async function sendMessage() {
   if (busy.value || sending.value || !draft.value.trim() || !thread.value) return;
   const workspaceId = workspace.value.id;
   const threadId = thread.value.id;
+  if (runs[threadId]) {
+    (runHistory[threadId] ||= []).push(runs[threadId]);
+  }
   runs[threadId] = {
     pending: true,
     content: draft.value.trim(),
@@ -303,7 +347,10 @@ async function sendMessage() {
     answer: null,
     reconciling: false,
   };
-  const run = runs[threadId];
+  await followRun(workspaceId, threadId, runs[threadId], false);
+}
+
+async function followRun(workspaceId, threadId, run, recovering) {
   const controller = new AbortController();
   connections.add(controller);
   const applyEvent = (event, eventId) => {
@@ -357,7 +404,7 @@ async function sendMessage() {
     if (eventId !== null) run.lastEventId = eventId;
   };
   try {
-    let resume = false;
+    let resume = recovering;
     while (true) {
       try {
         if (resume) {
@@ -384,7 +431,7 @@ async function sendMessage() {
     }
     if (run.status === "succeeded") {
       run.error = "";
-      drafts[threadId] = "";
+      if (!recovering) drafts[threadId] = "";
     }
   } catch (err) {
     if (disposed) return;
@@ -397,7 +444,7 @@ async function sendMessage() {
   }
   if (disposed) return;
   try {
-    await refreshResearch(workspaceId);
+    if (run === runs[threadId]) await refreshResearch(workspaceId);
   } catch (err) {
     run.error += `${run.error ? " " : ""}刷新记录失败：${err.message}`;
   } finally {

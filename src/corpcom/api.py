@@ -27,7 +27,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from corpcom.run_replay import replay_events
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore, ThreadBusyError
 from corpcom.workspace_models import (
-    Artifact, Message, Thread, ThreadDetail, Workspace, WorkspaceDetail, WorkspaceResearchInfo, WorkspaceSummary,
+    Artifact, Message, Thread, ThreadDetail, Workspace, WorkspaceDetail,
+    WorkspaceResearchInfo, WorkspaceSummary, ResearchRunSummary,
 )
 from corpcom.run_coordinator import RunCoordinator, ExecutionCapacityError
 from corpcom.workspace_stream import research_events
@@ -199,6 +200,18 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             payload = event.copy()
             event_id = payload.pop("event_id", None)
             yield ServerSentEvent(data=payload, id=event_id)
+
+    @app.get(
+        "/api/workspaces/{workspace_id}/threads/{thread_id}/runs"
+    )
+    def list_thread_runs(
+        workspace_id: str,
+        thread_id: str,
+    ) -> list[ResearchRunSummary]:
+        with WorkspaceStore(root) as store:
+            return store.list_research_runs(
+                workspace_id, thread_id,
+            )
 
     async def get_replay_events(
         workspace_id: str,

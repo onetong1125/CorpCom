@@ -469,5 +469,45 @@ with WorkspaceStore(Path(sys.argv[1])) as store:
           },
       )
 
+  def test_run_indexes_are_per_thread_and_rejected_claims_use_no_index(self):
+    workspace = self.create()
+    first = self.store.create_thread(workspace.id, "第一条 Thread")
+    second = self.store.create_thread(workspace.id, "第二条 Thread")
+
+    self.store.start_thread_execution(
+        workspace.id, first.id, run_id="first-0",
+    )
+    with self.assertRaises(ThreadBusyError):
+      self.store.start_thread_execution(
+          workspace.id, first.id, run_id="rejected",
+      )
+
+    self.store.finish_thread_execution(
+        workspace.id, first.id,
+        status="failed", error="测试失败",
+    )
+    self.store.start_thread_execution(
+        workspace.id, first.id, run_id="first-1",
+    )
+    self.store.start_thread_execution(
+        workspace.id, second.id, run_id="second-0",
+    )
+
+    with WorkspaceStore(self.data) as reopened:
+      first_runs = reopened.list_research_runs(workspace.id, first.id)
+      second_runs = reopened.list_research_runs(workspace.id, second.id)
+
+      self.assertEqual(
+          [(run.id, run.run_index, run.status) for run in first_runs],
+          [
+              ("first-0", 0, "failed"),
+              ("first-1", 1, "running"),
+          ],
+      )
+      self.assertEqual(
+          [(run.id, run.run_index) for run in second_runs],
+          [("second-0", 0)],
+      )
+
 if __name__ == "__main__":
   unittest.main()
