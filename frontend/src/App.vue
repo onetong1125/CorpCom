@@ -15,7 +15,7 @@ import {
   Layers,
   ChevronRight,
 } from "@lucide/vue";
-import { jsonRequest, request, streamRequest } from "./api";
+import { jsonRequest, request, streamRequest, replayRequest, StreamDisconnectedError } from "./api";
 import MarkdownContent from "./components/MarkdownContent.vue";
 import ArtifactPanel from "./components/ArtifactPanel.vue";
 
@@ -306,54 +306,86 @@ async function sendMessage() {
   const run = runs[threadId];
   const controller = new AbortController();
   connections.add(controller);
-  try {
-    const terminal = await streamRequest(
-      `/workspaces/${workspaceId}/threads/${threadId}/messages/stream`,
-      { content: run.content },
-      (event, eventId) => {
-        switch (event.type) {
-          case "started":
-            if (event.workspace_id !== workspaceId || event.thread_id !== threadId)
-              throw new Error("研究事件归属不匹配。");
-            run.status = "running";
-            run.runId = event.run_id;
-            break;
-          case "text_delta": {
-            let item = run.items.find((item) => item.type === "text" && item.id === event.message_id);
-            if (!item) {
-              run.items.push({ type: "text", id: event.message_id, text: "" });
-              item = run.items.at(-1);
-            }
-            item.text += event.text;
-            break;
-          }
-          case "tool_start":
-            run.items.push({ type: "tool", id: event.tool_run_id, name: event.name, status: "running" });
-            break;
-          case "tool_end":
-          case "tool_error": {
-            const item = run.items.find((item) => item.type === "tool" && item.id === event.tool_run_id);
-            item.status = event.type === "tool_end" ? "returned" : "error";
-            item.error = event.error;
-            break;
-          }
-          case "succeeded":
-            run.status = "succeeded";
-            run.answer = event.message;
-            break;
-          case "failed":
-            run.status = "failed";
-            run.error = `研究失败：${event.error || "后端执行失败"} 请核对消息记录后再决定是否重发。`;
-            break;
-          default:
-            throw new Error(`无法识别研究事件：${event.type}`);
+  const applyEvent = (event, eventId) => {
+    switch (event.type) {
+      case "started":
+        if (event.workspace_id !== workspaceId || event.thread_id !== threadId)
+          throw new Error("研究事件归属不匹配。");
+        run.status = "running";
+        run.runId = event.run_id;
+        break;
+      case "text_delta": {
+        let item = run.items.find((item) => item.type === "text" && item.id === event.message_id);
+        if (!item) {
+          run.items.push({ type: "text", id: event.message_id, text: "" });
+          item = run.items.at(-1);
         }
-        // Advance only after the event has been applied to this run.
-        if (eventId !== null) run.lastEventId = eventId;
-      },
-      controller.signal,
-    );
-    if (terminal.type === "succeeded") drafts[threadId] = "";
+        item.text += event.text;
+        break;
+      }
+      case "tool_start":
+        run.items.push({ type: "tool", id: event.tool_run_id, name: event.name, status: "running" });
+        break;
+      case "tool_end":
+      case "tool_error": {
+        const item = run.items.find((item) => item.type === "tool" && item.id === event.tool_run_id);
+        item.status = event.type === "tool_end" ? "returned" : "error";
+        item.error = event.error;
+        break;
+      }
+      case "succeeded":
+        run.status = "succeeded";
+        run.answer = event.message;
+        break;
+      case "failed":
+        run.status = "failed";
+        run.error = `研究失败：${event.error || "后端执行失败"} 请核对消息记录后再决定是否重发。`;
+        break;
+      case "run_finished":
+        if (event.run_id !== run.runId) throw new Error("研究事件归属不匹配。");
+        run.status = event.status;
+        run.error = event.status === "succeeded" ? "" : event.error;
+        break;
+      default:
+        throw new Error(`无法识别研究事件：${event.type}`);
+    }
+    if (run.status === "reconnecting") {
+      run.status = "running";
+      run.error = "";
+    }
+    // Advance only after the event has been applied to this run.
+    if (eventId !== null) run.lastEventId = eventId;
+  };
+  try {
+    let resume = false;
+    while (true) {
+      try {
+        if (resume) {
+          await replayRequest(
+            `/workspaces/${workspaceId}/threads/${threadId}/runs/${run.runId}/events`,
+            run.lastEventId || "0-0", applyEvent, controller.signal,
+          );
+        } else {
+          await streamRequest(
+            `/workspaces/${workspaceId}/threads/${threadId}/messages/stream`,
+            { content: run.content }, applyEvent, controller.signal,
+          );
+        }
+        break;
+      } catch (err) {
+        if (disposed || !(err instanceof StreamDisconnectedError) || !run.runId) throw err;
+        run.status = "reconnecting";
+        run.error = "连接已中断，正在恢复本轮研究输出。";
+        // Retry only the existing run's GET stream, never the question POST.
+        resume = true;
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        if (disposed) return;
+      }
+    }
+    if (run.status === "succeeded") {
+      run.error = "";
+      drafts[threadId] = "";
+    }
   } catch (err) {
     if (disposed) return;
     run.status = err.status ? "rejected" : "disconnected";

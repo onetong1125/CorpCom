@@ -6,7 +6,9 @@ export function controlledStream() {
   }), { headers: { "Content-Type": "text/event-stream" } });
   return {
     response,
-    emit(event) { controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`)); },
+    emit(event, id) {
+      controller.enqueue(encoder.encode(`${id === undefined ? "" : `id: ${id}\n`}data: ${JSON.stringify(event)}\n\n`));
+    },
     close() { controller.close(); },
     fail(error) { controller.error(error); },
   };

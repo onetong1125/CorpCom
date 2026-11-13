@@ -288,6 +288,72 @@ it("keeps partial output and tool errors after a streamed failure without saving
   expect(writes).toHaveLength(1);
 });
 
+it("resumes the same run over GET after repeated disconnects using the last applied cursor", async () => {
+  vi.useFakeTimers();
+  const initial = controlledStream();
+  const firstReplay = controlledStream();
+  const secondReplay = controlledStream();
+  const recoveredUrls = [];
+  writeHandler = () => initial.response;
+  readHandler = (url) => {
+    if (url.includes("/runs/run-a/events")) {
+      recoveredUrls.push(url);
+      return recoveredUrls.length === 1 ? firstReplay.response : secondReplay.response;
+    }
+  };
+  await openApp();
+  await send("问题 A");
+  initial.emit({ type: "started", workspace_id: "w1", thread_id: "a", run_id: "run-a" }, "100-0");
+  initial.emit({ type: "text_delta", message_id: "m", text: "第一段" }, "100-1");
+  initial.close();
+  await flushPromises();
+  await vi.advanceTimersByTimeAsync(1000);
+  await flushPromises();
+  expect(recoveredUrls).toEqual(["/api/workspaces/w1/threads/a/runs/run-a/events?after=100-1"]);
+  firstReplay.emit({ type: "text_delta", message_id: "m", text: "第二段" }, "100-2");
+  firstReplay.close();
+  await flushPromises();
+  await vi.advanceTimersByTimeAsync(1000);
+  await flushPromises();
+  expect(recoveredUrls[1]).toBe("/api/workspaces/w1/threads/a/runs/run-a/events?after=100-2");
+  secondReplay.emit({ type: "text_delta", message_id: "m", text: "第三段" }, "100-3");
+  await flushPromises();
+  expect(wrapper.text().match(/第一段第二段第三段/g)).toHaveLength(1);
+  threads.a.messages = [message(1, "user", "问题 A"), message(2, "assistant", "第一段第二段第三段", "m")];
+  threads.a.execution_status = "succeeded";
+  secondReplay.emit({ type: "run_finished", run_id: "run-a", status: "succeeded", error: null });
+  await flushPromises();
+  expect(wrapper.findAll(".message.assistant")).toHaveLength(1);
+  expect(wrapper.get(".message.assistant").text()).toContain("第一段第二段第三段");
+  expect(wrapper.get("textarea").element.value).toBe("");
+  expect(wrapper.find('[role="alert"]').exists()).toBe(false);
+  expect(writes).toHaveLength(1);
+});
+
+it.each(["failed", "interrupted"])("finishes replay with %s and preserves the question", async (status) => {
+  vi.useFakeTimers();
+  const initial = controlledStream();
+  const replay = controlledStream();
+  writeHandler = () => initial.response;
+  readHandler = (url) => url.includes("/runs/run-a/events") ? replay.response : undefined;
+  await openApp();
+  await send("问题 A");
+  initial.emit({ type: "started", workspace_id: "w1", thread_id: "a", run_id: "run-a" }, "100-0");
+  initial.close();
+  await flushPromises();
+  await vi.advanceTimersByTimeAsync(1000);
+  await flushPromises();
+  threads.a.execution_status = status;
+  threads.a.execution_error = "执行已结束";
+  threads.a.messages = [message(1, "user", "问题 A")];
+  replay.emit({ type: "run_finished", run_id: "run-a", status, error: "执行已结束" });
+  await flushPromises();
+  expect(wrapper.get('[role="alert"]').text()).toContain("执行已结束");
+  expect(wrapper.get("textarea").element.value).toBe("问题 A");
+  expect(wrapper.get("textarea").element.disabled).toBe(false);
+  expect(writes).toHaveLength(1);
+});
+
 it("recovers a disconnected stream through polling without resending", async () => {
   vi.useFakeTimers();
   const stream = controlledStream();
