@@ -2,6 +2,17 @@
 
 Workspace 通过 [后端 HTTP 接口](backend-api.md) 操作，创建研究、连续对话和文件上传下载的示例统一维护在接口文档中。SQLite 保存 Workspace 标识、标题、时间、会话、消息与文件索引，磁盘保存结构化研究信息和文件副本；每次存储方法写入成功即提交，服务退出后仍可读取。
 
+## 流式与历史恢复更新（2026-11-17）
+
+- `research_runs` 保存逐轮状态、Thread 内 `run_index`、关联的 `user_message_id` 和结束时的 `sse_events`；`threads` 仍表示最近一轮状态。
+- Redis Streams 保存实时过程事件，浏览器断开不取消后台执行。重连使用游标 GET，不重新提交问题。
+- 完整历史以 checkpoint 的助手消息和 ToolMessage 为主；读取时用 `add_messages` 合并消息通道 pending writes，仅做内存投影。SQLite 已归档事件补齐缺失尾部；归档为 `null` 时读取 Redis。空数组表示已归档，不能按未归档处理。
+- 普通工具异常转换为错误 ToolMessage；GraphBubbleUp 和 Redis 错误继续抛出。进程中断不意味着工具已失败或未执行，历史展示不会补造真实结果。
+- 无 Run 旧会话按 `business:{user_message_id}` 读取 checkpoint 分组，不创建运行记录。启动创建新表不等于迁移既有表结构或回填旧运行记录。
+- 69 项 Workspace／API 后端测试、58 项前端测试及构建通过；历史后端专项已用临时脚本验证，正式回归待补。真实旧会话的只读浏览器验收通过，未重新发起模型研究。
+
+接口与完整事件语义见 [流式执行、重连与历史](backend-api.md#流式执行重连与历史)。以下带日期的验收记录保留当时的测试范围。
+
 ## 数据位置与隔离
 
 ```text
@@ -15,7 +26,7 @@ data/
     .runs/<旧 execute_python 执行编号>/
 ```
 
-默认使用服务启动目录下的 `data/`，可通过 `CORPCOM_DATA_DIR` 指定已有数据目录。停止服务后，备份需要同时保留 corpcom.db、checkpoints.sqlite 和文件目录。Workspace 的 `execute_python` 使用 `workspaces/<workspace_id>/.runs/<执行编号>/`，将声明的产物复制到 `workspaces/<workspace_id>/tasks/<任务路径与版本>/` 并登记索引；独立 PTC 命令仍使用根目录 `runs/`。
+默认使用服务启动目录下的 `data/`，可通过 `CORPCOM_DATA_DIR` 指定已有数据目录。停止服务后，备份需要同时保留 corpcom.db、checkpoints.sqlite 和文件目录；若还需保留未归档的过程事件，应同时保留 Redis 数据卷。Redis 使用独立的 Compose `redis-data` 卷，不在上述 data 目录内。Workspace 的 `execute_python` 使用 `workspaces/<workspace_id>/.runs/<执行编号>/`，将声明的产物复制到 `workspaces/<workspace_id>/tasks/<任务路径与版本>/` 并登记索引；独立 PTC 命令仍使用根目录 `runs/`。
 
 `research.json` 是研究目标、初始假设、自由文本范围、观察周期和偏好的统一存储来源：
 
@@ -231,10 +242,10 @@ uv run python -m unittest discover -s tests -v
 
 模型收到目标、范围、观察周期、初始假设、偏好、当前会话消息，以及其他会话索引；每轮 context 不再注入完整文件索引。`create_workspace_tools(data_dir, workspace_id)` 返回绑定当前研究的工具，模型通过 `read_thread` 读取旧消息，通过 `execute_bash` 按路径发现和读取工作区文件。提示词说明上传或导入文件位于 `/workspace/files/<artifact_id>/<原文件名>`，任务产物（包括 Python 归档产物）位于 `/workspace/tasks/`；目录可能尚未创建，应先查看实际目录结构。`read_file(artifact_id)` 暂时注释并停止注册。Workspace ID 由程序绑定，不交给模型选择；Artifact 索引和前端文件查询、下载接口保留。`update_research(changes)` 将用户指定的字段保存到 `research.json`，返回更新后的全部研究信息，供本轮后续回答使用。工具在线程中运行，每次存储操作在执行线程内建立并关闭独立 SQLite 连接。
 
-每次提问最多调用模型 100 次，超限明确报错。工具参数不符合 schema 时，框架将校验错误反馈给模型；工具执行中的 `RecordNotFoundError` 由中间件转换为匹配调用 ID、`status="error"` 的 ToolMessage，模型可以据此修正调用或解释失败。后续模型调用仍计入本轮上限。其他未处理异常向调用方抛出；调用中断时保留已写入的用户提问，不保存成功回答。协调器只为旧状态为 interrupted 的 Thread 修复 checkpoint 末尾缺失的工具结果；普通工具异常保持失败，不自动修补或重放。
+每次提问最多调用模型 100 次，超限明确报错。工具参数不符合 schema 时，框架将校验错误反馈给模型；工具执行中的普通 `Exception` 由中间件记录并转换为匹配调用 ID、`status="error"` 的 ToolMessage，模型可以据此修正调用或解释失败。框架控制流异常 `GraphBubbleUp` 和 Redis 错误继续抛出。后续模型调用仍计入本轮上限。其他未处理异常向调用方抛出；调用中断时保留已写入的用户提问，不保存成功回答。协调器只为旧状态为 interrupted 的 Thread 修复 checkpoint 末尾缺失的工具结果；普通工具异常通过错误 ToolMessage 交给模型，不自动重放工具。
 
 当前 thread 尚无 checkpoint 时，从业务库导入已有问答，包括已经保存的本轮用户消息；之后每轮仅输入新用户消息，由 checkpoint 恢复此前的 Agent 消息。研究状态及其他会话索引仍在每轮刷新；文件通过工具按需发现，历史消息中的文件引用和工具结果仍随 checkpoint 恢复。
 
-业务库与 checkpoint 数据库之间没有原子事务。当前支持已完成轮次的历史恢复，不保证进程中途退出后的自动恢复，也未实现请求去重或最终回答的跨库幂等同步。
+业务库与 checkpoint 数据库之间没有原子事务。历史读取可恢复 checkpoint 和已归档／Redis 保留的过程内容；这不等于中途退出后自动续跑，也未实现请求去重或最终回答的跨库幂等同步。
 
 Agent 工具已包含 `execute_python` 与按需查询数据函数契约的 `read_function_doc`，可使用已接入的数据函数取数并保存研究产物。工作区文件通过 Bash 按需读取，未对长文件自动摘要。下一步的 Jinja2 模板、YAML 配置、运行时注入、上下文预算及研究记忆尚待实现，具体范围见 [当前路线](roadmap.md)。

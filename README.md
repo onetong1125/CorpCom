@@ -2,18 +2,20 @@
 
 围绕投资假设持续积累研究的 Python Agent 项目：一个研究目标对应一个 Workspace，保存会话、偏好、证据和报告，并支持后续更新。
 
-截至 2026-10-27，已实现 Workspace、多会话与文件持久化、模型对话、Docker PTC，以及研究报告/数据/代码产物归档。Vue 3 前端已完成（用户确认），使用方式见 [前端说明](frontend/README.md)。当前消息接口仍只返回最终答复。
+截至 2026-11-17，已实现 Workspace、多会话与文件持久化、Docker 工具执行、研究产物登记、Thread 并发、流式响应和历史恢复。前端支持 Redis 游标重连，并从 checkpoint 与事件归档恢复工具结果；没有 Run 记录的旧会话也可读取 checkpoint 历史。使用方式见 [前端说明](frontend/README.md)。
 
-下一阶段按“执行协调器与并发控制 → 流式响应 → 提示词与上下文管理 → 最小记忆 → 全流程验收”推进，Multi-agent 排到 11 月。月底交付范围、每日 5 小时的排期、验收标准与待定事项统一维护在 [开发路线与进度](docs/roadmap.md)。首个研究案例与产品设计见 [持续研究设计](docs/research-workspace.md)；经营数据接口实测与复跑方式见 [验证记录](docs/financial-data-validation.md)。
+下一步先补齐历史读取的后端正式回归测试，再按“提示词与上下文管理 → 最小记忆 → 全流程验收 → Multi-agent”推进。原计划窗口、验收标准与待定事项统一维护在 [开发路线与进度](docs/roadmap.md)。首个研究案例与产品设计见 [持续研究设计](docs/research-workspace.md)；经营数据接口实测与复跑方式见 [验证记录](docs/financial-data-validation.md)。
 
 ## 启动后端
 
 ```bash
 uv sync
+# 按 .env.example 配置本机 .env，包括 CORPCOM_REDIS_URL
+docker compose up -d redis
 uv run uvicorn corpcom.api:create_app --factory --host 127.0.0.1 --port 8001
 ```
 
-打开 [接口调试页面](http://127.0.0.1:8001/docs) 创建 Workspace、会话并发送消息。后端沿用本机 `.env` 模型配置和 `data/` 存储，前端只需调用 HTTP 接口。完整接口、错误响应和前端示例见 [后端接口文档](docs/backend-api.md)。
+打开 [接口调试页面](http://127.0.0.1:8001/docs) 创建 Workspace、会话并发送消息。后端沿用本机 `.env` 模型配置和 `data/` 存储，前端只需调用 HTTP 接口。开发时可在启动命令后加 `--reload`；未启用时，修改 Python 代码需要重启后端。完整接口、错误响应和前端示例见 [后端接口文档](docs/backend-api.md)。
 
 ## Workspace 本地验收
 
