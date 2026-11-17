@@ -51,6 +51,7 @@ beforeEach(() => {
     const intercepted = readHandler(url);
     if (intercepted) return intercepted;
     if (url.endsWith("/runs")) return response([]);
+    if (/\/threads\/[^/]+\/history$/.test(url)) return response({ thread_id: url.split("/").at(-2), turns: [] });
     if (url === "/api/workspaces") return response(spaces);
     const space = spaces.find((item) => url === `/api/workspaces/${item.id}`);
     if (space) return response({ ...space, threads: Object.values(threads)
@@ -90,6 +91,54 @@ async function selectWorkspace(id) {
   await flushPromises();
 }
 
+it.each([false, true])("restores legacy tools without run rows, with a newer run: %s", async (hasNewRun) => {
+  threads.a.messages = [message(1, "user", "旧问题"), message(2, "assistant", "旧答案", null)];
+  if (hasNewRun) threads.a.messages.push(message(3, "user", "新问题"), message(4, "assistant", "新答案", "new-answer"));
+  threads.a.execution_status = "succeeded";
+  readHandler = (url) => {
+    if (url.endsWith("/threads/a/runs")) return response(hasNewRun ? [{ id: "new", user_message_id: 3, status: "succeeded" }] : []);
+    if (url.endsWith("/threads/a/history")) return response({ thread_id: "a", turns: [
+      { user_message_id: 1, events: [
+        { type: "assistant_message", message_id: "old-plan", text: "先查旧资料", tool_calls: [{ id: "old-call", name: "legacy_lookup", args: { query: "旧资料" } }] },
+        { type: "tool_result", tool_call_id: "old-call", content: "旧工具结果", status: "error" },
+        { type: "assistant_message", message_id: "old-answer", text: "旧答案", tool_calls: [] },
+      ] },
+      { user_message_id: 3, events: [{ type: "assistant_message", message_id: "new-answer", text: "新答案", tool_calls: [] }] },
+    ] });
+    if (url.endsWith("/runs/new/history")) return response({ run: { id: "new", thread_id: "a", status: "succeeded" }, events: [
+      { type: "assistant_message", message_id: "new-answer", text: "新答案", tool_calls: [] },
+    ] });
+  };
+  await openApp();
+  expect(wrapper.findAll(".tool-event")).toHaveLength(1);
+  expect(wrapper.get(".tool-event").text()).toContain("旧工具结果");
+  expect(wrapper.get(".tool-event").text()).toContain("执行异常");
+  expect(wrapper.findAll(".research-progress").some((item) => item.text().includes("legacy_lookup"))).toBe(true);
+  expect(wrapper.text().match(/旧答案/g)).toHaveLength(1);
+  expect(wrapper.text().indexOf("legacy_lookup")).toBeLessThan(wrapper.text().indexOf("旧答案"));
+  if (hasNewRun) expect(wrapper.text().match(/新答案/g)).toHaveLength(1);
+  expect(writes).toHaveLength(0);
+  await selectThread("b");
+  await selectThread("a");
+  expect(wrapper.findAll(".tool-event")).toHaveLength(1);
+});
+
+it("loads legacy tool history when switching to an unvisited thread", async () => {
+  threads.b.messages = [message(10, "user", "旧问题 B")];
+  readHandler = (url) => {
+    if (url.endsWith("/threads/b/history")) return response({ thread_id: "b", turns: [
+      { user_message_id: 10, events: [
+        { type: "assistant_message", message_id: "b-plan", text: "", tool_calls: [{ id: "b-call", name: "lookup_b", args: {} }] },
+        { type: "tool_result", tool_call_id: "b-call", status: "success", content: "B 的历史结果" },
+      ] },
+    ] });
+  };
+  await openApp();
+  await selectThread("b");
+  expect(wrapper.get(".tool-event").text()).toContain("B 的历史结果");
+  expect(writes).toHaveLength(0);
+});
+
 it("rebuilds completed and active runs after page load without posting a question", async () => {
   const active = controlledStream();
   const replayUrls = [];
@@ -103,14 +152,13 @@ it("rebuilds completed and active runs after page load without posting a questio
     if (url.endsWith("/threads/a/runs")) return response(records);
     if (url.includes("/runs/")) {
       replayUrls.push(url);
-      if (url.includes("/old-run/")) return new Response([
-        { type: "started", workspace_id: "w1", thread_id: "a", run_id: "old-run" },
-        { type: "tool_start", tool_run_id: "old-tool", name: "old_lookup" },
-        { type: "tool_end", tool_run_id: "old-tool" },
-        { type: "text_delta", message_id: "old-answer", text: "旧答案" },
-        { type: "run_finished", run_id: "old-run", status: "succeeded", error: null },
-      ].map((event, index) => `id: 100-${index}\ndata: ${JSON.stringify(event)}\n\n`).join(""), {
-        headers: { "Content-Type": "text/event-stream" },
+      if (url.endsWith("/old-run/history")) return response({
+        run: { id: "old-run", thread_id: "a", status: "succeeded", error: null },
+        events: [
+          { type: "assistant_message", message_id: "old-plan", text: "", tool_calls: [{ id: "old-tool", name: "old_lookup", args: { query: "旧资料" } }] },
+          { type: "tool_result", tool_call_id: "old-tool", content: [{ type: "text", text: "旧工具结果" }], status: "success" },
+          { type: "assistant_message", message_id: "old-answer", text: "旧答案", tool_calls: [] },
+        ],
       });
       return active.response;
     }
@@ -118,7 +166,7 @@ it("rebuilds completed and active runs after page load without posting a questio
   await openApp();
   await flushPromises();
   expect(replayUrls).toEqual([
-    "/api/workspaces/w1/threads/a/runs/old-run/events?after=0-0",
+    "/api/workspaces/w1/threads/a/runs/old-run/history",
     "/api/workspaces/w1/threads/a/runs/active-run/events?after=0-0",
   ]);
   active.emit({ type: "started", workspace_id: "w1", thread_id: "a", run_id: "active-run" }, "200-0");
@@ -128,6 +176,10 @@ it("rebuilds completed and active runs after page load without posting a questio
   expect(wrapper.text().match(/旧答案/g)).toHaveLength(1);
   expect(wrapper.text()).toContain("正在核对");
   expect(wrapper.text()).toContain("old_lookup");
+  expect(wrapper.text()).toContain("旧资料");
+  expect(wrapper.text()).toContain("旧工具结果");
+  expect(wrapper.findAll(".tool-event").filter((item) => item.text().includes("old_lookup"))).toHaveLength(1);
+  expect(wrapper.findAll(".research-progress")[0].element.open).toBe(false);
   expect(wrapper.get("textarea").element.disabled).toBe(true);
   const text = wrapper.text();
   expect(text.indexOf("old_lookup")).toBeLessThan(text.indexOf("旧答案"));
@@ -153,14 +205,13 @@ it("restores partial output and tool errors from an already failed run on reload
   threads.a.execution_error = "模型失败";
   readHandler = (url) => {
     if (url.endsWith("/threads/a/runs")) return response([{ id: "failed-run", run_index: 0, user_message_id: 1, status: "failed" }]);
-    if (url.includes("/runs/failed-run/events")) return new Response([
-      { type: "started", workspace_id: "w1", thread_id: "a", run_id: "failed-run" },
-      { type: "text_delta", message_id: "partial", text: "未完成的计划" },
-      { type: "tool_start", tool_run_id: "failed-tool", name: "lookup" },
-      { type: "tool_error", tool_run_id: "failed-tool", error: "文件不存在" },
-      { type: "run_finished", run_id: "failed-run", status: "failed", error: "模型失败" },
-    ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
-      headers: { "Content-Type": "text/event-stream" },
+    if (url.endsWith("/runs/failed-run/history")) return response({
+      run: { id: "failed-run", thread_id: "a", status: "failed", error: "模型失败" },
+      events: [
+        { type: "assistant_message", message_id: "partial", text: "未完成的计划", tool_calls: [] },
+        { type: "tool_start", tool_run_id: "failed-tool", tool_call_id: "failed-call", name: "lookup" },
+        { type: "tool_error", tool_run_id: "failed-tool", tool_call_id: "failed-call", error: "文件不存在" },
+      ],
     });
   };
   await openApp();
@@ -170,6 +221,60 @@ it("restores partial output and tool errors from an already failed run on reload
   expect(wrapper.get('[role="alert"]').text()).toContain("模型失败");
   expect(wrapper.get("textarea").element.disabled).toBe(false);
   expect(writes).toHaveLength(0);
+});
+
+it("merges checkpoint tool errors and archived results into their declared cards", async () => {
+  threads.a.messages = [message(1, "user", "并行查询")];
+  threads.a.execution_status = "interrupted";
+  readHandler = (url) => {
+    if (url.endsWith("/threads/a/runs")) return response([{ id: "partial-run", user_message_id: 1, status: "interrupted" }]);
+    if (url.endsWith("/partial-run/history")) return response({
+      run: { id: "partial-run", thread_id: "a", status: "interrupted", error: "后端重启" },
+      events: [
+        { type: "assistant_message", message_id: "plan", text: "并行检索", tool_calls: [
+          { id: "a", name: "lookup_a", args: { query: "A" } },
+          { id: "b", name: "lookup_b", args: {} },
+          { id: "c", name: "lookup_c", args: {} },
+        ] },
+        { type: "tool_result", tool_call_id: "a", status: "error", content: "checkpoint 工具失败" },
+        { type: "tool_end", tool_run_id: "callback-b", tool_call_id: "b", status: "success", content: "归档工具结果" },
+        { type: "assistant_message", message_id: "tail", text: "尚未完成", tool_calls: [] },
+      ],
+    });
+  };
+  await openApp();
+  const cards = wrapper.findAll(".tool-event");
+  expect(cards).toHaveLength(3);
+  expect(cards[0].text()).toContain("执行异常");
+  expect(cards[0].text()).toContain("checkpoint 工具失败");
+  expect(cards[1].text()).toContain("已返回");
+  expect(cards[1].text()).toContain("归档工具结果");
+  expect(cards[2].text()).toContain("结果未收到");
+  expect(wrapper.text().match(/尚未完成/g)).toHaveLength(1);
+  expect(wrapper.get('[role="alert"]').text()).toContain("后端重启");
+  expect(writes).toHaveLength(0);
+  expect(fetch.mock.calls.some(([url]) => url.includes("/events"))).toBe(false);
+});
+
+it("shows an older history read failure without hiding the latest history", async () => {
+  threads.a.messages = [message(1, "user", "旧问题"), message(2, "user", "新问题")];
+  threads.a.execution_status = "succeeded";
+  readHandler = (url) => {
+    if (url.endsWith("/threads/a/runs")) return response([
+      { id: "old", user_message_id: 1, status: "failed" },
+      { id: "new", user_message_id: 2, status: "succeeded" },
+    ]);
+    if (url.endsWith("/old/history")) return response({ detail: "历史不存在" }, 404);
+    if (url.endsWith("/new/history")) return response({
+      run: { id: "new", thread_id: "a", status: "succeeded", error: null },
+      events: [{ type: "assistant_message", message_id: "answer", text: "新回答", tool_calls: [] }],
+    });
+  };
+  await openApp();
+  expect(wrapper.get('[role="alert"]').text()).toContain("历史不存在");
+  expect(wrapper.text()).toContain("新回答");
+  expect(writes).toHaveLength(0);
+  expect(fetch.mock.calls.some(([url]) => url.includes("/events"))).toBe(false);
 });
 
 it("streams text and tool events into the original thread and replaces the final increment once", async () => {

@@ -475,6 +475,8 @@ small {
 .tool-event > span:nth-child(2) { color: #537048; }
 .tool-event.error > span:nth-child(2), .tool-event p { color: #a33d34; }
 .tool-event p { width: 100%; margin: 0; white-space: pre-wrap; }
+.tool-detail { width: 100%; }
+.tool-detail pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; }
 .researching {
   display: flex;
   gap: 12px;

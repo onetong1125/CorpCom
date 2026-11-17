@@ -39,6 +39,7 @@ class ToolLogHandler(BaseCallbackHandler):
       self.on_event({
         "type": "tool_start",
         "tool_run_id": str(run_id),
+        "tool_call_id": kwargs["tool_call_id"],
         "name": serialized["name"],
       })
 
@@ -53,6 +54,9 @@ class ToolLogHandler(BaseCallbackHandler):
       self.on_event({
         "type": "tool_end",
         "tool_run_id": str(run_id),
+        "tool_call_id": output.tool_call_id,
+        "content": output.content,
+        "status": output.status,
       })
 
   def on_tool_error(self, error, *, run_id, **kwargs):

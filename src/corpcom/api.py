@@ -25,6 +25,7 @@ from openai import APIError
 from pydantic import BaseModel, ConfigDict, Field
 
 from corpcom.run_replay import replay_events
+from corpcom.run_history import read_run_history, read_thread_history
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore, ThreadBusyError
 from corpcom.workspace_models import (
     Artifact, Message, Thread, ThreadDetail, Workspace, WorkspaceDetail,
@@ -163,6 +164,20 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         with WorkspaceStore(root) as store:
             return store.get_thread(workspace_id, thread_id)
 
+    @app.get(
+        "/api/workspaces/{workspace_id}/threads/{thread_id}/history"
+    )
+    def get_thread_history(
+        workspace_id: str,
+        thread_id: str,
+    ) -> dict[str, object]:
+        return read_thread_history(
+            root,
+            app.state.checkpointer,
+            workspace_id,
+            thread_id,
+        )
+
     async def get_research_events(
         workspace_id: str, thread_id: str, body: MessageCreate,
         model: Annotated[BaseChatModel, Depends(get_model)]
@@ -212,6 +227,24 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             return store.list_research_runs(
                 workspace_id, thread_id,
             )
+
+    @app.get(
+        "/api/workspaces/{workspace_id}/threads/{thread_id}"
+        "/runs/{run_id}/history"
+    )
+    def get_run_history(
+        workspace_id: str,
+        thread_id: str,
+        run_id: str,
+    ) -> dict[str, object]:
+        return read_run_history(
+            root,
+            app.state.checkpointer,
+            app.state.redis,
+            workspace_id,
+            thread_id,
+            run_id,
+        )
 
     async def get_replay_events(
         workspace_id: str,

@@ -25,6 +25,7 @@ const thread = ref(null);
 const loading = ref(true);
 const runs = reactive({});
 const runHistory = reactive({});
+const legacyHistory = reactive({});
 const drafts = reactive({});
 const uploads = reactive({});
 const saving = ref(false);
@@ -68,7 +69,7 @@ const conversationEntries = computed(() => {
     type: "message", key: `message:${message.id}`, message,
   }));
   if (pendingText.value) entries.push({ type: "pending", key: "pending" });
-  const allRuns = [...(runHistory[thread.value?.id] || []), currentRun.value].filter(Boolean);
+  const allRuns = [...(legacyHistory[thread.value?.id] || []), ...(runHistory[thread.value?.id] || []), currentRun.value].filter(Boolean);
   for (const run of allRuns) {
 
     // Preserve event order around saved messages, including a final answer received
@@ -83,7 +84,7 @@ const conversationEntries = computed(() => {
     for (const item of run.items) {
       if (item.type === "text") {
         const saved = entries.findIndex((entry) => entry.type === "message" &&
-          entry.message.model_message_id === item.id);
+          (entry.message.model_message_id === item.id || entry.message.id === item.savedMessageId));
         if (saved !== -1) {
           insertAt = saved + 1;
           progress = null;
@@ -91,10 +92,13 @@ const conversationEntries = computed(() => {
         }
       }
       if (!progress) {
-        progress = { type: "progress", key: `progress:${item.type}:${item.id}`, items: [] };
+        progress = { type: "progress", key: `progress:${run.runId ?? run.userMessageId}:${item.type}:${item.id}`, items: [], run };
         entries.splice(insertAt++, 0, progress);
       }
       progress.items.push(item);
+    }
+    if (run.error && run !== currentRun.value) {
+      entries.splice(insertAt, 0, { type: "run_error", key: `run-error:${run.runId}`, error: run.error });
     }
   }
   return entries;
@@ -188,7 +192,38 @@ async function loadSelection(id, threadId) {
     const records = selectedThread && !runs[selectedThread.id]
       ? await request(`/workspaces/${id}/threads/${selectedThread.id}/runs`)
       : null;
+    const recordedQuestions = new Set(records?.map((record) => record.user_message_id));
+    const missingQuestions = records !== null && selectedThread.messages.some((message) =>
+      message.role === "user" && !recordedQuestions.has(message.id));
+    const history = missingQuestions && !legacyHistory[selectedThread.id]
+      ? await request(`/workspaces/${id}/threads/${selectedThread.id}/history`)
+      : null;
     if (version !== selectionVersion) return;
+    if (history) {
+      if (history.thread_id !== selectedThread.id) throw new Error("研究历史归属不匹配。");
+      legacyHistory[selectedThread.id] = history.turns
+        .filter((turn) => !recordedQuestions.has(turn.user_message_id))
+        .map((turn) => {
+          const start = selectedThread.messages.findIndex((message) => message.id === turn.user_message_id);
+          const following = selectedThread.messages.slice(start + 1);
+          const nextQuestion = following.findIndex((message) => message.role === "user");
+          const savedAnswers = (nextQuestion === -1 ? following : following.slice(0, nextQuestion))
+            .filter((message) => message.role === "assistant");
+          const usedAnswers = new Set();
+          const state = { userMessageId: turn.user_message_id, legacy: true, status: "historical", pending: false, items: [] };
+          for (const event of turn.events) applyRunEvent(id, selectedThread.id, state, event);
+          // Early saved answers have no model ID; match exact text only within this question.
+          for (const item of state.items.filter((item) => item.type === "text")) {
+            const saved = savedAnswers.find((message) => !usedAnswers.has(message.id) &&
+              (message.model_message_id === item.id || (!message.model_message_id && message.content === item.text)));
+            if (saved) {
+              item.savedMessageId = saved.id;
+              usedAnswers.add(saved.id);
+            }
+          }
+          return state;
+        });
+    }
     workspace.value = detail;
     thread.value = selectedThread;
     if (selectedThread) reconcileRun(selectedThread);
@@ -236,23 +271,7 @@ async function selectWorkspace(id, threadId) {
 }
 
 async function selectThread(id) {
-  const version = ++selectionVersion;
-  const workspaceId = workspace.value.id;
-  loading.value = true;
-  error.value = "";
-  sidebarOpen.value = false;
-  thread.value = null;
-  try {
-    const selected = await request(`/workspaces/${workspaceId}/threads/${id}`);
-    if (version !== selectionVersion) return;
-    thread.value = selected;
-    reconcileRun(selected);
-    rememberSelection();
-  } catch (err) {
-    if (version === selectionVersion) error.value = err.message;
-  } finally {
-    if (version === selectionVersion) loading.value = false;
-  }
+  await selectWorkspace(workspace.value.id, id);
 }
 
 async function refreshResearch(workspaceId = workspace.value.id) {
@@ -322,7 +341,29 @@ async function restoreRunHistory(workspaceId, detail, records) {
   for (let index = 0; index < restored.length; index += 1) {
     if (disposed) return;
     const run = index === restored.length - 1 ? runs[detail.id] : runHistory[detail.id][index];
-    await followRun(workspaceId, detail.id, run, true);
+    if (run.status === "running") {
+      await followRun(workspaceId, detail.id, run, true);
+    } else {
+      const controller = new AbortController();
+      connections.add(controller);
+      try {
+        const history = await request(
+          `/workspaces/${workspaceId}/threads/${detail.id}/runs/${run.runId}/history`,
+          { signal: controller.signal },
+        );
+        if (history.run.id !== run.runId || history.run.thread_id !== detail.id)
+          throw new Error("研究历史归属不匹配。");
+        for (const event of history.events) applyRunEvent(workspaceId, detail.id, run, event);
+        run.status = history.run.status;
+        run.error = history.run.error || "";
+      } catch (err) {
+        if (disposed) return;
+        run.error = `读取研究历史失败：${err.message}`;
+      } finally {
+        connections.delete(controller);
+        run.pending = false;
+      }
+    }
   }
 }
 
@@ -350,59 +391,74 @@ async function sendMessage() {
   await followRun(workspaceId, threadId, runs[threadId], false);
 }
 
+function applyRunEvent(workspaceId, threadId, run, event, eventId = null) {
+  switch (event.type) {
+    case "started":
+      if (event.workspace_id !== workspaceId || event.thread_id !== threadId)
+        throw new Error("研究事件归属不匹配。");
+      run.status = "running";
+      run.runId = event.run_id;
+      break;
+    case "assistant_message":
+    case "text_delta": {
+      let item = run.items.find((item) => item.type === "text" && item.id === event.message_id);
+      if (!item) {
+        run.items.push({ type: "text", id: event.message_id, text: "" });
+        item = run.items.at(-1);
+      }
+      if (event.type === "text_delta") item.text += event.text;
+      else {
+        item.text = event.text;
+        for (const call of event.tool_calls) {
+          run.items.push({
+            type: "tool", id: call.id, toolCallId: call.id,
+            name: call.name, args: call.args, status: "running",
+          });
+        }
+      }
+      break;
+    }
+    case "tool_start":
+      run.items.push({ type: "tool", id: event.tool_run_id, toolCallId: event.tool_call_id, name: event.name, status: "running" });
+      break;
+    case "tool_result":
+    case "tool_end":
+    case "tool_error": {
+      const item = run.items.find((item) => item.type === "tool" &&
+        (event.tool_call_id ? item.toolCallId === event.tool_call_id : item.id === event.tool_run_id));
+      item.status = event.type === "tool_error" || event.status === "error" ? "error" : "returned";
+      item.error = event.error;
+      item.content = event.content;
+      break;
+    }
+    case "succeeded":
+      run.status = "succeeded";
+      run.answer = event.message;
+      break;
+    case "failed":
+      run.status = "failed";
+      run.error = `研究失败：${event.error || "后端执行失败"} 请核对消息记录后再决定是否重发。`;
+      break;
+    case "run_finished":
+      if (event.run_id !== run.runId) throw new Error("研究事件归属不匹配。");
+      run.status = event.status;
+      run.error = event.status === "succeeded" ? "" : event.error;
+      break;
+    default:
+      throw new Error(`无法识别研究事件：${event.type}`);
+  }
+  if (run.status === "reconnecting") {
+    run.status = "running";
+    run.error = "";
+  }
+  // Advance only after the event has been applied to this run.
+  if (eventId !== null) run.lastEventId = eventId;
+}
+
 async function followRun(workspaceId, threadId, run, recovering) {
   const controller = new AbortController();
   connections.add(controller);
-  const applyEvent = (event, eventId) => {
-    switch (event.type) {
-      case "started":
-        if (event.workspace_id !== workspaceId || event.thread_id !== threadId)
-          throw new Error("研究事件归属不匹配。");
-        run.status = "running";
-        run.runId = event.run_id;
-        break;
-      case "text_delta": {
-        let item = run.items.find((item) => item.type === "text" && item.id === event.message_id);
-        if (!item) {
-          run.items.push({ type: "text", id: event.message_id, text: "" });
-          item = run.items.at(-1);
-        }
-        item.text += event.text;
-        break;
-      }
-      case "tool_start":
-        run.items.push({ type: "tool", id: event.tool_run_id, name: event.name, status: "running" });
-        break;
-      case "tool_end":
-      case "tool_error": {
-        const item = run.items.find((item) => item.type === "tool" && item.id === event.tool_run_id);
-        item.status = event.type === "tool_end" ? "returned" : "error";
-        item.error = event.error;
-        break;
-      }
-      case "succeeded":
-        run.status = "succeeded";
-        run.answer = event.message;
-        break;
-      case "failed":
-        run.status = "failed";
-        run.error = `研究失败：${event.error || "后端执行失败"} 请核对消息记录后再决定是否重发。`;
-        break;
-      case "run_finished":
-        if (event.run_id !== run.runId) throw new Error("研究事件归属不匹配。");
-        run.status = event.status;
-        run.error = event.status === "succeeded" ? "" : event.error;
-        break;
-      default:
-        throw new Error(`无法识别研究事件：${event.type}`);
-    }
-    if (run.status === "reconnecting") {
-      run.status = "running";
-      run.error = "";
-    }
-    // Advance only after the event has been applied to this run.
-    if (eventId !== null) run.lastEventId = eventId;
-  };
+  const applyEvent = (event, eventId) => applyRunEvent(workspaceId, threadId, run, event, eventId);
   try {
     let resume = recovering;
     while (true) {
@@ -855,19 +911,28 @@ onBeforeUnmount(() => {
               </div>
               <div class="user-content">{{ pendingText }}</div>
             </article>
+            <p v-else-if="entry.type === 'run_error'" role="alert">{{ entry.error }}</p>
             <details v-else class="research-progress"
-              :open="currentRun.status !== 'succeeded'">
-              <summary>{{ currentRun.status === 'succeeded' ? '查看本轮研究过程' :
-                currentRun.status === 'failed' ? '研究过程（未完成）' :
-                currentRun.status === 'disconnected' ? '已收到的研究过程（连接中断）' : '研究过程' }}</summary>
+              :open="!entry.run.legacy && entry.run.status !== 'succeeded'">
+              <summary>{{ entry.run.legacy ? '查看本轮研究过程' : entry.run.status === 'succeeded' ? '查看本轮研究过程' :
+                entry.run.status === 'failed' ? '研究过程（未完成）' :
+                entry.run.status === 'disconnected' ? '已收到的研究过程（连接中断）' : '研究过程' }}</summary>
               <div v-for="item in entry.items" :key="`${item.type}:${item.id}`" class="progress-item">
                 <MarkdownContent v-if="item.type === 'text'" :content="item.text" />
                 <div v-else class="tool-event" :class="item.status">
                   <span>{{ item.name }}</span>
                   <span>{{ item.status === 'running' ?
-                    (currentRun.pending ? '执行中' : '结果未收到') :
+                    (entry.run.pending ? '执行中' : '结果未收到') :
                     item.status === 'returned' ? '已返回' : '执行异常' }}</span>
                   <p v-if="item.error">{{ item.error }}</p>
+                  <details v-if="item.args !== undefined" class="tool-detail">
+                    <summary>调用参数</summary>
+                    <pre>{{ JSON.stringify(item.args, null, 2) }}</pre>
+                  </details>
+                  <details v-if="item.content !== undefined" class="tool-detail">
+                    <summary>工具结果</summary>
+                    <pre>{{ typeof item.content === 'string' ? item.content : JSON.stringify(item.content, null, 2) }}</pre>
+                  </details>
                 </div>
               </div>
             </details>

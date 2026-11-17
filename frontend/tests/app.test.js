@@ -59,6 +59,7 @@ beforeEach(() => {
         return postHandler(url, options);
       }
       if (url.endsWith("/runs")) return response([]);
+      if (url.endsWith("/threads/t1/history")) return response({ thread_id: "t1", turns: [] });
       if (url === "/api/workspaces") return response([{ id: detail.id, title: detail.title, goal: detail.info.goal }]);
       if (url === "/api/workspaces/w1") return response(detail);
       if (url === "/api/workspaces/w1/threads/t1")
