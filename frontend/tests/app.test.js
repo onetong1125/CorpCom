@@ -3,6 +3,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import App from "../src/App.vue";
 import MarkdownContent from "../src/components/MarkdownContent.vue";
 import ArtifactPanel from "../src/components/ArtifactPanel.vue";
+import { successResponse } from "./stream-fixtures";
 
 const workspace = {
   id: "w1",
@@ -57,6 +58,8 @@ beforeEach(() => {
         posted.push({ url, body: JSON.parse(options.body) });
         return postHandler(url, options);
       }
+      if (url.endsWith("/runs")) return response([]);
+      if (url.endsWith("/threads/t1/history")) return response({ thread_id: "t1", turns: [] });
       if (url === "/api/workspaces") return response([{ id: detail.id, title: detail.title, goal: detail.info.goal }]);
       if (url === "/api/workspaces/w1") return response(detail);
       if (url === "/api/workspaces/w1/threads/t1")
@@ -111,7 +114,7 @@ describe("research workbench", () => {
     expect(posted).toHaveLength(1);
     messages = [
       savedUser,
-      { ...savedUser, id: 2, role: "assistant", content: "报告已归档" },
+      { ...savedUser, id: 2, role: "assistant", content: "报告已归档", model_message_id: "model-answer" },
     ];
     detail.artifacts = [
       {
@@ -122,7 +125,7 @@ describe("research workbench", () => {
         created_at: savedUser.created_at,
       },
     ];
-    finish(response(messages[1], 201));
+    finish(successResponse(messages[1], "w1", "t1"));
     await flushPromises();
     expect(wrapper.findAll(".message")).toHaveLength(2);
     expect(wrapper.text()).toContain("report.md");

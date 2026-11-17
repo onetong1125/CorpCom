@@ -7,9 +7,13 @@ import shutil
 from tempfile import TemporaryDirectory
 from typing import Annotated
 from contextlib import asynccontextmanager
+from anyio import create_task_group
+from redis import Redis
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Form, HTTPException, UploadFile
+from collections.abc import AsyncIterator
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+from fastapi import Depends, FastAPI, Form, HTTPException, UploadFile, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -20,12 +24,15 @@ from langchain_openai import ChatOpenAI
 from openai import APIError
 from pydantic import BaseModel, ConfigDict, Field
 
+from corpcom.run_replay import replay_events
+from corpcom.run_history import read_run_history, read_thread_history
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore, ThreadBusyError
 from corpcom.workspace_models import (
-    Artifact, Message, Thread, ThreadDetail, Workspace, WorkspaceDetail, WorkspaceResearchInfo, WorkspaceSummary,
+    Artifact, Message, Thread, ThreadDetail, Workspace, WorkspaceDetail,
+    WorkspaceResearchInfo, WorkspaceSummary, ResearchRunSummary,
 )
 from corpcom.run_coordinator import RunCoordinator, ExecutionCapacityError
-
+from corpcom.workspace_stream import research_events
 
 logger = logging.getLogger(__name__)
 RequiredText = Annotated[str, Field(min_length=1, pattern=r"\S")]
@@ -71,15 +78,24 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         root.mkdir(parents=True, exist_ok=True)
         # Keep the checkpoint connection open for the application's lifetime.
-        with SqliteSaver.from_conn_string(
+        with (
+            Redis.from_url(
+                os.environ["CORPCOM_REDIS_URL"],
+                decode_responses=True,
+            ) as redis_client,
+            SqliteSaver.from_conn_string(
             str(root / "checkpoints.sqlite")
-        ) as checkpointer:
+        ) as checkpointer,
+        ):
+            app.state.redis = redis_client
             app.state.checkpointer = checkpointer
             app.state.coordinator = RunCoordinator(
-                checkpointer, max_concurrent_runs=2)
+                checkpointer, redis_client, max_concurrent_runs=2)
             with WorkspaceStore(root) as store:
                 store.interrupt_running_executions()
-            yield
+            async with create_task_group() as task_group:
+                app.state.research_tasks = task_group
+                yield
 
     app = FastAPI(
         title="CorpCom",
@@ -147,6 +163,118 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     def show_thread(workspace_id: str, thread_id: str) -> ThreadDetail:
         with WorkspaceStore(root) as store:
             return store.get_thread(workspace_id, thread_id)
+
+    @app.get(
+        "/api/workspaces/{workspace_id}/threads/{thread_id}/history"
+    )
+    def get_thread_history(
+        workspace_id: str,
+        thread_id: str,
+    ) -> dict[str, object]:
+        return read_thread_history(
+            root,
+            app.state.checkpointer,
+            workspace_id,
+            thread_id,
+        )
+
+    async def get_research_events(
+        workspace_id: str, thread_id: str, body: MessageCreate,
+        model: Annotated[BaseChatModel, Depends(get_model)]
+    ):
+        """统一提供应用对象，并转换HTTPException"""
+        try:
+            async with research_events(
+                root,
+                app.state.coordinator,
+                app.state.research_tasks,
+                workspace_id,
+                thread_id,
+                body.content,
+                model
+            ) as events:
+                yield events
+        except ThreadBusyError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ExecutionCapacityError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except RecordNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/api/workspaces/{workspace_id}/threads/{thread_id}/messages/stream",
+              response_class=EventSourceResponse
+    )
+    async def stream_message(
+        events: Annotated[
+            AsyncIterator[dict[str, object]],
+            Depends(get_research_events, scope="request")
+        ]
+    ):
+        # 这里已经准入成功，进入SSE
+        async for event in events:
+            payload = event.copy()
+            event_id = payload.pop("event_id", None)
+            yield ServerSentEvent(data=payload, id=event_id)
+
+    @app.get(
+        "/api/workspaces/{workspace_id}/threads/{thread_id}/runs"
+    )
+    def list_thread_runs(
+        workspace_id: str,
+        thread_id: str,
+    ) -> list[ResearchRunSummary]:
+        with WorkspaceStore(root) as store:
+            return store.list_research_runs(
+                workspace_id, thread_id,
+            )
+
+    @app.get(
+        "/api/workspaces/{workspace_id}/threads/{thread_id}"
+        "/runs/{run_id}/history"
+    )
+    def get_run_history(
+        workspace_id: str,
+        thread_id: str,
+        run_id: str,
+    ) -> dict[str, object]:
+        return read_run_history(
+            root,
+            app.state.checkpointer,
+            app.state.redis,
+            workspace_id,
+            thread_id,
+            run_id,
+        )
+
+    async def get_replay_events(
+        workspace_id: str,
+        thread_id: str,
+        run_id: str,
+        after: Annotated[
+            str, Query(pattern=r"^[0-9]+-[0-9]+$")
+        ] = "0-0",
+    ):
+        async with replay_events(
+            root, app.state.redis, workspace_id, thread_id, run_id, after
+        ) as events:
+            yield events
+
+    @app.get(
+        "/api/workspaces/{workspace_id}/threads/{thread_id}"
+        "/runs/{run_id}/events",
+        response_class=EventSourceResponse,
+    )
+    async def replay_run_events(
+        events: Annotated[
+            AsyncIterator[dict[str, object]],
+            Depends(get_replay_events, scope="request"),
+        ],
+    ):
+        async for event in events:
+            payload = event.copy()
+            event_id = payload.pop("event_id", None)
+            yield ServerSentEvent(data=payload, id=event_id)
+
 
     @app.post("/api/workspaces/{workspace_id}/threads/{thread_id}/messages", status_code=201)
     def send_message(

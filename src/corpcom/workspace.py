@@ -12,6 +12,7 @@ from pydantic import JsonValue
 from corpcom.workspace_models import (
   Artifact, ArtifactFile, Message, Thread, ThreadDetail,
   Workspace, WorkspaceDetail, WorkspaceResearchInfo, WorkspaceSummary,
+  ResearchRun, ResearchRunSummary
 )
 
 # Threads and files belong to a workspace; messages belong through their thread.
@@ -36,9 +37,46 @@ CREATE TABLE IF NOT EXISTS threads (
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
     thread_id TEXT NOT NULL REFERENCES threads(id),
+    model_message_id TEXT,
     role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
     content TEXT NOT NULL,
+    tool_calls TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_thread_model_message
+ON messages (thread_id, model_message_id);
+CREATE TABLE IF NOT EXISTS research_runs (
+    id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES threads(id),
+    run_index INTEGER NOT NULL CHECK (run_index >= 0),
+    user_message_id INTEGER UNIQUE REFERENCES messages(id),
+    status TEXT NOT NULL DEFAULT 'running' CHECK (
+        status IN ('running', 'succeeded', 'failed', 'interrupted')
+    ),
+    started_at TEXT NOT NULL DEFAULT (
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    ),
+    finished_at TEXT,
+    error TEXT,
+    sse_events TEXT,
+    UNIQUE (thread_id, run_index)
+);
+CREATE INDEX IF NOT EXISTS ix_research_runs_thread
+ON research_runs (thread_id);
+CREATE TABLE IF NOT EXISTS tool_executions (
+    id TEXT PRIMARY KEY,
+    message_id INTEGER NOT NULL REFERENCES messages(id),
+    tool_call_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('running', 'returned', 'error', 'interrupted')
+    ),
+    output TEXT,
+    error TEXT,
+    started_at TEXT NOT NULL DEFAULT (
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    ),
+    finished_at TEXT,
+    UNIQUE (message_id, tool_call_id)
 );
 CREATE TABLE IF NOT EXISTS artifacts (
     id TEXT PRIMARY KEY,
@@ -67,6 +105,12 @@ def _require_text(**fields: str) -> None:
   for name, value in fields.items():
     if not value.strip():
       raise ValueError(f"{name} must not be empty")
+
+def _message_from_row(row: sqlite3.Row) -> Message:
+  """Decode stored tool calls before building a message."""
+  data = dict(row)
+  data["tool_calls"] = json.loads(data["tool_calls"])
+  return Message.model_validate(data)
 
 
 class WorkspaceStore:
@@ -206,7 +250,7 @@ class WorkspaceStore:
     """Return a conversation with history messages."""
     thread = self._thread(workspace_id, thread_id)
     # Message IDs preserve insertion order even when timestamps share a millisecond.
-    messages = [Message.model_validate(dict(row)) for row in self.db.execute(
+    messages = [_message_from_row(row) for row in self.db.execute(
         "SELECT * FROM messages WHERE thread_id = ? ORDER BY id", (thread_id,)
     )]
     return ThreadDetail(**thread.model_dump(), messages=messages)
@@ -219,20 +263,37 @@ class WorkspaceStore:
         (workspace_id,),
     ).fetchone() is not None
 
-  def add_message(self, workspace_id: str, thread_id: str, role: str,
-      content: str) -> Message:
-    """Save supplied message text without calling a model or generating a reply."""
+  def add_message(
+      self,
+      workspace_id: str,
+      thread_id: str,
+      role: str,
+      content: str,
+      *,
+      model_message_id: str | None = None,
+      tool_calls: list[dict[str, JsonValue]] | None = None,
+  ) -> Message:
+    """Save message text and model tool-call declarations."""
     self._thread(workspace_id, thread_id)
-    _require_text(content=content)
+    calls = [] if tool_calls is None else tool_calls
+
+    # Assistant tool calls form a message even without text.
+    if role != "assistant" or not calls:
+      _require_text(content=content)
+
+    encoded_calls = json.dumps(calls, ensure_ascii=False, allow_nan=False,)
     with self.db:
       cursor = self.db.execute(
-          "INSERT INTO messages (thread_id, role, content) VALUES (?, ?, ?)",
-          (thread_id, role, content),
+          "INSERT INTO messages "
+          "(thread_id, role, content, model_message_id, tool_calls) "
+          "VALUES (?, ?, ?, ?, ?)",
+          (thread_id, role, content, model_message_id, encoded_calls),
       )
       self._touch(workspace_id)
-    return Message.model_validate(dict(self.db.execute(
+
+    return _message_from_row(self.db.execute(
         "SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)
-    ).fetchone()))
+    ).fetchone())
 
   def add_user_message(
     self,
@@ -251,12 +312,22 @@ class WorkspaceStore:
           "INSERT INTO messages (thread_id, role, content) VALUES (?, 'user', ?)",
           (thread_id, content),
       )
+      # Save the question and its run association in one transaction.
+      self.db.execute(
+          """
+          UPDATE research_runs
+          SET user_message_id = ?
+          WHERE thread_id = ?
+            AND status = 'running'
+          """,
+          (cursor.lastrowid, thread_id),
+      )
       self._touch(workspace_id)
-      message = Message.model_validate(dict(self.db.execute(
+      message = _message_from_row(self.db.execute(
         "SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)
-      ).fetchone()))
+      ).fetchone())
 
-      return (message, is_first)
+      return message, is_first
 
 
 
@@ -473,10 +544,63 @@ class WorkspaceStore:
       raise FileNotFoundError(f"stored file is missing: {path}")
     return ArtifactFile(**artifact, path=path)
 
+  def get_research_run(
+      self,
+      workspace_id: str,
+      thread_id: str,
+      run_id: str,
+  ) -> ResearchRun:
+    """Read a run within its owning workspace and thread."""
+    self._thread(workspace_id, thread_id)
+    row = self.db.execute(
+        """
+        SELECT * FROM research_runs
+        WHERE id = ? AND thread_id = ?
+        """,
+        (run_id, thread_id),
+    ).fetchone()
+
+    if row is None:
+      raise RecordNotFoundError(
+          f"research run not found in thread: {run_id}"
+      )
+
+    data = dict(row)
+    if data["sse_events"] is not None:
+      data["sse_events"] = json.loads(data["sse_events"])
+
+    return ResearchRun.model_validate(data)
+
+  def list_research_runs(
+      self,
+      workspace_id: str,
+      thread_id: str,
+  ) -> list[ResearchRunSummary]:
+    """List this thread's runs in insertion order."""
+    self._thread(workspace_id, thread_id)
+    rows = self.db.execute(
+        """
+        SELECT id, thread_id, run_index, user_message_id, status,
+               started_at, finished_at, error
+        FROM research_runs
+        WHERE thread_id = ?
+        ORDER BY run_index
+        """,
+        (thread_id,),
+    ).fetchall()
+
+    return [
+        ResearchRunSummary.model_validate(dict(row))
+        for row in rows
+    ]
+
   def start_thread_execution(
       self, workspace_id: str, thread_id: str,
+      *, run_id: str,
   ) -> Thread:
     """Claim execution and return the Thread snapshot from before the claim."""
+    if run_id is None:
+      raise ValueError("run_id must not be None")
     with self.db:
       # Read the old state under the same write lock as the admission update.
       self.db.execute("BEGIN IMMEDIATE")
@@ -501,6 +625,17 @@ class WorkspaceStore:
       if cursor.rowcount == 0:
         raise ThreadBusyError(f"Thread is already running: {thread_id}")
 
+      # Allocate the thread-local index under the admission write lock.
+      self.db.execute(
+          """
+          INSERT INTO research_runs (id, thread_id, run_index)
+          SELECT ?, ?, COALESCE(MAX(run_index), -1) + 1
+          FROM research_runs
+          WHERE thread_id = ?
+          """,
+          (run_id, thread_id, thread_id),
+      )
+
       return previous
 
   def finish_thread_execution(
@@ -510,9 +645,15 @@ class WorkspaceStore:
       *,
       status: Literal["succeeded", "failed"],
       error: str | None = None,
+      sse_events: list[dict[str, JsonValue]] | None = None,
   ) -> Thread:
     self._thread(workspace_id, thread_id)
-
+    # serialize events
+    encoded_events = (
+        None
+        if sse_events is None
+        else json.dumps(sse_events, ensure_ascii=False, allow_nan=False)
+    )
     with self.db:
       self.db.execute(
           """
@@ -522,6 +663,17 @@ class WorkspaceStore:
           WHERE workspace_id = ? AND id = ?
           """,
           (status, error, workspace_id, thread_id),
+      )
+      self.db.execute(
+          """
+          UPDATE research_runs
+          SET status = ?,
+              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+              error = ?,
+              sse_events = ?
+          WHERE thread_id = ? AND status = 'running'
+          """,
+          (status, error, encoded_events, thread_id),
       )
 
       return self._thread(workspace_id, thread_id)
@@ -538,6 +690,15 @@ class WorkspaceStore:
           WHERE execution_status = 'running'
           """
       )
+      self.db.execute(
+          """
+          UPDATE research_runs
+          SET status = 'interrupted',
+              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+              error = '后端重启，上次执行已中断'
+          WHERE status = 'running'
+          """
+      )
       return cursor.rowcount
 
   def complete_thread_execution(
@@ -545,16 +706,26 @@ class WorkspaceStore:
       workspace_id: str,
       thread_id: str,
       answer: str,
+      *,
+      model_message_id: str | None = None,
+      sse_events: list[dict[str, JsonValue]] | None = None,
   ) -> Message:
     self._thread(workspace_id, thread_id)
     _require_text(content=answer)
+
+    # serialize events
+    encoded_events = (
+      None
+      if sse_events is None
+      else json.dumps(sse_events, ensure_ascii=False, allow_nan=False)
+    )
     with self.db:
       cursor = self.db.execute(
           """
-          INSERT INTO messages (thread_id, role, content)
-          VALUES (?, 'assistant', ?);
+          INSERT INTO messages (thread_id, role, content, model_message_id)
+          VALUES (?, 'assistant', ?, ?);
           """,
-          (thread_id, answer)
+          (thread_id, answer, model_message_id)
       )
       message_id = cursor.lastrowid
 
@@ -568,9 +739,20 @@ class WorkspaceStore:
           """,
           (workspace_id, thread_id),
       )
+      self.db.execute(
+          """
+          UPDATE research_runs
+          SET status = 'succeeded',
+              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+              error = NULL,
+              sse_events = ?
+          WHERE thread_id = ? AND status = 'running'
+          """,
+          (encoded_events, thread_id),
+      )
 
       self._touch(workspace_id)
 
-      return Message.model_validate(dict(self.db.execute(
+      return _message_from_row(self.db.execute(
           "SELECT * FROM messages WHERE id = ?", (message_id,)
-      ).fetchone()))
+      ).fetchone())

@@ -58,10 +58,29 @@ class Message(BaseModel):
 
     id: int
     thread_id: str
+    model_message_id: str | None = None
     role: Literal["user", "assistant"]
     content: str
+    tool_calls: list[dict[str, JsonValue]] = Field(default_factory=list)
     created_at: Timestamp
 
+class ResearchRunSummary(BaseModel):
+    """Run metadata used to locate an execution."""
+
+    id: str
+    thread_id: str
+    run_index: int
+    user_message_id: int | None = None
+    status: Literal["running", "succeeded", "failed", "interrupted"]
+    started_at: Timestamp
+    finished_at: Timestamp | None = None
+    error: str | None = None
+
+
+class ResearchRun(ResearchRunSummary):
+    """One research execution and its archived stream events."""
+
+    sse_events: list[dict[str, JsonValue]] | None = None
 
 class Artifact(BaseModel):
     """File metadata with a path relative to the data directory."""

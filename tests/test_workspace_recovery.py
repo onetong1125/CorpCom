@@ -3,7 +3,9 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
+from uuid import uuid4
+from redis import Redis
 
 from langchain.agents import create_agent
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
@@ -34,7 +36,8 @@ class ProtocolCheckingModel(FakeMessagesListChatModel):
                     pending = {call["id"] for call in message.tool_calls}
         if pending:
             raise ValueError("insufficient tool messages following tool_calls message")
-        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        return result.model_copy(deep=True)
 
 
 class WorkspaceRecoveryTests(unittest.TestCase):
@@ -77,20 +80,20 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                                     for _, channel, value in checkpoint.pending_writes))
                 self.assertEqual([m for m in agent.get_state(config).values["messages"] if m.type == "tool"],
                                  recorded)
-                store.start_thread_execution(workspace.id, thread.id)
+                store.start_thread_execution(workspace.id, thread.id, run_id=uuid4().hex)
                 store.interrupt_running_executions()
 
-                def check_before_ask(*args):
+                def check_before_ask(*args, **kwargs):
                     with SqliteSaver.from_conn_string(checkpoint_path) as reader:
                         saved = reader.get_tuple(config).checkpoint["channel_values"]["messages"]
                     # Equality checks IDs, contents and success statuses, with no unknown-result additions.
                     self.assertEqual([m for m in saved if m.type == "tool"], recorded)
-                    return ask_workspace(*args)
+                    return ask_workspace(*args, **kwargs)
 
                 recovery = ProtocolCheckingModel(responses=[
                     AIMessage(content="恢复正常"), AIMessage(content="续聊正常"),
                 ])
-                coordinator = RunCoordinator(saver, max_concurrent_runs=2)
+                coordinator = RunCoordinator(saver, Mock(spec=Redis), max_concurrent_runs=2)
                 with patch("corpcom.run_coordinator.ask_workspace", side_effect=check_before_ask):
                     coordinator.run(store, recovery, workspace.id, thread.id, "直接回复")
                 coordinator.run(store, recovery, workspace.id, thread.id, "下一轮也不调用工具")
@@ -139,20 +142,20 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                                     for _, channel, value in checkpoint.pending_writes))
                 self.assertEqual([m for m in agent.get_state(config).values["messages"] if m.type == "tool"],
                                  [recorded])
-                store.start_thread_execution(workspace.id, thread.id)
+                store.start_thread_execution(workspace.id, thread.id, run_id=uuid4().hex)
                 store.interrupt_running_executions()
 
                 recovery = ProtocolCheckingModel(responses=[AIMessage(content="恢复正常")])
 
-                def check_before_ask(*args):
+                def check_before_ask(*args, **kwargs):
                     saved = saver.get_tuple(config).checkpoint["channel_values"]["messages"]
                     results = [m for m in saved if m.type == "tool"]
                     self.assertEqual([m.tool_call_id for m in results], ["recorded", "missing"])
                     self.assertEqual(results[0], recorded)
                     self.assertEqual(results[1].status, "error")
-                    return ask_workspace(*args)
+                    return ask_workspace(*args, **kwargs)
 
-                coordinator = RunCoordinator(saver, max_concurrent_runs=2)
+                coordinator = RunCoordinator(saver, Mock(spec=Redis), max_concurrent_runs=2)
                 with patch("corpcom.run_coordinator.ask_workspace", side_effect=check_before_ask):
                     coordinator.run(store, recovery, workspace.id, thread.id, "不再调用工具")
                 saved = saver.get_tuple(config).checkpoint["channel_values"]["messages"]
@@ -193,7 +196,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
             ):
                 workspace = store.create_workspace("恢复验收", goal="验证中断恢复")
                 thread = store.create_thread(workspace.id, "C")
-                coordinator = RunCoordinator(saver, max_concurrent_runs=2)
+                coordinator = RunCoordinator(saver, Mock(spec=Redis), max_concurrent_runs=2)
                 coordinator.run(store, model, workspace.id, thread.id, "第一轮")
                 with self.assertRaises(KeyboardInterrupt):
                     coordinator.run(store, model, workspace.id, thread.id, "执行工具")
@@ -208,19 +211,21 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                 store.interrupt_running_executions()
                 recovery = ProtocolCheckingModel(responses=[AIMessage(content="恢复正常")])
 
-                def check_before_ask(*args):
+                def check_before_ask(*args, **kwargs):
                     detail = store.get_thread(workspace.id, thread.id)
                     self.assertEqual(detail.execution_status, "running")
-                    self.assertEqual(detail.messages[-1].content, "执行工具")
+                    self.assertEqual(detail.messages[-2].content, "执行工具")
+                    self.assertEqual(detail.messages[-1].tool_calls[0]["id"],
+                                     "lost-result")
                     # A separate connection proves recovery is committed before ask starts.
                     with SqliteSaver.from_conn_string(checkpoint_path) as reader:
                         saved = reader.get_tuple(config).checkpoint["channel_values"]["messages"]
                     self.assertEqual(saved[-1].tool_call_id, "lost-result")
                     self.assertEqual(saved[-1].status, "error")
                     self.assertIn("未知", saved[-1].content)
-                    return ask_workspace(*args)
+                    return ask_workspace(*args, **kwargs)
 
-                coordinator = RunCoordinator(saver, max_concurrent_runs=2)
+                coordinator = RunCoordinator(saver, Mock(spec=Redis), max_concurrent_runs=2)
                 with patch("corpcom.run_coordinator.ask_workspace", side_effect=check_before_ask):
                     answer = coordinator.run(store, recovery, workspace.id, thread.id, "直接回复恢复正常")
                 self.assertEqual(answer.content, "恢复正常")
@@ -229,7 +234,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                 self.assertEqual(detail.execution_status, "succeeded")
                 self.assertIsNone(detail.execution_error)
                 self.assertEqual([m.content for m in detail.messages if m.role == "assistant"],
-                                 ["已有回答", "恢复正常"])
+                                 ["已有回答", "", "恢复正常"])
 
                 with patch("corpcom.run_coordinator.recover_interrupted_checkpoint") as recover:
                     coordinator.run(store, recovery, workspace.id, thread.id, "再确认一次")
@@ -238,7 +243,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                 self.assertEqual(sum(m.type == "tool" and m.tool_call_id == "lost-result" for m in saved), 1)
                 self.assertEqual(effects, ["performed"])
 
-    def test_non_interruption_tool_failure_is_not_repaired(self):
+    def test_tool_error_allows_next_turn_without_interruption_recovery(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
 
@@ -247,9 +252,15 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                 """Raise an ordinary tool exception, not a backend interruption."""
                 raise RuntimeError("ordinary tool failure")
 
-            model = ProtocolCheckingModel(responses=[AIMessage(content="", tool_calls=[{
-                "name": "broken_action", "args": {}, "id": "failed-tool",
-            }])])
+            model = ProtocolCheckingModel(responses=[
+                AIMessage(content="", tool_calls=[{
+                    "name": "broken_action",
+                    "args": {},
+                    "id": "failed-tool",
+                }]),
+                AIMessage(content="工具失败，暂时无法完成查询。"),
+                AIMessage(content="继续研究。"),
+            ])
             with (
                 WorkspaceStore(root) as store,
                 SqliteSaver.from_conn_string(str(root / "checkpoints.sqlite")) as saver,
@@ -258,17 +269,43 @@ class WorkspaceRecoveryTests(unittest.TestCase):
             ):
                 workspace = store.create_workspace("异常不可掩盖", goal="验证工具错误")
                 thread = store.create_thread(workspace.id, "C")
-                coordinator = RunCoordinator(saver, max_concurrent_runs=2)
-                with self.assertRaisesRegex(RuntimeError, "ordinary tool failure"):
-                    coordinator.run(store, model, workspace.id, thread.id, "调用工具")
-                retry = ProtocolCheckingModel(responses=[AIMessage(content="不应生成")])
-                with self.assertRaisesRegex(ValueError, "insufficient tool messages"):
-                    coordinator.run(store, retry, workspace.id, thread.id, "尝试继续")
+                coordinator = RunCoordinator(saver, Mock(spec=Redis), max_concurrent_runs=2)
+
+                answer = coordinator.run(
+                    store, model, workspace.id, thread.id, "调用工具",
+                )
+                self.assertEqual(
+                    answer.content, "工具失败，暂时无法完成查询。",
+                )
+
+                followup = coordinator.run(
+                    store, model, workspace.id, thread.id, "继续",
+                )
+                self.assertEqual(followup.content, "继续研究。")
                 recover.assert_not_called()
+
                 detail = store.get_thread(workspace.id, thread.id)
-                self.assertEqual(detail.execution_status, "failed")
-                self.assertIn("insufficient tool messages", detail.execution_error)
-                self.assertEqual([m.role for m in detail.messages], ["user", "user"])
+                self.assertEqual(detail.execution_status, "succeeded")
+                self.assertIsNone(detail.execution_error)
+
+                config = {
+                    "configurable": {
+                        "thread_id": f"{workspace.id}:{thread.id}",
+                    },
+                }
+                messages = saver.get_tuple(config).checkpoint[
+                    "channel_values"
+                ]["messages"]
+                results = [
+                    m for m in messages if isinstance(m, ToolMessage)
+                ]
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0].tool_call_id, "failed-tool")
+                self.assertEqual(results[0].status, "error")
+                self.assertEqual(
+                    results[0].content,
+                    "RuntimeError: ordinary tool failure",
+                )
 
     def test_recovery_failure_skips_ask_and_releases_capacity(self):
         with TemporaryDirectory() as directory:
@@ -279,9 +316,9 @@ class WorkspaceRecoveryTests(unittest.TestCase):
             ):
                 workspace = store.create_workspace("恢复失败", goal="验证额度释放")
                 thread = store.create_thread(workspace.id, "C")
-                store.start_thread_execution(workspace.id, thread.id)
+                store.start_thread_execution(workspace.id, thread.id, run_id=uuid4().hex)
                 store.interrupt_running_executions()
-                coordinator = RunCoordinator(saver, max_concurrent_runs=1)
+                coordinator = RunCoordinator(saver, Mock(spec=Redis), max_concurrent_runs=1)
                 model = ProtocolCheckingModel(responses=[AIMessage(content="正常回答")])
                 with (
                     patch("corpcom.run_coordinator.recover_interrupted_checkpoint",
@@ -308,10 +345,10 @@ class WorkspaceRecoveryTests(unittest.TestCase):
             ):
                 workspace = store.create_workspace("早期中断", goal="checkpoint 尚未创建")
                 thread = store.create_thread(workspace.id, "C")
-                store.start_thread_execution(workspace.id, thread.id)
+                store.start_thread_execution(workspace.id, thread.id, run_id=uuid4().hex)
                 store.interrupt_running_executions()
                 model = ProtocolCheckingModel(responses=[AIMessage(content="恢复正常")])
-                answer = RunCoordinator(saver, max_concurrent_runs=2).run(
+                answer = RunCoordinator(saver, Mock(spec=Redis), max_concurrent_runs=2).run(
                     store, model, workspace.id, thread.id, "继续",
                 )
                 self.assertEqual(answer.content, "恢复正常")

@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from threading import Event
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 import httpx
@@ -18,6 +19,7 @@ from openai import APIConnectionError
 from corpcom.api import create_app, get_model
 from corpcom.workspace_agent import ask_workspace
 from corpcom.workspace import WorkspaceStore
+from corpcom.workspace_models import Thread
 
 
 class ApiTestModel(FakeMessagesListChatModel):
@@ -32,8 +34,16 @@ class ApiTests(unittest.TestCase):
     temporary = TemporaryDirectory()
     self.addCleanup(temporary.cleanup)
     self.root = Path(temporary.name)
-    with patch.dict(os.environ, {"CORPCOM_CORS_ORIGINS": "http://localhost:5173"}):
-      self.app = create_app(self.root / "data")
+    self.enterContext(patch.dict(os.environ, {
+      "CORPCOM_CORS_ORIGINS": "http://localhost:5173",
+      "CORPCOM_REDIS_URL": "redis://127.0.0.1:6380/0",
+    }))
+    redis_factory = self.enterContext(
+        patch("corpcom.api.Redis.from_url")
+    )
+    self.redis = redis_factory.return_value.__enter__.return_value
+    self.redis.xadd.return_value = "1-0"
+    self.app = create_app(self.root / "data")
     self.model = ApiTestModel(responses=[AIMessage(content="先核对现金流。")])
     self.app.dependency_overrides[get_model] = lambda: self.model
     self.client = self.enterContext(TestClient(self.app))
@@ -85,9 +95,16 @@ class ApiTests(unittest.TestCase):
     # A fresh app reads persisted records without retaining the first app's objects.
     with TestClient(create_app(self.root / "data")) as reopened:
       messages = reopened.get(second_url).json()["messages"]
-      self.assertEqual([m["role"] for m in messages], ["user", "assistant", "user", "assistant"])
-      self.assertEqual(messages[1], continued.json())
-      self.assertEqual(messages[3], followup.json())
+      self.assertEqual(
+          [m["role"] for m in messages],
+          ["user", "assistant", "assistant", "user", "assistant"],
+      )
+      self.assertEqual(
+          messages[1]["tool_calls"],
+          self.model.responses[0].tool_calls,
+      )
+      self.assertEqual(messages[2], continued.json())
+      self.assertEqual(messages[4], followup.json())
       self.assertEqual(reopened.get(self.url).json()["artifacts"], [artifact])
       self.assertEqual(reopened.get(self.url + f"/files/{artifact['id']}").json(), artifact)
       download = reopened.get(self.url + f"/files/{artifact['id']}/content")
@@ -235,11 +252,11 @@ class ApiTests(unittest.TestCase):
     entered = Event()
     release = Event()
 
-    def slow_ask(*args):
+    def slow_ask(*args, **kwargs):
       entered.set()
       if not release.wait(10):
         raise TimeoutError("Test did not release the model request")
-      return ask_workspace(*args)
+      return ask_workspace(*args, **kwargs)
 
     with patch("corpcom.run_coordinator.ask_workspace", side_effect=slow_ask):
       with ThreadPoolExecutor(max_workers=1) as executor:
@@ -293,13 +310,13 @@ class ApiTests(unittest.TestCase):
     release = Event()
 
     def slow_ask(store, model, workspace_id, thread_id, question,
-        checkpointer):
+        checkpointer, *, on_event):
       entered[thread_id].set()
       if not release.wait(15):
         raise TimeoutError("Test did not release the Agent")
       return ask_workspace(
           store, model, workspace_id, thread_id, question,
-          checkpointer,
+          checkpointer, on_event=on_event,
       )
 
     requests = [
@@ -394,12 +411,15 @@ class ApiTests(unittest.TestCase):
     }
     release = Event()
 
-    def slow_ask(store, model, workspace_id, thread_id, question, checkpointer):
+    def slow_ask(store, model, workspace_id, thread_id, question, checkpointer,
+      *, on_event
+    ):
       entered[thread_id].set()
       if not release.wait(15):
         raise TimeoutError("Test did not release the Agent")
       return ask_workspace(
           store, model, workspace_id, thread_id, question, checkpointer,
+          on_event=on_event,
       )
 
     with patch(
@@ -472,7 +492,7 @@ class ApiTests(unittest.TestCase):
         store.add_message(
             workspace.id, thread.id, "user", "测试问题",
         )
-        store.start_thread_execution(workspace.id, thread.id)
+        store.start_thread_execution(workspace.id, thread.id, run_id=uuid4().hex)
 
       store.complete_thread_execution(
           workspace.id, succeeded.id, "已保存的回答",
@@ -543,6 +563,195 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json(), after[thread_id])
 
+  def test_streaming_message_returns_events_and_saves_answer(self):
+    response = self.client.post(
+        self.thread_url + "/messages/stream",
+        json={"content": "测试流式回答"},
+    )
+    self.assertEqual(response.status_code, 200, response.text)
+    self.assertTrue(
+        response.headers["content-type"].startswith("text/event-stream")
+    )
+    events = [
+      json.loads(line[5:].strip())
+      for line in response.text.splitlines()
+      if line.startswith("data:")
+    ]
+    self.assertEqual(
+        [event["type"] for event in events],
+        ["started", "text_delta", "succeeded"]
+    )
+    self.assertEqual(
+        events[0]["workspace_id"], self.workspace["id"]
+    )
+    self.assertEqual(
+        events[0]["thread_id"], self.thread["id"]
+    )
+    self.assertEqual(
+        events[1]["text"], "先核对现金流。"
+    )
+    response = self.client.get(self.thread_url)
+    self.assertEqual(response.status_code, 200)
+    detail = response.json()
+    self.assertEqual(detail["execution_status"], "succeeded")
+    assistant_messages = [
+      msg for msg in detail["messages"] if msg["role"] == "assistant"
+    ]
+    self.assertEqual(len(assistant_messages), 1)
+    self.assertEqual(assistant_messages[0], events[-1]["message"])
+
+  def test_streaming_rejects_running_thread_before_sse(self):
+    with WorkspaceStore(self.root / "data") as store:
+      store.start_thread_execution(
+          self.workspace["id"], self.thread["id"], run_id=uuid4().hex
+      )
+
+    before = self.client.get(self.thread_url).json()
+
+    response = self.client.post(
+        self.thread_url + "/messages/stream",
+        json={"content": "这条问题不应保存"},
+    )
+    self.assertEqual(response.status_code, 409, response.text)
+    self.assertTrue(
+        response.headers["content-type"].startswith("application/json")
+    )
+    self.assertIn("detail", response.json())
+    after = self.client.get(self.thread_url).json()
+    self.assertEqual(after, before)
+
+  def test_run_history_returns_checkpoint_tool_results(self):
+    self.model.responses = [
+      AIMessage(
+          id="plan",
+          content="",
+          tool_calls=[{
+            "id": "read-call",
+            "name": "read_thread",
+            "args": {"thread_id": self.thread["id"]},
+          }],
+      ),
+      AIMessage(id="answer", content="已读取会话。"),
+    ]
+
+    sent = self.client.post(
+        self.thread_url + "/messages",
+        json={"content": "读取当前会话"},
+    )
+    self.assertEqual(sent.status_code, 201, sent.text)
+
+    runs = self.client.get(self.thread_url + "/runs")
+    self.assertEqual(runs.status_code, 200, runs.text)
+    run_id = runs.json()[0]["id"]
+
+    response = self.client.get(
+        self.thread_url + f"/runs/{run_id}/history",
+    )
+    self.assertEqual(response.status_code, 200, response.text)
+    history = response.json()
+
+    self.assertEqual(history["run"]["id"], run_id)
+    self.assertEqual(history["run"]["status"], "succeeded")
+    self.assertNotIn("sse_events", history["run"])
+    self.assertEqual(
+        [event["type"] for event in history["events"]],
+        ["assistant_message", "tool_result", "assistant_message"],
+    )
+    self.assertEqual(
+        history["events"][0]["tool_calls"][0]["id"],
+        "read-call",
+    )
+    self.assertEqual(history["events"][1]["tool_call_id"], "read-call")
+    self.assertEqual(history["events"][1]["status"], "success")
+    self.assertEqual(history["events"][2]["text"], "已读取会话。")
+    self.redis.xread.assert_not_called()
+
+  def test_thread_history_returns_tools_without_run_records(self):
+    self.model.responses = [
+      AIMessage(
+          id="old-plan",
+          content="",
+          tool_calls=[{
+            "id": "old-call",
+            "name": "read_thread",
+            "args": {"thread_id": self.thread["id"]},
+          }],
+      ),
+      AIMessage(id="old-answer", content="旧会话读取完成。"),
+    ]
+
+    with WorkspaceStore(self.root / "data") as store:
+      answer = ask_workspace(
+          store,
+          self.model,
+          self.workspace["id"],
+          self.thread["id"],
+          "读取当前会话",
+          self.app.state.checkpointer,
+      )
+      store.add_message(
+          self.workspace["id"],
+          self.thread["id"],
+          "assistant",
+          answer.text,
+          model_message_id=answer.id,
+      )
+      question = store.get_thread(
+          self.workspace["id"], self.thread["id"],
+      ).messages[0]
+
+    response = self.client.get(self.thread_url + "/history")
+    self.assertEqual(response.status_code, 200, response.text)
+    history = response.json()
+
+    self.assertEqual(history["thread_id"], self.thread["id"])
+    self.assertEqual(len(history["turns"]), 1)
+    turn = history["turns"][0]
+    self.assertEqual(turn["user_message_id"], question.id)
+    self.assertEqual(
+        [event["type"] for event in turn["events"]],
+        ["assistant_message", "tool_result", "assistant_message"],
+    )
+    self.assertEqual(turn["events"][1]["tool_call_id"], "old-call")
+    self.assertEqual(turn["events"][2]["text"], "旧会话读取完成。")
+
+    runs = self.client.get(self.thread_url + "/runs")
+    self.assertEqual(runs.status_code, 200, runs.text)
+    self.assertEqual(runs.json(), [])
+    self.redis.xread.assert_not_called()
+
+  def test_history_routes_return_404_for_wrong_ownership(self):
+    with WorkspaceStore(self.root / "data") as store:
+      other_workspace = store.create_workspace("其他研究")
+      other_thread = store.create_thread(
+          self.workspace["id"], "其他会话",
+      )
+      store.start_thread_execution(
+          self.workspace["id"],
+          self.thread["id"],
+          run_id="run-1",
+      )
+
+    foreign_thread_url = (
+        f"/api/workspaces/{other_workspace.id}"
+        f"/threads/{self.thread['id']}"
+    )
+    paths = [
+      foreign_thread_url + "/history",
+      foreign_thread_url + "/runs/run-1/history",
+      self.url + f"/threads/{other_thread.id}/runs/run-1/history",
+      self.thread_url + "/runs/missing-run/history",
+      self.url + "/threads/missing-thread/history",
+    ]
+
+    for path in paths:
+      with self.subTest(path=path):
+        response = self.client.get(path)
+
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertIsInstance(response.json()["detail"], str)
+
+    self.redis.xread.assert_not_called()
 
 if __name__ == "__main__":
   unittest.main()
