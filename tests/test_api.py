@@ -620,5 +620,138 @@ class ApiTests(unittest.TestCase):
     after = self.client.get(self.thread_url).json()
     self.assertEqual(after, before)
 
+  def test_run_history_returns_checkpoint_tool_results(self):
+    self.model.responses = [
+      AIMessage(
+          id="plan",
+          content="",
+          tool_calls=[{
+            "id": "read-call",
+            "name": "read_thread",
+            "args": {"thread_id": self.thread["id"]},
+          }],
+      ),
+      AIMessage(id="answer", content="已读取会话。"),
+    ]
+
+    sent = self.client.post(
+        self.thread_url + "/messages",
+        json={"content": "读取当前会话"},
+    )
+    self.assertEqual(sent.status_code, 201, sent.text)
+
+    runs = self.client.get(self.thread_url + "/runs")
+    self.assertEqual(runs.status_code, 200, runs.text)
+    run_id = runs.json()[0]["id"]
+
+    response = self.client.get(
+        self.thread_url + f"/runs/{run_id}/history",
+    )
+    self.assertEqual(response.status_code, 200, response.text)
+    history = response.json()
+
+    self.assertEqual(history["run"]["id"], run_id)
+    self.assertEqual(history["run"]["status"], "succeeded")
+    self.assertNotIn("sse_events", history["run"])
+    self.assertEqual(
+        [event["type"] for event in history["events"]],
+        ["assistant_message", "tool_result", "assistant_message"],
+    )
+    self.assertEqual(
+        history["events"][0]["tool_calls"][0]["id"],
+        "read-call",
+    )
+    self.assertEqual(history["events"][1]["tool_call_id"], "read-call")
+    self.assertEqual(history["events"][1]["status"], "success")
+    self.assertEqual(history["events"][2]["text"], "已读取会话。")
+    self.redis.xread.assert_not_called()
+
+  def test_thread_history_returns_tools_without_run_records(self):
+    self.model.responses = [
+      AIMessage(
+          id="old-plan",
+          content="",
+          tool_calls=[{
+            "id": "old-call",
+            "name": "read_thread",
+            "args": {"thread_id": self.thread["id"]},
+          }],
+      ),
+      AIMessage(id="old-answer", content="旧会话读取完成。"),
+    ]
+
+    with WorkspaceStore(self.root / "data") as store:
+      answer = ask_workspace(
+          store,
+          self.model,
+          self.workspace["id"],
+          self.thread["id"],
+          "读取当前会话",
+          self.app.state.checkpointer,
+      )
+      store.add_message(
+          self.workspace["id"],
+          self.thread["id"],
+          "assistant",
+          answer.text,
+          model_message_id=answer.id,
+      )
+      question = store.get_thread(
+          self.workspace["id"], self.thread["id"],
+      ).messages[0]
+
+    response = self.client.get(self.thread_url + "/history")
+    self.assertEqual(response.status_code, 200, response.text)
+    history = response.json()
+
+    self.assertEqual(history["thread_id"], self.thread["id"])
+    self.assertEqual(len(history["turns"]), 1)
+    turn = history["turns"][0]
+    self.assertEqual(turn["user_message_id"], question.id)
+    self.assertEqual(
+        [event["type"] for event in turn["events"]],
+        ["assistant_message", "tool_result", "assistant_message"],
+    )
+    self.assertEqual(turn["events"][1]["tool_call_id"], "old-call")
+    self.assertEqual(turn["events"][2]["text"], "旧会话读取完成。")
+
+    runs = self.client.get(self.thread_url + "/runs")
+    self.assertEqual(runs.status_code, 200, runs.text)
+    self.assertEqual(runs.json(), [])
+    self.redis.xread.assert_not_called()
+
+  def test_history_routes_return_404_for_wrong_ownership(self):
+    with WorkspaceStore(self.root / "data") as store:
+      other_workspace = store.create_workspace("其他研究")
+      other_thread = store.create_thread(
+          self.workspace["id"], "其他会话",
+      )
+      store.start_thread_execution(
+          self.workspace["id"],
+          self.thread["id"],
+          run_id="run-1",
+      )
+
+    foreign_thread_url = (
+        f"/api/workspaces/{other_workspace.id}"
+        f"/threads/{self.thread['id']}"
+    )
+    paths = [
+      foreign_thread_url + "/history",
+      foreign_thread_url + "/runs/run-1/history",
+      self.url + f"/threads/{other_thread.id}/runs/run-1/history",
+      self.thread_url + "/runs/missing-run/history",
+      self.url + "/threads/missing-thread/history",
+    ]
+
+    for path in paths:
+      with self.subTest(path=path):
+        response = self.client.get(path)
+
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertIsInstance(response.json()["detail"], str)
+
+    self.redis.xread.assert_not_called()
+
 if __name__ == "__main__":
   unittest.main()
