@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, onBeforeUnmount, reactive, ref, watch } from "vue";
+import { computed, nextTick, onMounted, reactive, ref, watch } from "vue";
 import {
   ArrowUp,
   Plus,
@@ -15,104 +15,27 @@ import {
   Layers,
   ChevronRight,
 } from "@lucide/vue";
-import { jsonRequest, request, streamRequest, replayRequest, StreamDisconnectedError } from "./api";
+import { jsonRequest, request } from "./api";
 import MarkdownContent from "./components/MarkdownContent.vue";
 import ArtifactPanel from "./components/ArtifactPanel.vue";
+import { useResearchRuns } from "./useResearchRuns";
 
 const workspaces = ref([]);
 const workspace = ref(null);
 const thread = ref(null);
 const loading = ref(true);
-const runs = reactive({});
-const runHistory = reactive({});
-const legacyHistory = reactive({});
-const drafts = reactive({});
 const uploads = reactive({});
 const saving = ref(false);
 const error = ref("");
 const search = ref("");
 const threadSearch = ref("");
-const pollError = ref("");
-const connections = new Set();
-let disposed = false;
 let selectionVersion = 0;
 let refreshVersion = 0;
-const draft = computed({
-  get: () => drafts[thread.value?.id] || "",
-  set: (value) => {
-    drafts[thread.value.id] = value;
-  },
-});
-const sending = computed(
-  () => Boolean(runs[thread.value?.id]?.pending) ||
-    thread.value?.execution_status === "running",
-);
-const currentRun = computed(() => runs[thread.value?.id]);
-const displayedMessages = computed(() => {
-  const messages = thread.value?.messages || [];
-  const run = currentRun.value;
-  if (!run?.answer || messages.some((item) => item.id === run.answer.id)) return messages;
-  const question = messages.filter((item) => item.role === "user").length === run.userMessageCount
-    ? [{ id: `pending:${thread.value.id}`, role: "user", content: run.content, created_at: run.createdAt }] : [];
-  return [...messages, ...question, run.answer];
-});
-const pendingText = computed(() => {
-  const run = runs[thread.value?.id];
-  // A refresh may already contain the persisted user message.
-  return run?.pending && !run.answer &&
-    thread.value.messages.filter((item) => item.role === "user").length === run.userMessageCount
-    ? run.content
-    : "";
-});
-const conversationEntries = computed(() => {
-  const entries = displayedMessages.value.map((message) => ({
-    type: "message", key: `message:${message.id}`, message,
-  }));
-  if (pendingText.value) entries.push({ type: "pending", key: "pending" });
-  const allRuns = [...(legacyHistory[thread.value?.id] || []), ...(runHistory[thread.value?.id] || []), currentRun.value].filter(Boolean);
-  for (const run of allRuns) {
-
-    // Preserve event order around saved messages, including a final answer received
-    // before the preceding plan has been read back from storage.
-    const textIds = new Set(run.items.filter((item) => item.type === "text").map((item) => item.id));
-    const firstSaved = entries.findIndex((entry) => entry.type === "message" &&
-      textIds.has(entry.message.model_message_id));
-    const question = entries.findIndex((entry) => entry.type === "message" &&
-      entry.message.id === run.userMessageId);
-    let insertAt = firstSaved !== -1 ? firstSaved : question !== -1 ? question + 1 : entries.length;
-    let progress = null;
-    for (const item of run.items) {
-      if (item.type === "text") {
-        const saved = entries.findIndex((entry) => entry.type === "message" &&
-          (entry.message.model_message_id === item.id || entry.message.id === item.savedMessageId));
-        if (saved !== -1) {
-          insertAt = saved + 1;
-          progress = null;
-          continue;
-        }
-      }
-      if (!progress) {
-        progress = { type: "progress", key: `progress:${run.runId ?? run.userMessageId}:${item.type}:${item.id}`, items: [], run };
-        entries.splice(insertAt++, 0, progress);
-      }
-      progress.items.push(item);
-    }
-    if (run.error && run !== currentRun.value) {
-      entries.splice(insertAt, 0, { type: "run_error", key: `run-error:${run.runId}`, error: run.error });
-    }
-  }
-  return entries;
-});
-const executionError = computed(() => {
-  const run = runs[thread.value?.id];
-  if (run?.error) return run.error;
-  if (run?.pending) return "";
-  if (thread.value?.execution_status === "failed")
-    return `上次研究失败：${thread.value.execution_error}`;
-  if (thread.value?.execution_status === "interrupted")
-    return `上次研究已中断：${thread.value.execution_error}`;
-  return "";
-});
+const {
+  draft, sending, currentRun, displayedMessages, pendingText, conversationEntries,
+  executionError, pollError, executionLabel,
+  send, loadHistory, reconcileThread, reconcileWorkspace,
+} = useResearchRuns({ workspace, thread, refreshResearch });
 const sidebarOpen = ref(false);
 const messageEnd = ref(null);
 const modal = ref(null);
@@ -159,21 +82,6 @@ function rememberSelection() {
   window.history.replaceState(null, "", url);
 }
 
-function reconcileRun(detail) {
-  const run = runs[detail.id];
-  if (run && run.userMessageId == null) {
-    run.userMessageId = detail.messages.filter((message) => message.role === "user")[run.userMessageCount]?.id ?? null;
-  }
-  if (!run || (!run.reconciling && run.status !== "disconnected")) return;
-  run.reconciling = false;
-  if (run.status === "disconnected" &&
-      detail.messages.filter((item) => item.role === "user").length > run.userMessageCount &&
-      ["succeeded", "failed", "interrupted"].includes(detail.execution_status)) {
-    run.status = detail.execution_status;
-    run.error = detail.execution_status === "succeeded" ? "" : detail.execution_error;
-  }
-}
-
 async function loadSelection(id, threadId) {
   const version = ++selectionVersion;
   loading.value = true;
@@ -189,46 +97,12 @@ async function loadSelection(id, threadId) {
     const selectedThread = selected
       ? await request(`/workspaces/${id}/threads/${selected.id}`)
       : null;
-    const records = selectedThread && !runs[selectedThread.id]
-      ? await request(`/workspaces/${id}/threads/${selectedThread.id}/runs`)
-      : null;
-    const recordedQuestions = new Set(records?.map((record) => record.user_message_id));
-    const missingQuestions = records !== null && selectedThread.messages.some((message) =>
-      message.role === "user" && !recordedQuestions.has(message.id));
-    const history = missingQuestions && !legacyHistory[selectedThread.id]
-      ? await request(`/workspaces/${id}/threads/${selectedThread.id}/history`)
-      : null;
+    if (selectedThread) await loadHistory(id, selectedThread);
     if (version !== selectionVersion) return;
-    if (history) {
-      if (history.thread_id !== selectedThread.id) throw new Error("研究历史归属不匹配。");
-      legacyHistory[selectedThread.id] = history.turns
-        .filter((turn) => !recordedQuestions.has(turn.user_message_id))
-        .map((turn) => {
-          const start = selectedThread.messages.findIndex((message) => message.id === turn.user_message_id);
-          const following = selectedThread.messages.slice(start + 1);
-          const nextQuestion = following.findIndex((message) => message.role === "user");
-          const savedAnswers = (nextQuestion === -1 ? following : following.slice(0, nextQuestion))
-            .filter((message) => message.role === "assistant");
-          const usedAnswers = new Set();
-          const state = { userMessageId: turn.user_message_id, legacy: true, status: "historical", pending: false, items: [] };
-          for (const event of turn.events) applyRunEvent(id, selectedThread.id, state, event);
-          // Early saved answers have no model ID; match exact text only within this question.
-          for (const item of state.items.filter((item) => item.type === "text")) {
-            const saved = savedAnswers.find((message) => !usedAnswers.has(message.id) &&
-              (message.model_message_id === item.id || (!message.model_message_id && message.content === item.text)));
-            if (saved) {
-              item.savedMessageId = saved.id;
-              usedAnswers.add(saved.id);
-            }
-          }
-          return state;
-        });
-    }
     workspace.value = detail;
     thread.value = selectedThread;
-    if (selectedThread) reconcileRun(selectedThread);
+    if (selectedThread) reconcileThread(selectedThread);
     rememberSelection();
-    if (records?.length) restoreRunHistory(id, selectedThread, records);
   } catch (err) {
     if (version === selectionVersion) throw err;
   } finally {
@@ -287,15 +161,12 @@ async function refreshResearch(workspaceId = workspace.value.id) {
   if (selection !== selectionVersion || version !== refreshVersion) return;
   if (results[0].status === "fulfilled") {
     workspace.value = results[0].value;
-    // Non-selected threads are observed through the workspace status list.
-    for (const item of workspace.value.threads) {
-      if (item.id !== threadId && runs[item.id]) runs[item.id].reconciling = false;
-    }
+    reconcileWorkspace(workspace.value, threadId);
   }
   if (results[1].status === "fulfilled") workspaces.value = results[1].value;
   if (threadId && results[2].status === "fulfilled") {
     thread.value = results[2].value;
-    reconcileRun(thread.value);
+    reconcileThread(thread.value);
   }
   const failures = results.filter((result) => result.status === "rejected");
   if (failures.length)
@@ -315,238 +186,10 @@ async function refresh() {
   }
 }
 
-async function restoreRunHistory(workspaceId, detail, records) {
-  const restored = records.map((record) => {
-    const questionIndex = detail.messages.findIndex((message) => message.id === record.user_message_id);
-    const question = detail.messages[questionIndex];
-    return {
-      pending: true,
-      content: question?.content || "",
-      createdAt: record.started_at,
-      userMessageId: record.user_message_id,
-      userMessageCount: (questionIndex === -1 ? detail.messages : detail.messages.slice(0, questionIndex))
-        .filter((message) => message.role === "user").length,
-      error: "",
-      status: record.status,
-      runId: record.id,
-      lastEventId: null,
-      items: [],
-      answer: null,
-      reconciling: false,
-    };
-  });
-  runHistory[detail.id] = restored.slice(0, -1);
-  runs[detail.id] = restored.at(-1);
-  // Rebuild empty page state from the start; keep each run's cursor separate.
-  for (let index = 0; index < restored.length; index += 1) {
-    if (disposed) return;
-    const run = index === restored.length - 1 ? runs[detail.id] : runHistory[detail.id][index];
-    if (run.status === "running") {
-      await followRun(workspaceId, detail.id, run, true);
-    } else {
-      const controller = new AbortController();
-      connections.add(controller);
-      try {
-        const history = await request(
-          `/workspaces/${workspaceId}/threads/${detail.id}/runs/${run.runId}/history`,
-          { signal: controller.signal },
-        );
-        if (history.run.id !== run.runId || history.run.thread_id !== detail.id)
-          throw new Error("研究历史归属不匹配。");
-        for (const event of history.events) applyRunEvent(workspaceId, detail.id, run, event);
-        run.status = history.run.status;
-        run.error = history.run.error || "";
-      } catch (err) {
-        if (disposed) return;
-        run.error = `读取研究历史失败：${err.message}`;
-      } finally {
-        connections.delete(controller);
-        run.pending = false;
-      }
-    }
-  }
-}
-
 async function sendMessage() {
   if (busy.value || sending.value || !draft.value.trim() || !thread.value) return;
-  const workspaceId = workspace.value.id;
-  const threadId = thread.value.id;
-  if (runs[threadId]) {
-    (runHistory[threadId] ||= []).push(runs[threadId]);
-  }
-  runs[threadId] = {
-    pending: true,
-    content: draft.value.trim(),
-    createdAt: new Date().toISOString(),
-    userMessageCount: thread.value.messages.filter((item) => item.role === "user")
-      .length,
-    error: "",
-    status: "connecting",
-    runId: null,
-    lastEventId: null,
-    items: [],
-    answer: null,
-    reconciling: false,
-  };
-  await followRun(workspaceId, threadId, runs[threadId], false);
+  await send(workspace.value.id, thread.value, draft.value.trim());
 }
-
-function applyRunEvent(workspaceId, threadId, run, event, eventId = null) {
-  switch (event.type) {
-    case "started":
-      if (event.workspace_id !== workspaceId || event.thread_id !== threadId)
-        throw new Error("研究事件归属不匹配。");
-      run.status = "running";
-      run.runId = event.run_id;
-      break;
-    case "assistant_message":
-    case "text_delta": {
-      let item = run.items.find((item) => item.type === "text" && item.id === event.message_id);
-      if (!item) {
-        run.items.push({ type: "text", id: event.message_id, text: "" });
-        item = run.items.at(-1);
-      }
-      if (event.type === "text_delta") item.text += event.text;
-      else {
-        item.text = event.text;
-        for (const call of event.tool_calls) {
-          run.items.push({
-            type: "tool", id: call.id, toolCallId: call.id,
-            name: call.name, args: call.args, status: "running",
-          });
-        }
-      }
-      break;
-    }
-    case "tool_start":
-      run.items.push({ type: "tool", id: event.tool_run_id, toolCallId: event.tool_call_id, name: event.name, status: "running" });
-      break;
-    case "tool_result":
-    case "tool_end":
-    case "tool_error": {
-      const item = run.items.find((item) => item.type === "tool" &&
-        (event.tool_call_id ? item.toolCallId === event.tool_call_id : item.id === event.tool_run_id));
-      item.status = event.type === "tool_error" || event.status === "error" ? "error" : "returned";
-      item.error = event.error;
-      item.content = event.content;
-      break;
-    }
-    case "succeeded":
-      run.status = "succeeded";
-      run.answer = event.message;
-      break;
-    case "failed":
-      run.status = "failed";
-      run.error = `研究失败：${event.error || "后端执行失败"} 请核对消息记录后再决定是否重发。`;
-      break;
-    case "run_finished":
-      if (event.run_id !== run.runId) throw new Error("研究事件归属不匹配。");
-      run.status = event.status;
-      run.error = event.status === "succeeded" ? "" : event.error;
-      break;
-    default:
-      throw new Error(`无法识别研究事件：${event.type}`);
-  }
-  if (run.status === "reconnecting") {
-    run.status = "running";
-    run.error = "";
-  }
-  // Advance only after the event has been applied to this run.
-  if (eventId !== null) run.lastEventId = eventId;
-}
-
-async function followRun(workspaceId, threadId, run, recovering) {
-  const controller = new AbortController();
-  connections.add(controller);
-  const applyEvent = (event, eventId) => applyRunEvent(workspaceId, threadId, run, event, eventId);
-  try {
-    let resume = recovering;
-    while (true) {
-      try {
-        if (resume) {
-          await replayRequest(
-            `/workspaces/${workspaceId}/threads/${threadId}/runs/${run.runId}/events`,
-            run.lastEventId || "0-0", applyEvent, controller.signal,
-          );
-        } else {
-          await streamRequest(
-            `/workspaces/${workspaceId}/threads/${threadId}/messages/stream`,
-            { content: run.content }, applyEvent, controller.signal,
-          );
-        }
-        break;
-      } catch (err) {
-        if (disposed || !(err instanceof StreamDisconnectedError) || !run.runId) throw err;
-        run.status = "reconnecting";
-        run.error = "连接已中断，正在恢复本轮研究输出。";
-        // Retry only the existing run's GET stream, never the question POST.
-        resume = true;
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        if (disposed) return;
-      }
-    }
-    if (run.status === "succeeded") {
-      run.error = "";
-      if (!recovering) drafts[threadId] = "";
-    }
-  } catch (err) {
-    if (disposed) return;
-    run.status = err.status ? "rejected" : "disconnected";
-    run.reconciling = true;
-    const detail = err.status ? err.message : `事件连接中断，研究可能仍在后台进行。${err.message}`;
-    run.error = `${detail} 请先核对消息记录；重新发送会发起新的请求。`;
-  } finally {
-    connections.delete(controller);
-  }
-  if (disposed) return;
-  try {
-    if (run === runs[threadId]) await refreshResearch(workspaceId);
-  } catch (err) {
-    run.error += `${run.error ? " " : ""}刷新记录失败：${err.message}`;
-  } finally {
-    run.pending = false;
-  }
-}
-
-function executionLabel(item) {
-  const status = runs[item.id]?.pending
-    ? "running"
-    : thread.value?.id === item.id
-      ? thread.value.execution_status
-      : item.execution_status;
-  return {
-    running: "研究中", succeeded: "已完成", failed: "失败", interrupted: "已中断",
-  }[status];
-}
-
-watch(
-  () => workspace.value && (
-    sending.value || workspace.value.threads.some((item) =>
-      item.execution_status === "running" || runs[item.id]?.pending || runs[item.id]?.reconciling,
-    )
-  ) ? workspace.value.id : null,
-  (workspaceId, _, onCleanup) => {
-    pollError.value = "";
-    if (!workspaceId) return;
-    let active = true;
-    let timer;
-    onCleanup(() => {
-      active = false;
-      clearTimeout(timer);
-    });
-    async function poll() {
-      try {
-        await refreshResearch(workspaceId);
-        if (active) pollError.value = "";
-      } catch (err) {
-        if (active) pollError.value = `自动刷新失败：${err.message}`;
-      } finally {
-        if (active) timer = setTimeout(poll, 2000);
-      }
-    }
-    timer = setTimeout(poll, 2000);
-  },
-);
 
 async function openModal(kind) {
   sidebarOpen.value = false;
@@ -688,10 +331,6 @@ watch(
   },
 );
 onMounted(initialize);
-onBeforeUnmount(() => {
-  disposed = true;
-  for (const controller of connections) controller.abort();
-});
 </script>
 
 <template>
@@ -913,10 +552,10 @@ onBeforeUnmount(() => {
             </article>
             <p v-else-if="entry.type === 'run_error'" role="alert">{{ entry.error }}</p>
             <details v-else class="research-progress"
-              :open="!entry.run.legacy && entry.run.status !== 'succeeded'">
-              <summary>{{ entry.run.legacy ? '查看本轮研究过程' : entry.run.status === 'succeeded' ? '查看本轮研究过程' :
-                entry.run.status === 'failed' ? '研究过程（未完成）' :
-                entry.run.status === 'disconnected' ? '已收到的研究过程（连接中断）' : '研究过程' }}</summary>
+              :open="!entry.run.legacy && entry.run.executionStatus !== 'succeeded'">
+              <summary>{{ entry.run.legacy ? '查看本轮研究过程' : entry.run.executionStatus === 'succeeded' ? '查看本轮研究过程' :
+                entry.run.executionStatus === 'failed' ? '研究过程（未完成）' :
+                entry.run.connectionStatus === 'disconnected' ? '已收到的研究过程（连接中断）' : '研究过程' }}</summary>
               <div v-for="item in entry.items" :key="`${item.type}:${item.id}`" class="progress-item">
                 <MarkdownContent v-if="item.type === 'text'" :content="item.text" />
                 <div v-else class="tool-event" :class="item.status">

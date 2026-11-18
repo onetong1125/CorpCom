@@ -8,7 +8,8 @@ from langchain.tools import tool
 from langchain_core.tools import BaseTool, ToolException
 
 from corpcom.function_catalog import FUNCTIONS
-from corpcom.workspace import ArtifactRegistrationError, WorkspaceStore
+from corpcom.errors import ArtifactRegistrationError
+from corpcom.workspace import WorkspaceStore
 from corpcom.workspace_models import WorkspaceResearchInfo
 from corpcom.workspace_file_tools import create_file_tools
 from corpcom.sandbox import run_python, run_bash

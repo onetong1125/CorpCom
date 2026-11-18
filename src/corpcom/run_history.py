@@ -1,6 +1,6 @@
 """Select and project checkpoint messages for research history."""
 
-from collections.abc import Sequence
+from collections.abc import Sequence, Mapping
 from pathlib import Path
 
 from langchain_core.messages import (
@@ -12,6 +12,7 @@ from redis import Redis
 
 from corpcom.run_events import RunEventStream
 from corpcom.workspace import WorkspaceStore
+from corpcom.event_types import CheckpointEvent
 
 
 def read_thread_messages(
@@ -100,9 +101,9 @@ def read_run_messages(
 
 def project_run_messages(
     messages: Sequence[BaseMessage],
-) -> list[dict[str, object]]:
+) -> list[CheckpointEvent]:
     """Project complete messages"""
-    events = []
+    events: list[CheckpointEvent] = []
 
     for message in messages:
         if isinstance(message, AIMessage):
@@ -152,11 +153,12 @@ def project_archived_events(
     return projected
 
 def merge_run_history(
-    checkpoint_events: Sequence[dict[str, object]],
+    checkpoint_events: Sequence[CheckpointEvent],
     archived_events: Sequence[dict[str, object]],
-) -> list[dict[str, object]]:
+) -> list[Mapping[str, object]]:
     """Prefer checkpoint messages and append uncheckpointed events."""
-    merged = list(checkpoint_events)
+    merged: list[Mapping[str, object]]\
+        = list(checkpoint_events)
 
     assistant_ids = {
         event["message_id"]

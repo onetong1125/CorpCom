@@ -1,16 +1,18 @@
 """Store research in workspace JSON, with conversations and file indexes in SQLite."""
 
 import json
-from pathlib import Path
-import shutil
 import sqlite3
-from uuid import uuid4
+from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 from pydantic import JsonValue
 
+from corpcom.artifacts import ArtifactStore
+from corpcom.errors import RecordNotFoundError
+from corpcom.event_types import RunProgressEvent
 from corpcom.workspace_models import (
-  Artifact, ArtifactFile, Message, Thread, ThreadDetail,
+  ArtifactFile, Message, Thread, ThreadDetail,
   Workspace, WorkspaceDetail, WorkspaceResearchInfo, WorkspaceSummary,
   ResearchRun, ResearchRunSummary
 )
@@ -89,14 +91,6 @@ CREATE TABLE IF NOT EXISTS artifacts (
 """
 
 
-class RecordNotFoundError(ValueError):
-  """A requested record does not exist within the supplied workspace."""
-
-
-class ArtifactRegistrationError(ValueError):
-  """A supplied file or kind cannot be registered as a workspace artifact."""
-
-
 class ThreadBusyError(ValueError):
   """The thread already has an execution in progress."""
 
@@ -129,6 +123,7 @@ class WorkspaceStore:
     # Enable foreign keys per connection to reject references to missing parents.
     self.db.execute("PRAGMA foreign_keys = ON")
     self.db.executescript(SCHEMA)
+    self.artifacts = ArtifactStore(self.db, self.root, self._touch)
 
   def __enter__(self):
     return self
@@ -210,10 +205,7 @@ class WorkspaceStore:
         "SELECT * FROM threads WHERE workspace_id = ? ORDER BY rowid",
         (workspace_id,)
     )]
-    artifacts = [Artifact.model_validate(dict(row)) for row in self.db.execute(
-        "SELECT * FROM artifacts WHERE workspace_id = ? ORDER BY rowid",
-        (workspace_id,)
-    )]
+    artifacts = self.artifacts.list_for_workspace(workspace_id)
     return WorkspaceDetail(**workspace.model_dump(), threads=threads,
                            artifacts=artifacts)
 
@@ -334,33 +326,9 @@ class WorkspaceStore:
   def import_file(self, workspace_id: str, source: Path,
       kind: str) -> ArtifactFile:
     """Copy and index a file; separate imports preserve copies with the same name."""
-    self.get_workspace(workspace_id)
+    workspace = self.get_workspace(workspace_id)
     _require_text(kind=kind)
-    source = source.resolve(strict=True)
-    if not source.is_file():
-      raise ValueError(f"source must be a file: {source}")
-    artifact_id = uuid4().hex
-    # Workspace and artifact IDs select the directory; retain the familiar filename.
-    directory = self.root / "workspaces" / workspace_id / "files" / artifact_id
-    directory.mkdir(parents=True)
-    destination = directory / source.name
-    try:
-      with self.db:
-        shutil.copyfile(source, destination)
-        self.db.execute(
-            """INSERT INTO artifacts (id, workspace_id, name, kind, relative_path)
-               VALUES (?, ?, ?, ?, ?)""",
-            (artifact_id, workspace_id, source.name, kind,
-             # Relative paths keep files locatable when the whole data directory moves.
-             destination.relative_to(self.root).as_posix()),
-        )
-        self._touch(workspace_id)
-    except (OSError, sqlite3.Error):
-      # fixme File writes are outside SQLite transactions; clean up this failed copy separately.
-      # This handles file/database errors, but does not guarantee atomicity on process kill.
-      shutil.rmtree(directory)
-      raise
-    return self.get_file(workspace_id, artifact_id)
+    return self.artifacts.import_file(workspace, source, kind)
 
   def register_run_file(
       self, workspace_id: str, run_dir: Path, output_path: Path, kind: str,
@@ -375,174 +343,30 @@ class WorkspaceStore:
       outputs: list[tuple[Path, str]],
   ) -> list[ArtifactFile]:
     """Index a batch of run outputs in one database transaction."""
-    self.get_workspace(workspace_id)
-
-    run_dir = run_dir.resolve(strict=True)
-    runs_root = self.root / "workspaces" / workspace_id / "runs"
-    if run_dir.parent != runs_root:
-      raise ValueError("run directory must belong to this workspace")
-
-    artifacts = []
-    with self.db:
-      for output_path, kind in outputs:
-        _require_text(kind=kind)
-        if output_path.is_absolute():
-          raise ValueError(
-              "output path must be relative to the run directory"
-          )
-
-        source = (run_dir / output_path).resolve(strict=True)
-        if not source.is_relative_to(run_dir):
-          raise ValueError(
-              "output path must stay within the run directory"
-          )
-        if not source.is_file():
-          raise ValueError(f"output must be a file: {source}")
-
-        artifact_id = uuid4().hex
-        self.db.execute(
-            """INSERT INTO artifacts
-                   (id, workspace_id, name, kind, relative_path)
-               VALUES (?, ?, ?, ?, ?)""",
-            (
-              artifact_id, workspace_id, source.name, kind,
-              source.relative_to(self.root).as_posix(),
-            ),
-        )
-        artifacts.append(
-            self.get_file(workspace_id, artifact_id)
-        )
-
-      if artifacts:
-        self._touch(workspace_id)
-
-    return artifacts
+    workspace = self.get_workspace(workspace_id)
+    return self.artifacts.register_run_files(
+        workspace, run_dir, outputs,
+    )
 
   def archive_run_files(
       self, workspace_id: str, run_dir: Path,
       outputs: list[tuple[Path, str]], *, archive_path: Path,
   ) -> list[ArtifactFile]:
     """Copy selected outputs into a new task directory and index one batch."""
-    self.get_workspace(workspace_id)
-    workspace_root = self.root / "workspaces" / workspace_id
-    run_dir = run_dir.resolve(strict=True)
-    if run_dir.parent != workspace_root / ".runs":
-      raise ValueError("run directory must belong to this workspace")
+    workspace = self.get_workspace(workspace_id)
 
-    if (
-        archive_path.is_absolute()
-        or not archive_path.parts
-        or ".." in archive_path.parts
-    ):
-      raise ValueError("archive path must be a non-empty relative task path")
-
-    tasks_root = workspace_root / "tasks"
-    directory = (tasks_root / archive_path).resolve()
-    if directory == tasks_root or not directory.is_relative_to(tasks_root):
-      raise ValueError(
-          "archive path must stay within the workspace tasks directory"
-      )
-
-    selected = []
-    seen = set()
-    for output_path, kind in outputs:
-      _require_text(kind=kind)
-      if output_path.is_absolute():
-        raise ValueError("output path must be relative to the run directory")
-
-      source = (run_dir / output_path).resolve(strict=True)
-      if not source.is_relative_to(run_dir):
-        raise ValueError("output path must stay within the run directory")
-      if not source.is_file():
-        raise ValueError(f"output must be a file: {source}")
-      if source in seen:
-        raise ValueError(f"duplicate output file: {output_path}")
-
-      seen.add(source)
-      selected.append((source, kind))
-
-    if not selected:
-      return []
-
-    # Create exclusively, so cleanup can only remove this batch's directory.
-    directory.mkdir(parents=True)
-    artifacts = []
-    try:
-      with self.db:
-        for source, kind in selected:
-          destination = directory / source.relative_to(run_dir)
-          destination.parent.mkdir(parents=True, exist_ok=True)
-          shutil.copyfile(source, destination)
-
-          artifact_id = uuid4().hex
-          self.db.execute(
-              """INSERT INTO artifacts
-                     (id, workspace_id, name, kind, relative_path)
-                 VALUES (?, ?, ?, ?, ?)""",
-              (
-                artifact_id, workspace_id, destination.name, kind,
-                destination.relative_to(self.root).as_posix(),
-              ),
-          )
-          artifacts.append(self.get_file(workspace_id, artifact_id))
-
-        self._touch(workspace_id)
-    except (OSError, sqlite3.Error):
-      # SQLite rolls back rows; remove this batch's copies and propagate the error.
-      shutil.rmtree(directory)
-      raise
-
-    return artifacts
+    return self.artifacts.archive_run_files(
+        workspace, run_dir, outputs, archive_path=archive_path)
 
   def register_workspace_file(
       self, workspace_id: str, file_path: Path, kind: str,
   ) -> ArtifactFile:
     """Index an existing workspace file in place, reusing its existing record."""
-    self.get_workspace(workspace_id)
-    if not kind.strip():
-      raise ArtifactRegistrationError("kind must not be empty")
-    if file_path.is_absolute() or "\0" in str(file_path):
-      raise ArtifactRegistrationError("file_path must be relative to /workspace")
-    workspace_root = (self.root / "workspaces" / workspace_id).resolve()
-    source = (workspace_root / file_path).resolve()
-    if not source.is_relative_to(workspace_root):
-      raise ArtifactRegistrationError("file_path must stay within the current workspace")
-    if not source.is_file():
-      raise ArtifactRegistrationError("file_path must refer to an existing regular file")
-    relative_path = source.relative_to(self.root).as_posix()
-    # Serialize lookup and insert across connections to avoid duplicate registrations.
-    with self.db:
-      self.db.execute("BEGIN IMMEDIATE")
-      row = self.db.execute(
-          "SELECT id FROM artifacts WHERE workspace_id = ? AND relative_path = ?",
-          (workspace_id, relative_path),
-      ).fetchone()
-      if row is not None:
-        artifact_id = row["id"]
-      else:
-        artifact_id = uuid4().hex
-        self.db.execute(
-            """INSERT INTO artifacts (id, workspace_id, name, kind, relative_path)
-               VALUES (?, ?, ?, ?, ?)""",
-            (artifact_id, workspace_id, source.name, kind, relative_path),
-        )
-        self._touch(workspace_id)
-    return self.get_file(workspace_id, artifact_id)
+    workspace = self.get_workspace(workspace_id)
+    return self.artifacts.register_workspace_file(workspace, file_path, kind)
 
   def get_file(self, workspace_id: str, artifact_id: str) -> ArtifactFile:
-    """Check ownership and return file metadata and an absolute path, without reading contents."""
-    row = self.db.execute(
-        "SELECT * FROM artifacts WHERE workspace_id = ? AND id = ?",
-        (workspace_id, artifact_id),
-    ).fetchone()
-    if row is None:
-      raise RecordNotFoundError(f"file not found in workspace: {artifact_id}")
-    artifact = dict(row)
-    path = self.root / artifact["relative_path"]
-    # An index row does not guarantee the file still exists after manual deletion.
-    if not path.is_file():
-      raise FileNotFoundError(f"stored file is missing: {path}")
-    return ArtifactFile(**artifact, path=path)
+    return self.artifacts.get_file(workspace_id, artifact_id)
 
   def get_research_run(
       self,
@@ -645,7 +469,7 @@ class WorkspaceStore:
       *,
       status: Literal["succeeded", "failed"],
       error: str | None = None,
-      sse_events: list[dict[str, JsonValue]] | None = None,
+      sse_events: list[RunProgressEvent] | None = None,
   ) -> Thread:
     self._thread(workspace_id, thread_id)
     # serialize events
@@ -708,7 +532,7 @@ class WorkspaceStore:
       answer: str,
       *,
       model_message_id: str | None = None,
-      sse_events: list[dict[str, JsonValue]] | None = None,
+      sse_events: list[RunProgressEvent] | None = None,
   ) -> Message:
     self._thread(workspace_id, thread_id)
     _require_text(content=answer)
