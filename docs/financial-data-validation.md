@@ -1,5 +1,4 @@
 # 经营数据接口实测记录
-前面的探针实测与验收记录对应 2026-10-06；2026-10-21 的可调用函数与测试验收见文末。
 
 ## 结论
 
@@ -62,17 +61,8 @@ uv run python examples/probe_fundamentals.py
 1. 同花顺 `stock_financial_abstract_new_ths` 和新浪 `stock_financial_abstract` 本次都能获取两家公司摘要，但其中“营业总收入”不能映射成“营业收入”。茅台 2024 年两者相差约 32.45 亿元；正式字段优先取新浪三大报表。
 2. 新浪返回的茅台 2024 年行 `公告日期=20260417`，五粮液对应行 `公告日期=20260430`，而更新日期分别在 2025-04-02 和 2025-04-25。这些上游字段不能证明首次披露时间。探针保留原值，并明确 `first_publication_verified=false`，不擅自修正日期或推断原因。
 3. 当前接口可能返回经过后续更新的历史数值。要演示严格历史回放，还需验证原始公告时间和数据版本；对历史年度获取成功不等于完成了该验证。
-4. 本次只验证宿主机数据链路。经营数据尚未加入 Docker 工具、Agent 提示词或生产报告；新闻接口、定时任务也未验证。
-5. 首次受限执行环境因 DNS 失败而未能访问；允许外部网络后的实际请求成功。这是执行环境限制，不构成接口字段不可用的证据。普通本地终端仍需要能访问新浪财经。
 
-## 验收记录
-
-- 可复跑探针：四次实际请求成功，保存四份返回表和一份摘要，进程退出码 0。
-- 年报对账：12 个金额到分一致；6 个同比到百分数两位小数一致。
-- 静态检查：脚本编译通过；本批变更通过 `git diff --check`。
-- 产品设计：见 [研究案例、报告与 Workspace](research-workspace.md)。以上数据验证通过后，下一批可以开始 Workspace 持久化；历史回放的时间与版本核验仍为后续独立验收项。
-
-## 可调用年度经营数据函数与验收（2026-10-21）
+## 年度经营数据函数
 
 已从探针提取 `src/corpcom/fundamentals.py` 中的年度经营数据函数：
 
@@ -86,7 +76,7 @@ result = get_annual_financials("sh600519", [2023, 2024])
 
 返回值为可序列化为 JSON 的字典。`statements` 按报表和报告期组织记录，金额位于 `amounts_yuan`，使用人民币元、两位小数字符串。结果保留来源链接、AKShare 版本、UTC 抓取开始时间、上游公告日期和更新日期，以及合并年度累计口径。
 
-函数不计算同比、不保存文件；文件保存由调用方负责。首次披露时间仍未核验，`first_publication_verified` 为 `false`。当前函数不含请求时限控制，也尚未接入 Workspace Agent 或 Docker PTC。
+函数不计算同比、不保存文件；文件保存由调用方负责。首次披露时间仍未核验，`first_publication_verified` 为 `false`。该函数已注册到 Agent 的函数目录，可在 Docker 沙箱中调用。
 
 非法参数、缺失或重复年度、币种或合并口径不符、非有限金额会明确报错；无法解析的金额和请求异常继续向上传播。
 
@@ -95,106 +85,35 @@ result = get_annual_financials("sh600519", [2023, 2024])
 在项目根目录执行。单元测试使用模拟报表，不联网：
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -p 'test_fundamentals.py' -v
+uv run python -m unittest discover -s tests -p 'test_fundamentals.py' -v
 ```
 
 真实接口测试默认跳过，显式启用后请求两家公司，并对照已有年报基准核对 12 个金额：
 
 ```bash
-CORPCOM_LIVE_TESTS=1 .venv/bin/python -m unittest discover -s tests -p 'test_fundamentals_live.py' -v
+CORPCOM_LIVE_TESTS=1 uv run python -m unittest discover -s tests -p 'test_fundamentals_live.py' -v
 ```
 
 启用后，网络异常或金额不一致会使测试失败，不会自动跳过。测试不重新下载原始年报；基准来自本文关联的资料核查记录。2023、2024 年为固定验收样本，不代表当前最新数据。
 
-默认全量回归：
+## 在 Docker 中复跑
 
-```bash
-env -u CORPCOM_LIVE_TESTS .venv/bin/python -m unittest discover -s tests -v
-```
-
-### 本次验收结果
-
-- 6 项单元测试通过，覆盖正常返回、来源与时间、非法参数、年度缺失或重复、口径错误、非法金额及请求异常传播。
-- 真实接口测试由开发者本地显式启用并确认通过，两家公司共 12 个金额与已有年报基准一致。
-- 默认全量回归发现 29 项测试：28 项通过，1 项真实接口测试按预期跳过。
-- `git diff --check` 通过。
-
-## Docker 固定脚本验收（2026-10-21）
-
-沙箱镜像已包含 `corpcom.fundamentals`。固定脚本
-`examples/fixed_fundamentals.py` 在容器内调用年度经营数据函数，
-保存两家公司的完整函数返回值，并通过 `result.json` 返回文件索引。
-
-在项目根目录执行：
+在仓库根目录构建沙箱镜像，再运行固定脚本：
 
 ```bash
 docker build -f Dockerfile.sandbox -t corpcom-sandbox:local .
-.venv/bin/python -m corpcom.sandbox examples/fixed_fundamentals.py
+uv run corpcom-sandbox examples/fixed_fundamentals.py
 ```
 
-本次运行目录为 `runs/8636c703e841451ea9ae53a5796bd1e4/`，
-包含 `analysis.py`、`result.json` 及两家公司的年度数据 JSON。
+独立沙箱命令将脚本、`result.json` 和生成的数据保存在 `runs/<执行编号>/`。行情也有固定脚本和模型生成脚本两种入口：
 
-验收结果：
-- 两家公司各四条报表记录，2023/2024 年共 12 个金额与已有年报基准一致。
-- 来源、时间、单位及合并口径完整；容器内 AKShare 版本为 1.19.1。
-- `result.json` 为 462 字节，文件索引与宿主机落盘文件一致。
-- 数据文件保存的是函数整理后的返回值，不是上游原始报表。
+```bash
+uv run corpcom-sandbox examples/fixed_compare.py
+uv run corpcom-ptc 600519 000858 2025-01-01 2025-03-31
+```
 
-本次通过固定脚本验证了 Docker 内取数和宿主机文件保存；
-模型生成经营分析代码、Workspace Agent 调用及产物登记截至该次验收时尚未接入。
+## 已记录的端到端样本
 
-## Workspace Agent 函数发现与沙箱验收（2026-10-22）
+2026-10-21 的固定脚本在容器内获取了两家公司的年度数据，12 个金额与年报基准一致。2026-10-22 的真实模型验收覆盖了先读取函数契约，再执行年度财务、日频行情及组合查询。茅台 2024 年营业收入同比为 15.71%；行情样本返回 2025-01-02 至 2025-03-31 共 57 条记录，未做跨来源行情对账。
 
-Workspace Agent 已接入 execute_python。运行目录位于
-data_dir/workspaces/<workspace_id>/runs/<run_id>/，
-执行结果返回计算摘要，不向模型暴露宿主机 run_dir。
-
-函数发现采用：
-在系统提示词中函数简表预先可见 → read_function_doc 按需读取完整契约 →
-在 Docker 中导入执行。
-
-function_catalog 显式注册年度财务与日频行情函数。
-简表来自函数 docstring 首段；完整契约包含实际导入语句、
-函数签名和完整 docstring。读取契约不执行数据函数，
-未知函数 ID 返回明确错误及可用 ID 列表。
-
-### 真实模型验收
-
-本轮使用重建后的 corpcom-sandbox:local 镜像。
-
-- 纯概念问题：开发者运行确认直接回答，没有调用工具。
-- 年度财务：仅读取财务契约，随后单次执行。
-  茅台 2023/2024 年六个金额与已有年报基准一致，
-  营业收入同比为 15.71%，完整函数返回数据已保存。
-- 日频行情：仅读取行情契约，随后单次执行。
-  使用无交易所前缀的六位代码，排序后取首末记录。
-  本次返回 57 条记录，实际区间为 2025-01-02 至 2025-03-31，
-  首末前复权收盘价为 1408.42、1481.42 元，涨幅为 5.18%。
-  JSON、CSV 和计算摘要一致；未另做跨来源行情对账。
-- 能力边界：模型曾错误承诺支持后复权查询；
-  同会话追问后纠正承诺，明确当前函数不支持，
-  没有新增工具调用或沙箱执行。
-- 组合查询：先读取两个契约，再在一次执行中完成两类取数和计算。
-  两份完整数据均已保存，回答中的 57 个日期及价格与保存数据一致，
-  result.json 为 6208 字节，低于 16 KiB 限制。
-
-### 自动测试
-
-新增三项测试，覆盖：
-- 读取注册函数的真实契约，且不执行函数；
-- 未知函数 ID 的明确错误返回；
-- 简表只包含函数 ID 和 docstring 首段，且不执行函数。
-
-默认全量回归共 32 项：31 项通过，
-1 项真实财务接口测试按预期跳过；git diff --check 通过。
-
-### 当前边界
-
-- 执行前读取契约由提示词要求，尚无运行时强制检查。
-- 当前测试样本通过，不代表模型始终遵守选择规则。
-- 模型曾额外读取无关契约；明确工具描述后，本轮单函数验收通过。
-- 执行产物尚未自动登记为 Workspace Artifact。
-- 回答中额外延伸的金融解释未全部核验，
-  不能把工具执行成功等同于整段回答正确。
-- 本批尚未验证上下文压缩收益或长期稳定性。
+Workspace 中的 Python 工具将声明的输出复制到任务目录并登记，文件可以通过前端或 HTTP 接口读取。[Workspace 存储与执行](workspace-local.md)

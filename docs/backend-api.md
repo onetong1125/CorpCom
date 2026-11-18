@@ -2,28 +2,13 @@
 
 后端通过 FastAPI 暴露 Workspace、会话、文件和 Agent 对话，前端直接发送 HTTP 请求。研究状态与问答由 SQLite 和文件目录保存，由 `RunCoordinator` 管理准入、Agent 执行和终态保存。存储结构、Agent 执行流程与自动验收见 [本地存储说明](workspace-local.md)。
 
-## 启动
+## 服务配置
 
-在项目根目录执行：
+按[快速开始](../README.md#快速开始)启动服务后，可查看 [Swagger UI](http://127.0.0.1:8001/docs) 或 [OpenAPI 定义](http://127.0.0.1:8001/openapi.json)。健康检查 `GET /health` 返回 `{"status":"ok"}`。
 
-```bash
-uv sync
-# .env 中设置 CORPCOM_REDIS_URL=redis://127.0.0.1:6380/0
-docker compose up -d redis
-uv run uvicorn corpcom.api:create_app --factory --host 127.0.0.1 --port 8001
-```
+开发服务使用一个 Uvicorn worker。同一 Thread 同时只接受一轮研究，整个进程最多执行两轮，额度用完时立即返回 503。未配置模型时仍可操作研究空间、会话和文件，发送消息返回 503。
 
-- 交互接口文档：<http://127.0.0.1:8001/docs>
-- OpenAPI 定义：<http://127.0.0.1:8001/openapi.json>
-- 服务健康检查：`GET /health`，返回 `{"status":"ok"}`。
-
-沿用项目 `.env` 的 `CORPCOM_MODEL`、`OPENAI_API_KEY` 和可选 `OPENAI_BASE_URL`。配置仅供后端使用。未配置模型时，研究、会话和文件接口仍可用，发送消息返回 `503`。
-
-默认数据目录为启动目录下的 `data/`，与现有 Workspace 数据兼容。可通过 `CORPCOM_DATA_DIR` 指定绝对路径。默认允许前端来源 `http://localhost:5173` 和 `http://127.0.0.1:5173`，其他端口通过逗号分隔的 `CORPCOM_CORS_ORIGINS` 配置。
-
-开发时可加 `--reload`；未启用时，Python 修改后需重启服务，新路由才会加载。Redis 地址通过 `CORPCOM_REDIS_URL` 配置，仓库 Compose 映射到本机 6380，使用 AOF `everysec` 和 `noeviction`。
-
-当前服务面向单用户本机开发，使用一个 Uvicorn worker。同 Thread 拒绝重叠执行，同 Workspace 不同 Thread 可并行，整个进程最多两轮；满额立即拒绝，不排队。Redis 不替代进程内执行额度管理，多 worker 协调尚未实现。
+Vite 开发服务代理 `/api`。浏览器直接跨域访问后端时，默认允许 `http://localhost:5173` 和 `http://127.0.0.1:5173`，其他来源通过逗号分隔的 `CORPCOM_CORS_ORIGINS` 配置。
 
 ## 接口清单
 
@@ -120,22 +105,6 @@ curl -X POST "http://127.0.0.1:8001/api/workspaces/$workspace_id/threads/$thread
 
 发送消息的成功响应是已保存的助手消息，字段为 `id`、`thread_id`、`model_message_id`、`role`、`content`、`tool_calls`、`created_at`。再次向同一地址发送新文本即可追问；重新获取 thread 详情可以恢复完整问答。
 
-前端调用示例：
-
-```javascript
-const response = await fetch(
-  `http://127.0.0.1:8001/api/workspaces/${workspaceId}/threads/${threadId}/messages`,
-  {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content: question }),
-  },
-);
-const payload = await response.json();
-if (!response.ok) throw new Error(JSON.stringify(payload.detail));
-console.log(payload.content);
-```
-
 ## 文件上传与下载
 
 ```bash
@@ -157,31 +126,6 @@ curl -X POST "http://127.0.0.1:8001/api/workspaces/$workspace_id/files" \
 
 SSE 开始后的执行失败通过 `failed` 事件返回，不能再改变已发送的 HTTP 状态码。HTTP 错误返回 `{"detail": ...}`；未处理的程序错误由服务器返回 500 并记录异常。请求失败后可读取 thread 查看已保存消息；当前没有请求去重或自动续跑，重新发送会新增一条用户消息。启动时仅将遗留 running 标记为 interrupted。
 
-同步的 SQLite 和模型调用在请求工作线程内执行，模型等待不会占用 HTTP 事件循环。每个路由在执行线程内创建和关闭自己的数据库连接；Agent 工具也各自建立连接。
+接口契约与历史恢复行为分别由 [HTTP 测试](../tests/test_api.py) 和 [Run 历史测试](../tests/test_run_history.py) 覆盖。
 
 工具执行中的普通 `Exception` 会被中间件记录，并转换为匹配调用 ID、`status="error"` 的 ToolMessage，让模型继续处理。框架控制流异常 `GraphBubbleUp` 和 Redis 基础设施错误继续抛出；模型错误由整轮失败收尾。两个数据库之间没有原子事务，当前不提供进程中断后的自动续跑，也不保证双库崩溃一致性。
-
-## 已验证
-
-2026-11-17：69 项 Workspace／API 后端测试、58 项前端测试及生产构建通过。后端历史选择、pending writes、投影与合并、SQLite 重开、Redis 分批回退和 HTTP 归属检查已用临时脚本验证，其中 Redis 使用 mock；这些历史专项仍待固化为仓库测试。前端回归已覆盖无 Run 旧会话、混合新旧轮次和侧栏首次切换加载历史。
-
-同日只读浏览器验收：真实旧会话 A3 可展开 `execute_bash` 参数及结果，结果含 `338350`；从侧栏切换到 A2 后也能展开历史工具结果。本次没有发起新模型请求，不等同于重新完成真实模型断网／进程崩溃全链路验收。
-
-
-2026-10-10 全部 18 项自动测试通过，包含 HTTP 创建与读取、偏好替换、文件上传下载、问答保存、重新创建应用后的恢复、Workspace 隔离、非法输入、模型错误、并发请求拒绝以及浏览器 CORS 预检。
-
-同日通过临时 Uvicorn 服务和现有真实模型接口验收：新会话读取旧会话与上传文件的随机标记，同会话第二轮准确承接上一轮信息；停止再启动服务后，四条问答消息和文件内容均能恢复。验收使用临时数据目录，测试服务已停止。
-
-2026-10-19 全部 22 项自动测试通过。另使用临时数据目录完成真实模型验收：调用不存在文件的 read_file 后，匹配的失败 ToolMessage 和最终回答写入 checkpoint；停止并重新启动服务后，同一 thread 能准确回忆上一轮标记、工具参数与失败结果，未再次调用工具。磁盘核对得到六条 Agent 消息和四条业务问答，无重复历史。
-
-2026-11-05 产物主动登记验收：`tests/test_register_artifact.py` 的 7 项测试通过，包括已有文件原地登记、重复与并发登记复用 ID、编辑后通过 `/content` 读取最新内容及跨 Workspace 访问拒绝；现有工具测试 6 项也通过，覆盖旧 Python 归档流程。
-
-同日用户确认真实模型与前端联动验收完成：模型写报告、调用 `register_artifact`、前端文件列表显示、预览和下载通过。该项为用户实测确认；此前的 HTTP 自动测试与脚本化模型测试分别记录，不替代页面验收。该次验收时 API 仍为 Workspace 互斥。M1—M3 的完整证据见 [本地验收记录](workspace-local.md#m1m3-验收记录2026-11-05)。
-
-2026-11-10 M4 后端执行协调已验收。全量回归：67 项中 66 通过、1 项真实金融接口测试按配置跳过，API 的 12 项测试全部通过。已验证同 Thread 冲突、同 Workspace 双 Thread 并行、跨 Workspace 共用两轮额度、满额拒绝不写数据、失败后额度复用、启动识别中断及终态保留。使用临时数据和脚本化模型，不作为前端或真实模型并发验收。
-
-Thread 响应新增 `execution_status`、`execution_started_at`、`execution_finished_at`、`execution_error`。未执行时均为空；状态取 running/succeeded/failed/interrupted，仅保留最近一轮。整体额度由应用启动时的 `RunCoordinator(..., max_concurrent_runs=2)` 设置，满额立即拒绝；整体满额检查先于 Thread 冲突检查。首版要求单进程运行。
-
-空 Workspace 并发首轮的重复初始化指令已修复：首条用户消息判断与消息插入在同一短事务内完成，并发回归确认只有首条用户消息触发初始化指令。验证记录和后续范围见 [本地执行协调器验收](workspace-local.md#m4-执行协调器与验收2026-11-10)。
-
-2026-11-10 M6 真实并发验收完成：用户通过页面验证两条研究共享容器、运行中上传、文件互读、失败隔离、刷新与重启中断恢复。修复缺失工具结果后，新建 C2 的恢复与下一轮续聊均成功；只读核对确认匹配的 ToolMessage 已保存、旧工具未重放、回答未重复，A/B 终态及共享容器 ID 保持不变。修复后的后端回归为 74 项中 73 通过、1 项按配置跳过；现场证据见 [M6 验收记录](workspace-local.md#m6-验收记录2026-11-10)。
