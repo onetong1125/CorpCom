@@ -6,6 +6,7 @@ from anyio import to_thread
 from redis import Redis
 
 from corpcom.run_events import RunEventStream
+from corpcom.event_types import RunFinishedEvent
 from corpcom.workspace import WorkspaceStore
 from corpcom.workspace_models import ResearchRun
 
@@ -55,12 +56,13 @@ async def replay_events(
 
       # A terminal state alone is insufficient: drain Redis first.
       if not batch and run.status != "running":
-        yield {
+        finished_event: RunFinishedEvent = {
           "type": "run_finished",
           "run_id": run.id,
           "status": run.status,
           "error": run.error,
         }
+        yield finished_event
         return
 
       run, batch = await to_thread.run_sync(

@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.errors import GraphBubbleUp
 
+from corpcom.event_types import ToolEvent, AgentEvent
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore
 from corpcom.workspace_prompt import build_workspace_prompt
 from corpcom.workspace_tools import create_workspace_tools
@@ -24,7 +25,7 @@ class ToolLogHandler(BaseCallbackHandler):
   raise_error = True
   def __init__(
       self,
-      on_event: Callable[[dict[str, object]], None] | None = None,
+      on_event: Callable[[ToolEvent], None] | None = None,
   ):
     self.on_event = on_event
 
@@ -129,7 +130,7 @@ def ask_workspace(
     store: WorkspaceStore, model: BaseChatModel,
     workspace_id: str, thread_id: str, question: str,
     checkpointer: BaseCheckpointSaver, *,
-    on_event: Callable[[dict[str, object]], None] | None = None,
+    on_event: Callable[[AgentEvent], None] | None = None,
 ) -> AIMessage:
   """Save the user's question and generate the answer."""
   logger.info("本轮开始 workspace=%s thread=%s", workspace_id, thread_id)

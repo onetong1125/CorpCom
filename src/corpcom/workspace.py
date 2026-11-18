@@ -14,6 +14,7 @@ from corpcom.workspace_models import (
   Workspace, WorkspaceDetail, WorkspaceResearchInfo, WorkspaceSummary,
   ResearchRun, ResearchRunSummary
 )
+from corpcom.event_types import RunProgressEvent
 
 # Threads and files belong to a workspace; messages belong through their thread.
 # Research fields live in research.json. Artifact rows index files on disk.
@@ -645,7 +646,7 @@ class WorkspaceStore:
       *,
       status: Literal["succeeded", "failed"],
       error: str | None = None,
-      sse_events: list[dict[str, JsonValue]] | None = None,
+      sse_events: list[RunProgressEvent] | None = None,
   ) -> Thread:
     self._thread(workspace_id, thread_id)
     # serialize events
@@ -708,7 +709,7 @@ class WorkspaceStore:
       answer: str,
       *,
       model_message_id: str | None = None,
-      sse_events: list[dict[str, JsonValue]] | None = None,
+      sse_events: list[RunProgressEvent] | None = None,
   ) -> Message:
     self._thread(workspace_id, thread_id)
     _require_text(content=answer)

@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -8,6 +8,7 @@ import asyncio
 from anyio.abc import TaskGroup
 from langchain_core.language_models import BaseChatModel
 
+from corpcom.event_types import RunEventSink
 from corpcom.run_coordinator import RunCoordinator, ExecutionCapacityError
 from corpcom.workspace import WorkspaceStore, RecordNotFoundError, \
   ThreadBusyError
@@ -22,7 +23,7 @@ def execute_research(
     thread_id: str,
     question: str,
     model: BaseChatModel,
-    on_event: Callable[[dict[str, object]], None],
+    on_event: RunEventSink,
 ) -> Message:
   with WorkspaceStore(root) as store:
     store.get_thread(workspace_id, thread_id)
@@ -39,7 +40,7 @@ async def run_research(
     thread_id: str,
     question: str,
     model: BaseChatModel,
-    publish: Callable[[dict[str, object] | Exception | None], None],
+    publish: Callable[[Mapping[str, object] | Exception | None], None],
 ) -> None:
   try:
     await to_thread.run_sync(
@@ -68,13 +69,13 @@ async def research_events(
     model: BaseChatModel,
 ):
   loop = asyncio.get_running_loop()
-  queue: asyncio.Queue[dict[str, object] | Exception | None]  = asyncio.Queue()
+  queue: asyncio.Queue[Mapping[str, object] | Exception | None]  = asyncio.Queue()
   connected = True
   def enqueue(item):
     if connected:
       queue.put_nowait(item)
 
-  def publish(item):
+  def publish(item: Mapping[str, object] | Exception | None) -> None:
     loop.call_soon_threadsafe(enqueue, item)
 
   task_group.start_soon(

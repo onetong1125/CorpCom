@@ -11,7 +11,7 @@ from anyio import create_task_group
 from redis import Redis
 
 from dotenv import load_dotenv
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from fastapi import Depends, FastAPI, Form, HTTPException, UploadFile, Query
 from fastapi.exceptions import RequestValidationError
@@ -206,13 +206,13 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     )
     async def stream_message(
         events: Annotated[
-            AsyncIterator[dict[str, object]],
+            AsyncIterator[Mapping[str, object]],
             Depends(get_research_events, scope="request")
         ]
     ):
         # 这里已经准入成功，进入SSE
         async for event in events:
-            payload = event.copy()
+            payload = dict(event)
             event_id = payload.pop("event_id", None)
             yield ServerSentEvent(data=payload, id=event_id)
 
