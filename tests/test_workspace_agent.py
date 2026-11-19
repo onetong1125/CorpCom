@@ -239,6 +239,10 @@ class WorkspaceAgentTests(unittest.TestCase):
     self.assertEqual(context["scope"], "")
     self.assertEqual(context["initial_hypothesis"], saved.info.initial_hypothesis)
     self.assertEqual(context["preferences"], saved.info.preferences)
+    self.assertEqual(
+        context["other_threads"],
+        [{"id": self.thread.id, "title": self.thread.title}],
+    )
 
   def test_same_thread_retains_both_turns_in_context_and_storage(self):
     first_question = "先分析什么指标？"
@@ -266,6 +270,9 @@ class WorkspaceAgentTests(unittest.TestCase):
       WorkspaceStore(self.data) as store,
       SqliteSaver.from_conn_string(checkpoint_path) as checkpointer
     ):
+      store.update_research(
+          self.workspace.id, WorkspaceResearchInfo(goal="检查经营现金流")
+      )
       # Existing checkpoints must supply history without reading business messages.
       with patch.object(
           store,
@@ -302,6 +309,10 @@ class WorkspaceAgentTests(unittest.TestCase):
     self.assertEqual(len(model.requests), 2)
     self.assertEqual(model.requests[0][0].type, "system")
     self.assertEqual(model.requests[1][0].type, "system")
+    prompt = model.requests[1][0].content
+    context = json.loads(prompt.split("当前 Workspace 的已保存研究状态：\n", 1)[1])
+    self.assertEqual(context["goal"], "检查经营现金流")
+    self.assertEqual(context["preferences"], self.workspace.info.preferences)
     self.assertEqual(
         [(item.type, item.content) for item in model.requests[0][1:]],
         [("human", first_question)],
