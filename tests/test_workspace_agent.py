@@ -1,6 +1,7 @@
 """Exercise the real LangChain loop with a scripted model and temporary workspace storage."""
 
 import json
+import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -14,7 +15,9 @@ from langchain.agents.middleware.model_call_limit import \
   ModelCallLimitExceededError
 from langchain_core.language_models.fake_chat_models import \
   FakeMessagesListChatModel, FakeListChatModel, FakeListChatModelError
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, \
+  ToolMessage, SystemMessage
+from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import Field
@@ -25,6 +28,8 @@ from corpcom.run_coordinator import RunCoordinator
 from corpcom.workspace import WorkspaceStore
 from corpcom.workspace_agent import ask_workspace
 from corpcom.workspace_models import WorkspaceResearchInfo
+from corpcom.workspace_prompt import build_workspace_prompt
+from corpcom.workspace_tools import create_workspace_tools
 
 
 class ScriptedModel(FakeMessagesListChatModel):
@@ -48,6 +53,8 @@ class StreamingModel(FakeListChatModel):
 
 class WorkspaceAgentTests(unittest.TestCase):
   def setUp(self):
+    self.enterContext(patch.dict(os.environ))
+    os.environ.pop("CORPCOM_MODEL_INPUT_TOKEN_BUDGET", None)
     self.temporary = TemporaryDirectory()
     self.addCleanup(self.temporary.cleanup)
     self.root = Path(self.temporary.name)
@@ -243,6 +250,51 @@ class WorkspaceAgentTests(unittest.TestCase):
         context["other_threads"],
         [{"id": self.thread.id, "title": self.thread.title}],
     )
+
+  def test_over_budget_drops_oldest_complete_turn(self):
+    first_question = "营收是多少？"
+    first_answer = "营收为 100 万元。"
+    second_question = "经营现金流是多少？"
+    second_answer = "经营现金流为 30 万元。"
+    current_question = "刚才的经营现金流是多少？"
+    model = ScriptedModel(responses=[
+      AIMessage(content=first_answer),
+      AIMessage(content=second_answer),
+      AIMessage(content="经营现金流为 30 万元。"),
+    ])
+
+    with WorkspaceStore(self.data) as store:
+      ask_workspace(store, model, self.workspace.id, self.thread.id,
+                    first_question, self.checkpointer)
+      ask_workspace(store, model, self.workspace.id, self.thread.id,
+                    second_question, self.checkpointer)
+
+      messages_to_keep = [
+        model.requests[1][0],
+        HumanMessage(content=second_question),
+        AIMessage(content=second_answer),
+        HumanMessage(content=current_question),
+      ]
+      tools = create_workspace_tools(store.root, self.workspace.id)
+      budget = count_tokens_approximately(messages_to_keep, tools=tools)
+      with patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=str(budget)):
+        ask_workspace(store, model, self.workspace.id, self.thread.id,
+                      current_question, self.checkpointer)
+
+    self.assertEqual(
+        [(message.type, message.content) for message in model.requests[2][1:]],
+        [(message.type, message.content) for message in messages_to_keep[1:]],
+    )
+
+  def test_invalid_input_budget_fails_before_calling_model(self):
+    with WorkspaceStore(self.data) as store:
+      for value in ("0", "-1", "32k"):
+        with self.subTest(value=value), patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=value):
+          model = ScriptedModel(responses=[AIMessage(content="回答")])
+          with self.assertRaisesRegex(ValueError, "CORPCOM_MODEL_INPUT_TOKEN_BUDGET"):
+            ask_workspace(store, model, self.workspace.id, self.thread.id,
+                          "检查现金流", self.checkpointer)
+          self.assertEqual(model.requests, [])
 
   def test_same_thread_retains_both_turns_in_context_and_storage(self):
     first_question = "先分析什么指标？"
@@ -1000,6 +1052,139 @@ class WorkspaceAgentTests(unittest.TestCase):
     self.assertEqual(
         results[0].content,
         "RuntimeError: record lookup failed",
+    )
+
+  def test_over_budget_shortens_long_tool_result_and_keeps_parallel_error(self):
+    @tool
+    def read_long_result() -> str:
+      """Read a long research result."""
+      return "经营现金流数据。" * 2000
+
+    @tool
+    def read_failed_result() -> str:
+      """Read a research result that fails."""
+      raise ValueError("读取失败")
+
+    tools = [read_long_result, read_failed_result]
+    question = "同时读取两份研究资料。"
+    tool_calls = [
+      {"id": "call_a", "name": "read_long_result", "args": {}},
+      {"id": "call_b", "name": "read_failed_result", "args": {}},
+    ]
+    model = ScriptedModel(responses=[
+      AIMessage(content="先读取两份资料。", tool_calls=tool_calls),
+      AIMessage(content="第一份资料已读取，第二份读取失败。"),
+    ])
+
+    with WorkspaceStore(self.data) as store:
+      detail = store.get_workspace_detail(self.workspace.id)
+      context = {
+        "title": detail.title,
+        **detail.info.model_dump(),
+        "other_threads": [
+          {"id": item.id, "title": item.title}
+          for item in detail.threads if item.id != self.thread.id
+        ],
+      }
+      system_prompt = build_workspace_prompt(
+          context, initialize_research=False,
+      )
+
+      # 给截断结果留出空间，同时确保完整结果会超过预算。
+      common_messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=question),
+        AIMessage(content="先读取两份资料。", tool_calls=tool_calls),
+      ]
+      error_result = ToolMessage(
+          content="ValueError: 读取失败",
+          tool_call_id="call_b",
+          name="read_failed_result",
+          status="error",
+      )
+      short_result = ToolMessage(
+          content="经营现金流数据。" * 50,
+          tool_call_id="call_a",
+          name="read_long_result",
+      )
+      long_result = ToolMessage(
+          content="经营现金流数据。" * 2000,
+          tool_call_id="call_a",
+          name="read_long_result",
+      )
+      budget = count_tokens_approximately(
+          [*common_messages, short_result, error_result], tools=tools,
+      )
+      self.assertGreater(
+          count_tokens_approximately(
+              [*common_messages, long_result, error_result], tools=tools,
+          ),
+          budget,
+      )
+
+      with (
+        patch("corpcom.workspace_agent.create_workspace_tools", return_value=tools),
+        patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=str(budget)),
+      ):
+        ask_workspace(
+            store, model, self.workspace.id, self.thread.id,
+            question, self.checkpointer,
+        )
+
+    self.assertEqual(len(model.requests), 2)
+    request = model.requests[1]
+    self.assertEqual(request[2].tool_calls, model.responses[0].tool_calls)
+    tool_results = [message for message in request if isinstance(message, ToolMessage)]
+    self.assertCountEqual([m.tool_call_id for m in tool_results], ["call_a", "call_b"])
+    results = {message.tool_call_id: message for message in tool_results}
+    self.assertEqual(results["call_b"].status, "error")
+    self.assertEqual(results["call_b"].content, "ValueError: 读取失败")
+    self.assertLess(len(results["call_a"].content), len(long_result.content))
+    self.assertIn("经营现金流数据。", results["call_a"].content)
+    self.assertTrue(results["call_a"].content.endswith("[工具结果已截断]"))
+    self.assertLessEqual(
+        count_tokens_approximately(request, tools=tools),
+        budget,
+    )
+
+    config = {"configurable": {"thread_id": f"{self.workspace.id}:{self.thread.id}"}}
+    checkpoint = self.checkpointer.get_tuple(config).checkpoint
+    saved_results = {
+        message.tool_call_id: message
+        for message in checkpoint["channel_values"]["messages"]
+        if isinstance(message, ToolMessage)
+    }
+    self.assertEqual(saved_results["call_a"].content, long_result.content)
+    self.assertEqual(saved_results["call_b"], results["call_b"])
+
+    # 下一轮预算恰好够用时，模型应收到 checkpoint 中的完整工具记录。
+    history = checkpoint["channel_values"]["messages"]
+    follow_up = HumanMessage(content="哪份资料读取失败？")
+    full_budget = count_tokens_approximately(
+        [request[0], *history, follow_up], tools=tools,
+    )
+    follow_model = ScriptedModel(responses=[
+        AIMessage(content="第二份。"), AIMessage(content="好的。"),
+    ])
+    with (
+      WorkspaceStore(self.data) as store,
+      patch("corpcom.workspace_agent.create_workspace_tools", return_value=tools),
+    ):
+      with patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=str(full_budget)):
+        ask_workspace(store, follow_model, self.workspace.id, self.thread.id,
+                      follow_up.content, self.checkpointer)
+      self.assertEqual(follow_model.requests[0][1:-1], history)
+
+      # 预算只够最近一问一答与当前追问时，旧轮的工具调用和结果应一起移出。
+      last_question = HumanMessage(content="继续。")
+      recent = [follow_up, follow_model.responses[0], last_question]
+      recent_budget = count_tokens_approximately([request[0], *recent], tools=tools)
+      with patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=str(recent_budget)):
+        ask_workspace(store, follow_model, self.workspace.id, self.thread.id,
+                      last_question.content, self.checkpointer)
+    self.assertEqual(
+        [(m.type, m.content) for m in follow_model.requests[1][1:]],
+        [(m.type, m.content) for m in recent],
     )
 
 if __name__ == "__main__":
