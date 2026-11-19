@@ -1,14 +1,19 @@
 """Continue one research conversation using its persistent workspace context."""
 
 import logging
+import os
 from collections.abc import Callable
+
+from langchain_core.messages.utils import count_tokens_approximately
+from pydantic import env_settings
 from redis.exceptions import RedisError
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import ModelCallLimitMiddleware, wrap_tool_call
+from langchain.agents.middleware import ModelCallLimitMiddleware, \
+  wrap_tool_call, wrap_model_call
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.errors import GraphBubbleUp
 
@@ -89,6 +94,76 @@ def handle_workspace_tool_error(request, handler):
         status="error",
     )
 
+@wrap_model_call
+def compact_model_input_tokens(request, handler):
+  """Estimate model input and trim complete old turns when over budget."""
+  messages = request.messages
+  count = count_tokens_approximately(
+      [request.system_message, *messages],
+      tools=request.tools,
+  )
+  raw_budget = os.getenv("CORPCOM_MODEL_INPUT_TOKEN_BUDGET")
+  if raw_budget is not None:
+    try:
+      budget = int(raw_budget)
+    except ValueError as exc:
+      raise ValueError("CORPCOM_MODEL_INPUT_TOKEN_BUDGET 必须是正整数") from exc
+    if budget <= 0:
+      raise ValueError("CORPCOM_MODEL_INPUT_TOKEN_BUDGET 必须是正整数")
+
+    while count > budget:
+      next_turn = next(
+          (
+            index for index, message in enumerate(messages[1:], start=1)
+            if isinstance(message, HumanMessage)
+          ),
+          None,
+      )
+      if next_turn is None:
+        break
+
+      messages = messages[next_turn:]
+      count = count_tokens_approximately(
+          [request.system_message, *messages],
+          tools=request.tools,
+      )
+
+    if count > budget:
+      messages = list(messages)
+      marker = "\n[工具结果已截断]"
+      for index, message in enumerate(messages):
+        if count <= budget:
+          break
+        if not isinstance(message, ToolMessage) or message.status != "success":
+          continue
+        if not isinstance(message.content, str) or len(message.content) <= len(marker):
+          continue
+
+        original = message.content
+        low, high = 0, len(original) - len(marker)
+        while low < high:
+          middle = (low + high + 1) // 2
+          messages[index] = message.model_copy(
+              update={"content": original[:middle] + marker}
+          )
+          candidate_count = count_tokens_approximately(
+              [request.system_message, *messages], tools=request.tools,
+          )
+          if candidate_count <= budget:
+            low = middle
+          else:
+            high = middle - 1
+        messages[index] = message.model_copy(
+            update={"content": original[:low] + marker}
+        )
+        count = count_tokens_approximately(
+            [request.system_message, *messages], tools=request.tools,
+        )
+      if count > budget:
+        raise RuntimeError("模型输入超过预算，无法缩短到预算范围内")
+
+  logger.info("模型输入估算 tokens=%d", count)
+  return handler(request.override(messages=messages))
 
 def create_workspace_agent(
     store: WorkspaceStore, model: BaseChatModel,
@@ -121,6 +196,7 @@ def create_workspace_agent(
       middleware=[
         ModelCallLimitMiddleware(run_limit=100, exit_behavior="error"),
         handle_workspace_tool_error,
+        compact_model_input_tokens,
       ],
       checkpointer=checkpointer,
   )
