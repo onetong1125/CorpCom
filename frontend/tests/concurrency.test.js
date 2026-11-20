@@ -174,6 +174,8 @@ it("rebuilds completed and active runs after page load without posting a questio
   active.emit({ type: "tool_start", tool_run_id: "current-tool", name: "new_lookup" }, "200-2");
   await flushPromises();
   expect(wrapper.text().match(/旧答案/g)).toHaveLength(1);
+  expect(wrapper.findAll(".assistant-byline").map((header) =>
+    header.element.nextElementSibling.className)).toEqual(["research-progress", "research-progress"]);
   expect(wrapper.text()).toContain("正在核对");
   expect(wrapper.text()).toContain("old_lookup");
   expect(wrapper.text()).toContain("旧资料");
@@ -282,6 +284,7 @@ it("streams text and tool events into the original thread and replaces the final
   writeHandler = () => stream.response;
   await openApp();
   await send("问题 A");
+  expect(wrapper.findAll(".assistant-byline")).toHaveLength(1);
   stream.emit({ type: "started", workspace_id: "w1", thread_id: "a" });
   stream.emit({ type: "text_delta", message_id: "intro", text: "先查资料" });
   stream.emit({ type: "tool_start", tool_run_id: "tool1", name: "bash" });
@@ -305,6 +308,8 @@ it("streams text and tool events into the original thread and replaces the final
   threads.a.execution_status = "succeeded";
   stream.emit({ type: "succeeded", message: { ...threads.a.messages[2], thread_id: "a" } });
   await flushPromises();
+  expect(wrapper.findAll(".messages .message-byline strong").map((name) => name.text()))
+    .toEqual(["你", "CorpCom"]);
   expect(wrapper.findAll(".message.assistant").map((item) => item.text())).toEqual([
     expect.stringContaining("先查资料"), expect.stringContaining("最终回答"),
   ]);
