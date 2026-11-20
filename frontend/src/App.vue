@@ -74,6 +74,10 @@ const dialogTitle = computed(
     })[modalKind.value],
 );
 
+function isQuestion(entry) {
+  return entry.type === "pending" || entry.message?.role === "user";
+}
+
 function rememberSelection() {
   const url = new URL(window.location.href);
   url.searchParams.set("workspace", workspace.value.id);
@@ -517,25 +521,17 @@ onMounted(initialize);
               <Plus :size="16" />新建会话
             </button>
           </div>
-          <template v-for="entry in conversationEntries" :key="entry.key">
+          <template v-for="(entry, index) in conversationEntries" :key="entry.key">
             <article
               v-if="entry.type === 'message'"
               class="message"
               :class="entry.message.role"
             >
-              <div class="message-byline">
-                <span class="avatar">{{
-                  entry.message.role === "assistant" ? "C" : "你"
-                }}</span
-                ><strong>{{
-                  entry.message.role === "assistant" ? "CorpCom" : "你"
-                }}</strong
-                ><time>{{
-                  new Date(entry.message.created_at).toLocaleTimeString("zh-CN", {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })
-                }}</time>
+              <div v-if="entry.message.role === 'user'" class="message-byline">
+                <span class="avatar">你</span><strong>你</strong>
+                <time>{{ new Date(entry.message.created_at).toLocaleTimeString("zh-CN", {
+                  hour: "2-digit", minute: "2-digit",
+                }) }}</time>
               </div>
               <MarkdownContent
                 v-if="entry.message.role === 'assistant'"
@@ -575,6 +571,15 @@ onMounted(initialize);
                 </div>
               </div>
             </details>
+            <div
+              v-if="isQuestion(entry) && (conversationEntries[index + 1]
+                ? !isQuestion(conversationEntries[index + 1]) : sending)"
+              class="message-byline assistant-byline"
+            >
+              <span class="avatar">C</span><strong>CorpCom</strong>
+              <time>{{ new Date(entry.type === 'pending' ? currentRun.createdAt : entry.message.created_at)
+                .toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) }}</time>
+            </div>
           </template>
           <div v-if="sending" class="researching" role="status">
             <span class="pulse-dot"></span>
