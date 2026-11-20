@@ -308,6 +308,9 @@ it("streams text and tool events into the original thread and replaces the final
   threads.a.execution_status = "succeeded";
   stream.emit({ type: "succeeded", message: { ...threads.a.messages[2], thread_id: "a" } });
   await flushPromises();
+  const byline = wrapper.get(".assistant-byline").element;
+  expect(byline.previousElementSibling).toBe(wrapper.get(".message.user").element);
+  expect(byline.nextElementSibling).toBe(wrapper.findAll(".message.assistant")[0].element);
   expect(wrapper.findAll(".messages .message-byline strong").map((name) => name.text()))
     .toEqual(["你", "CorpCom"]);
   expect(wrapper.findAll(".message.assistant").map((item) => item.text())).toEqual([

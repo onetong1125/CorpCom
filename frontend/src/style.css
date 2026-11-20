@@ -417,6 +417,11 @@ small {
   margin-bottom: 27px;
   overflow-wrap: anywhere;
 }
+.message.user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
 .message-byline {
   display: flex;
   align-items: center;
@@ -443,20 +448,23 @@ small {
   border-radius: 7px;
   font-size: 13px;
 }
+.user .message-byline {
+  flex-direction: row-reverse;
+}
 .user .avatar {
   background: #e8ebdf;
   color: #77846a;
   font-size: 10px;
 }
 .user-content {
+  max-width: 85%;
   white-space: pre-wrap;
   background: #edf0e8;
   border: 1px solid #e4e8dc;
-  border-radius: 0 9px 9px 9px;
+  border-radius: 9px 0 9px 9px;
   padding: 14px 17px;
   font-size: 12px;
   line-height: 1.9;
-  margin-left: 35px;
 }
 .message.assistant > .markdown {
   padding-left: 35px;
@@ -1252,9 +1260,7 @@ small {
   .chat-empty > p {
     font-size: 10px;
   }
-  .user-content,
-  .message.assistant > .markdown {
-    margin-left: 0;
+  .user-content {
     padding-left: 14px;
   }
   .message.assistant > .markdown {
