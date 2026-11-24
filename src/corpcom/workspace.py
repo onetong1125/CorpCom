@@ -1,12 +1,15 @@
 """Store research in workspace JSON, with conversations and file indexes in SQLite."""
 
+import fcntl
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+import yaml
 from pydantic import JsonValue
 
 from corpcom.artifacts import ArtifactStore
@@ -188,18 +191,129 @@ class WorkspaceStore:
   ) -> str:
     """Read the scope's UTF-8 index, returning empty text if it is missing."""
     self.get_workspace(workspace_id)
-    directory = user_memory_dir if scope == "user" else self.root / "workspaces" / workspace_id / "memory"
-    flags = os.O_RDONLY | os.O_NOFOLLOW
     try:
-      directory_fd = os.open(directory, flags | os.O_DIRECTORY)
-      try:
-        index_fd = os.open("memory.md", flags, dir_fd=directory_fd)
-      finally:
-        os.close(directory_fd)
+      return self._read_scoped_memory_markdown(workspace_id, scope, user_memory_dir, "memory.md")
     except FileNotFoundError:
       return ""
-    with os.fdopen(index_fd, "r", encoding="utf-8", newline="") as index:
-      return index.read()
+
+  def read_memory_topic(
+      self,
+      workspace_id: str,
+      scope: Literal["user", "workspace"],
+      user_memory_dir: Path,
+      key: str,
+  ) -> str:
+    """Read a topic's full UTF-8 Markdown from the selected scope."""
+    self._validate_memory_topic_key(key)
+    self.get_workspace(workspace_id)
+    try:
+      return self._read_scoped_memory_markdown(workspace_id, scope, user_memory_dir, key)
+    except FileNotFoundError as exc:
+      raise FileNotFoundError(exc.errno, exc.strerror, key) from exc
+
+  def create_memory_topic(
+      self,
+      workspace_id: str,
+      scope: Literal["user", "workspace"],
+      user_memory_dir: Path,
+      key: str,
+      *,
+      name: str,
+      description: str,
+      memory_type: Literal["user", "feedback", "project", "reference"],
+      body: str,
+  ) -> None:
+    """Create or retry a topic and ensure it is indexed in the selected scope."""
+    self._validate_memory_topic_key(key)
+    if key.casefold() == "memory.md":
+      raise ValueError("memory.md is reserved for the memory index")
+    self.get_workspace(workspace_id)
+
+    metadata = yaml.safe_dump(
+        {"name": name, "description": description, "type": memory_type},
+        allow_unicode=True, sort_keys=False,
+    )
+    markdown = f"---\n{metadata}---\n\n{body}".encode("utf-8")
+    entry = f"- [{name}]({key}) — {description}\n".encode("utf-8")
+
+    directory = self._memory_directory(workspace_id, scope, user_memory_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+      try:
+        topic_fd = os.open(
+            key, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            mode=0o600, dir_fd=directory_fd,
+        )
+      except FileExistsError:
+        topic_fd = os.open(key, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        with os.fdopen(topic_fd, "rb") as topic:
+          if topic.read() != markdown:
+            # 非重试请求，抛出异常
+            raise
+          # 相同重试请求，继续处理索引
+      else:
+        with os.fdopen(topic_fd, "wb") as topic:
+          topic.write(markdown)
+
+      index_fd = os.open(
+          "memory.md", os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+          mode=0o600, dir_fd=directory_fd,
+      )
+      with os.fdopen(index_fd, "a+b") as index:
+        # Keep the lookup and append together across writers.
+        fcntl.flock(index.fileno(), fcntl.LOCK_EX)
+        index.seek(0)
+        index_content = index.read()
+        destination = b"(" + key.encode("utf-8") + b")"
+        for item in re.finditer(rb"^[ \t]*-[ \t]+\[([^\r\n]*)", index_content, re.MULTILINE):
+          label_and_target = item.group(1)
+          depth = 1
+          for bracket in re.finditer(rb"\\.|[\[\]]", label_and_target):
+            if bracket.group() == b"[":
+              depth += 1
+            elif bracket.group() == b"]":
+              depth -= 1
+              if depth == 0:
+                if label_and_target.startswith(destination, bracket.end()):
+                  return
+                break
+        if index_content and not index_content.endswith(b"\n"):
+          entry = b"\n" + entry
+        index.write(entry)
+    finally:
+      os.close(directory_fd)
+
+  @staticmethod
+  def _validate_memory_topic_key(key: str) -> None:
+    filename = Path(key)
+    if filename.name != key or filename.suffix != ".md" or "\0" in key:
+      raise ValueError("memory topic key must be a single .md filename")
+
+  def _memory_directory(
+      self, workspace_id: str, scope: Literal["user", "workspace"], user_memory_dir: Path,
+  ) -> Path:
+    if scope == "user":
+      return user_memory_dir
+    return self.root / "workspaces" / workspace_id / "memory"
+
+  def _read_scoped_memory_markdown(
+      self, workspace_id: str, scope: Literal["user", "workspace"],
+      user_memory_dir: Path, filename: str,
+  ) -> str:
+    """Read UTF-8 Markdown by filename from the selected memory scope.
+
+    Reject symlinks at the memory directory and file. The caller handles missing paths.
+    """
+    directory = self._memory_directory(workspace_id, scope, user_memory_dir)
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    directory_fd = os.open(directory, flags | os.O_DIRECTORY)
+    try:
+      file_fd = os.open(filename, flags, dir_fd=directory_fd)
+    finally:
+      os.close(directory_fd)
+    with os.fdopen(file_fd, "r", encoding="utf-8", newline="") as memory_file:
+      return memory_file.read()
 
   def _thread(self, workspace_id: str, thread_id: str) -> Thread:
     # Check ownership before reading or adding messages, not just the thread ID.

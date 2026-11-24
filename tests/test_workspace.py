@@ -11,6 +11,8 @@ import unittest
 import sqlite3
 from uuid import uuid4
 
+import yaml
+
 from corpcom.workspace import RecordNotFoundError, ThreadBusyError, WorkspaceStore
 from corpcom.workspace_models import WorkspaceResearchInfo
 
@@ -145,6 +147,129 @@ class WorkspaceStoreTests(unittest.TestCase):
     for key in ("notes.txt", "reports/summary.md", str(self.root / "report.md")):
       with self.subTest(key=key), self.assertRaises(ValueError):
         self.store.read_memory_topic(wid, "user", user_dir, key)
+
+  def test_create_memory_topic_writes_markdown_and_indexes_it_in_selected_scope(self):
+    wid = self.create().id
+    user_dir = self.root / "custom" / "memory"
+    project_dir = self.data / "workspaces" / wid / "memory"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    existing = "# 项目索引\n\n- [库存](stock.md) — 跟踪周转天数"
+    (project_dir / "memory.md").write_text(existing, encoding="utf-8")
+
+    for scope, directory, name, description, kind, body in (
+        ("user", user_dir, "报告格式", "金额注明币种", "feedback", "适用于所有报告。\n\n依据：用户明确要求。\n"),
+        ("workspace", project_dir, "回款核查", "按季核对回款", "project", "仅适用于本项目。\n\n依据：一季报第 8 页。\n"),
+    ):
+      with self.subTest(scope=scope):
+        self.store.create_memory_topic(
+            wid, scope, user_dir, "research.md", name=name, description=description,
+            memory_type=kind, body=body,
+        )
+        markdown = (directory / "research.md").read_text(encoding="utf-8")
+        opening, metadata, saved_body = markdown.split("---\n", 2)
+        self.assertEqual(opening, "")
+        self.assertEqual(yaml.safe_load(metadata), {
+            "name": name, "description": description, "type": kind,
+        })
+        self.assertEqual(saved_body.lstrip("\n"), body)
+        index = (directory / "memory.md").read_text(encoding="utf-8")
+        entry = f"- [{name}](research.md) — {description}"
+        self.assertEqual(index.splitlines().count(entry), 1)
+        if scope == "workspace":
+          self.assertTrue(index.startswith(existing + "\n"))
+
+  def test_create_memory_topic_rejects_reserved_index_filename(self):
+    wid = self.create().id
+    user_dir = self.root / "custom-memory"
+    user_dir.mkdir()
+    index = user_dir / "memory.md"
+    index.write_text("# 手写索引\n", encoding="utf-8")
+    with self.assertRaises(ValueError):
+      self.store.create_memory_topic(
+          wid, "user", user_dir, "memory.md", name="报告格式", description="金额注明币种",
+          memory_type="feedback", body="依据：用户明确要求。\n",
+      )
+    self.assertEqual(index.read_text(encoding="utf-8"), "# 手写索引\n")
+
+  def test_retry_memory_topic_repairs_missing_entry_only_once(self):
+    wid = self.create().id
+    directory = self.root / "custom-memory"
+    args = (wid, "user", directory, "units.md")
+    fields = dict(name="金额单位", description="金额标注币种", memory_type="feedback",
+                  body="依据：用户要求注明币种。\n")
+    self.store.create_memory_topic(*args, **fields)
+    topic = directory / "units.md"
+    original_topic = topic.read_bytes()
+    index = directory / "memory.md"
+    # Reconstruct the on-disk state after the topic write but before index registration.
+    previous = "# 索引\n\n- [库存](stock.md) — 单位见[币种约定](units.md)\n"
+    index.write_text(previous, encoding="utf-8")
+
+    with WorkspaceStore(self.data) as reopened:
+      reopened.create_memory_topic(*args, **fields)
+      self.assertEqual(index.read_text(encoding="utf-8"),
+                       previous + "- [金额单位](units.md) — 金额标注币种\n")
+      # A user may relabel the link. The filename still identifies the registered topic.
+      edited_index = previous + "- [我的币种约定 [2025]](units.md) — 手工整理\n"
+      index.write_text(edited_index, encoding="utf-8")
+      reopened.create_memory_topic(*args, **fields)
+    self.assertEqual(index.read_text(encoding="utf-8"), edited_index)
+    self.assertEqual(topic.read_bytes(), original_topic)
+
+  def test_retry_memory_topic_preserves_a_conflicting_edit(self):
+    wid = self.create().id
+    directory = self.root / "custom-memory"
+    args = (wid, "user", directory, "units.md")
+    fields = dict(name="金额单位", description="金额标注币种", memory_type="feedback",
+                  body="金额需注明币种。\n")
+    self.store.create_memory_topic(*args, **fields)
+    topic = directory / "units.md"
+    revised = topic.read_bytes() + "用户补充：同时注明汇率日期。\n".encode("utf-8")
+    topic.write_bytes(revised)
+    index = directory / "memory.md"
+    index.write_text("# 待整理\n", encoding="utf-8")
+
+    with self.assertRaises(FileExistsError):
+      self.store.create_memory_topic(*args, **fields)
+    self.assertEqual(topic.read_bytes(), revised)
+    self.assertEqual(index.read_text(encoding="utf-8"), "# 待整理\n")
+
+  def test_revise_memory_topic_keeps_frontmatter_and_handwritten_index(self):
+    wid = self.create().id
+    args = (wid, "workspace", self.root / "user-memory", "cashflow.md")
+    directory = self.data / "workspaces" / wid / "memory"
+    directory.mkdir()
+    header = "---\n# 手工整理\nname: 回款核查\ndescription: 跟踪回款\ntype: project\n---\n\n"
+    topic = directory / "cashflow.md"
+    topic.write_text(header + "年报显示回款改善，原因待核实。\n", encoding="utf-8")
+    index = directory / "memory.md"
+    entry = "- [回款核查 [2025]](cashflow.md) — 我的跟踪项\n"
+    index.write_text(entry, encoding="utf-8")
+    original = self.store.read_memory_topic(*args)
+    revised_body = "回款提前主要源于结算时点。\n\n2025-04-30 修订：一季报第 8 页披露了到账日期。\n"
+
+    self.store.revise_memory_topic(*args, expected_markdown=original, body=revised_body)
+
+    self.assertEqual(self.store.read_memory_topic(*args), header + revised_body)
+    self.assertEqual(index.read_bytes(), entry.encode("utf-8"))
+
+  def test_revise_memory_topic_rejects_stale_read_after_editor_save(self):
+    wid = self.create().id
+    directory = self.root / "user-memory"
+    args = (wid, "user", directory, "units.md")
+    self.store.create_memory_topic(*args, name="报告单位", description="披露币种",
+                                  memory_type="feedback", body="金额标注币种。\n")
+    original = self.store.read_memory_topic(*args)
+    topic = directory / "units.md"
+    handwritten = (original + "用户补充：标注换算日期。\n").encode("utf-8")
+    topic.write_bytes(handwritten)
+    index = directory / "memory.md"
+    original_index = index.read_bytes()
+
+    with self.assertRaises(ValueError):
+      self.store.revise_memory_topic(*args, expected_markdown=original, body="改用美元。\n")
+    self.assertEqual(topic.read_bytes(), handwritten)
+    self.assertEqual(index.read_bytes(), original_index)
 
   def test_concurrent_user_messages_have_one_first_message_per_workspace(self):
     workspace = self.create()
