@@ -97,6 +97,48 @@ describe("research workbench", () => {
     expect(window.location.search).toBe("?workspace=w1&thread=t1");
   });
 
+  it("reopens working notes from disk and preserves the current draft and library", async () => {
+    messages = [savedUser];
+    await openApp();
+    const draft = wrapper.get('textarea[aria-label="研究问题"]');
+    await draft.setValue("尚未发送");
+    const toggle = wrapper.get('button[aria-controls="memory-panel"]');
+    const library = wrapper.get('[aria-label="研究产物"]');
+    for (const [source, expected] of [
+      ["- [ ] 核对季报", "☐ 核对季报"], ["- [x] 核对季报", "☑ 核对季报"],
+    ]) {
+      fetch.mockResolvedValueOnce(response(source, 200, true));
+      await toggle.trigger("click");
+      await flushPromises();
+      expect(fetch.mock.calls.at(-1)[0]).toBe("/api/workspaces/w1/working-note");
+      expect(wrapper.get("#memory-panel li").text()).toBe(expected);
+      expect(library.isVisible()).toBe(false);
+      await wrapper.get('[aria-label="关闭记忆"]').trigger("click");
+      expect(library.isVisible()).toBe(true);
+      expect(document.activeElement).toBe(toggle.element);
+      expect(draft.element.value).toBe("尚未发送");
+      expect(wrapper.get(".user-content").text()).toBe(savedUser.content);
+    }
+  });
+
+  it("retries a failed note preview, shows an empty template, and refreshes handwritten changes", async () => {
+    await openApp();
+    fetch.mockResolvedValueOnce(response({ detail: "读取失败" }, 500));
+    await wrapper.get('button[aria-controls="memory-panel"]').trigger("click");
+    await flushPromises();
+    const panel = wrapper.get("#memory-panel");
+    expect(panel.get('[role="alert"]').text()).toContain("读取失败");
+    const template = "# 工作笔记\n\n## 当前进展与下一步\n\n## 会话与关键发现\n\n## 资料与产物\n";
+    fetch.mockResolvedValueOnce(response(template, 200, true));
+    await panel.get('[role="alert"] button').trigger("click");
+    await flushPromises();
+    expect(panel.text()).toContain("暂无工作笔记");
+    fetch.mockResolvedValueOnce(response("## 新发现\n\n已核对", 200, true));
+    await panel.get('[aria-label="刷新工作笔记"]').trigger("click");
+    await flushPromises();
+    expect(panel.get(".markdown h2").text()).toBe("新发现");
+  });
+
   it("disables duplicate sends but allows navigation while pending, then refreshes messages and artifacts", async () => {
     let finish;
     postHandler = () =>

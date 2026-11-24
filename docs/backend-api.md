@@ -10,7 +10,7 @@
 
 Vite 开发服务代理 `/api`。浏览器直接跨域访问后端时，默认允许 `http://localhost:5173` 和 `http://127.0.0.1:5173`，其他来源通过逗号分隔的 `CORPCOM_CORS_ORIGINS` 配置。
 
-可选环境变量 `CORPCOM_MODEL_INPUT_TOKEN_BUDGET` 接受正整数，表示为回答预留空间后，每次请求可用的估算输入 token 上限。系统提示词、工具声明和对话消息都计入估算。省略此变量时保留完整输入。设置额度后，超限请求先移除旧轮，再按需缩短成功工具结果；保留当前问题和错误信息后仍超限时，本轮报错。
+可选环境变量 `CORPCOM_MODEL_INPUT_TOKEN_BUDGET` 接受正整数，表示为回答预留空间后，每次请求可用的估算输入 token 上限。系统提示词、工具声明和对话消息都计入估算。省略此变量时保留完整输入。设置额度后，超限请求先移除旧轮，再按需缩短成功工具结果。仍超限时，工作笔记可缩为前段摘录，并提示从 `agent.md` 读取全文。必需输入仍超限时，本轮报错。
 
 ## 接口清单
 
@@ -21,6 +21,7 @@ Vite 开发服务代理 `/api`。浏览器直接跨域访问后端时，默认�
 | POST | `/api/workspaces` | 创建研究，返回 `Workspace`，状态码 201 |
 | GET | `/api/workspaces` | 返回 `WorkspaceSummary[]` |
 | GET | `/api/workspaces/{wid}` | 返回 `WorkspaceDetail`，包含会话和文件索引 |
+| GET | `/api/workspaces/{wid}/working-note` | 每次从该工作区读取完整 `agent.md`，返回 UTF-8 纯文本 |
 | PUT | `/api/workspaces/{wid}/research` | 更新提交的研究字段，返回 `Workspace` |
 | PUT | `/api/workspaces/{wid}/preferences` | 保留的兼容路由，支持相同的五类字段；原 `{"preferences": {...}}` 请求仍整体替换偏好 |
 | POST | `/api/workspaces/{wid}/threads` | `{"title":"首次讨论"}` 创建会话，返回 `Thread`，状态码 201 |

@@ -1,6 +1,7 @@
 """Store research in workspace JSON, with conversations and file indexes in SQLite."""
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Literal
@@ -107,6 +108,16 @@ def _message_from_row(row: sqlite3.Row) -> Message:
   return Message.model_validate(data)
 
 
+EMPTY_WORKING_NOTE = """# 工作笔记
+
+## 当前进展与下一步
+
+## 会话与关键发现
+
+## 资料与产物
+"""
+
+
 class WorkspaceStore:
   """Manage one data directory; use with to close the connection on exit.
 
@@ -154,6 +165,24 @@ class WorkspaceStore:
     finally:
       temporary.unlink(missing_ok=True)
 
+  def _ensure_working_note(self, workspace_id: str) -> Path:
+    path = self.root / "workspaces" / workspace_id / "agent.md"
+    try:
+      note = path.open("x", encoding="utf-8")
+    except FileExistsError:
+      return path
+    with note:
+      note.write(EMPTY_WORKING_NOTE)
+    return path
+
+  def read_working_note(self, workspace_id: str) -> str:
+    """Read the current note, initializing it on first use."""
+    self.get_workspace(workspace_id)
+    path = self._ensure_working_note(workspace_id)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "r", encoding="utf-8", newline="") as note:
+      return note.read()
+
   def _thread(self, workspace_id: str, thread_id: str) -> Thread:
     # Check ownership before reading or adding messages, not just the thread ID.
     row = self.db.execute(
@@ -189,6 +218,7 @@ class WorkspaceStore:
           (workspace_id, title),
       )
       self._write_research(workspace_id, research)
+      self._ensure_working_note(workspace_id)
     return self.get_workspace(workspace_id)
 
   def list_workspaces(self) -> list[WorkspaceSummary]:

@@ -15,6 +15,14 @@ from corpcom.workspace import RecordNotFoundError, ThreadBusyError, WorkspaceSto
 from corpcom.workspace_models import WorkspaceResearchInfo
 
 
+EMPTY_NOTE_HEADINGS = [
+    "# 工作笔记",
+    "## 当前进展与下一步",
+    "## 会话与关键发现",
+    "## 资料与产物",
+]
+
+
 class WorkspaceStoreTests(unittest.TestCase):
   def setUp(self):
     # Isolate each test without touching user research.
@@ -31,6 +39,47 @@ class WorkspaceStoreTests(unittest.TestCase):
         initial_hypothesis="经营现金流能够持续覆盖经营投入",
         preferences={"报告语言": "中文", "关注指标": ["现金流"]},
     )
+
+  def test_new_workspace_has_empty_working_note(self):
+    for title in ("研究 A", "研究 B"):
+      workspace = self.create(title)
+      path = self.data / "workspaces" / workspace.id / "agent.md"
+      lines = path.read_text(encoding="utf-8").splitlines()
+      self.assertEqual([line for line in lines if line.strip()], EMPTY_NOTE_HEADINGS)
+
+  def test_first_working_note_read_creates_missing_file(self):
+    workspace = self.create()
+    path = self.data / "workspaces" / workspace.id / "agent.md"
+    path.unlink(missing_ok=True)  # Model a workspace created before working notes.
+    with WorkspaceStore(self.data) as reopened:
+      reopened.get_workspace_detail(workspace.id)
+      self.assertFalse(path.exists())
+      note = reopened.read_working_note(workspace.id)
+    self.assertEqual(path.read_text(encoding="utf-8"), note)
+    self.assertEqual([line for line in note.splitlines() if line.strip()], EMPTY_NOTE_HEADINGS)
+
+  def test_reopening_workspace_preserves_handwritten_working_note(self):
+    workspace = self.create()
+    path = self.data / "workspaces" / workspace.id / "agent.md"
+    handwritten = "# 我的笔记\r\n\r\n下一步核对季报。  ".encode("utf-8")
+    path.write_bytes(handwritten)
+    with WorkspaceStore(self.data) as reopened:
+      reopened.get_workspace_detail(workspace.id)
+      note = reopened.read_working_note(workspace.id)
+    self.assertEqual(path.read_bytes(), handwritten)
+    self.assertEqual(note.splitlines(), handwritten.decode("utf-8").splitlines())
+
+  def test_working_note_rejects_symlink(self):
+    workspace = self.create()
+    path = self.data / "workspaces" / workspace.id / "agent.md"
+    outside = self.root / "outside.md"
+    outside.write_text("私人内容", encoding="utf-8")
+    path.unlink()
+    path.symlink_to(outside)
+
+    with self.assertRaises(OSError):
+      self.store.read_working_note(workspace.id)
+    self.assertEqual(outside.read_text(encoding="utf-8"), "私人内容")
 
   def test_concurrent_user_messages_have_one_first_message_per_workspace(self):
     workspace = self.create()

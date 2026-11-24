@@ -94,9 +94,14 @@ def handle_workspace_tool_error(request, handler):
         status="error",
     )
 
-@wrap_model_call
-def compact_model_input_tokens(request, handler):
-  """Estimate model input and trim complete old turns when over budget."""
+def compact_model_input_tokens(
+    request,
+    handler,
+    working_note: str,
+    render_prompt: Callable[[str], str]
+):
+  """Fit history, tool results and the working note to the model input budget."""
+  system_message = request.system_message
   messages = request.messages
   count = count_tokens_approximately(
       [request.system_message, *messages],
@@ -160,10 +165,27 @@ def compact_model_input_tokens(request, handler):
             [request.system_message, *messages], tools=request.tools,
         )
       if count > budget:
+        marker = "\n［工作笔记已截断，可读取 agent.md 查看全文］"
+        low, high = 0, len(working_note) - 1
+        while low <= high:
+          middle = (low + high) // 2
+          candidate = request.system_message.model_copy(update={
+              "content": render_prompt(working_note[:middle] + marker),
+          })
+          candidate_count = count_tokens_approximately(
+              [candidate, *messages], tools=request.tools,
+          )
+          if candidate_count <= budget:
+            system_message = candidate
+            count = candidate_count
+            low = middle + 1
+          else:
+            high = middle - 1
+      if count > budget:
         raise RuntimeError("模型输入超过预算，无法缩短到预算范围内")
 
   logger.info("模型输入估算 tokens=%d", count)
-  return handler(request.override(messages=messages))
+  return handler(request.override(system_message=system_message, messages=messages))
 
 def create_workspace_agent(
     store: WorkspaceStore, model: BaseChatModel,
@@ -187,16 +209,25 @@ def create_workspace_agent(
       for item in detail.threads if item.id != thread_id
     ],
   }
+  working_note = store.read_working_note(workspace_id)
+
+  def render_prompt(note: str) -> str:
+    return build_workspace_prompt(
+        {**context, "working_note": note}, initialize_research=initialize_research,
+    )
+
+  @wrap_model_call
+  def apply_input_budget(request, handler):
+    return compact_model_input_tokens(request, handler, working_note, render_prompt)
+
   return create_agent(
       model,
       tools=create_workspace_tools(store.root, workspace_id),
-      system_prompt=build_workspace_prompt(
-          context, initialize_research=initialize_research
-      ),
+      system_prompt=render_prompt(working_note),
       middleware=[
         ModelCallLimitMiddleware(run_limit=100, exit_behavior="error"),
         handle_workspace_tool_error,
-        compact_model_input_tokens,
+        apply_input_budget,
       ],
       checkpointer=checkpointer,
   )

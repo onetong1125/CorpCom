@@ -16,7 +16,7 @@ from fastapi.sse import EventSourceResponse, ServerSentEvent
 from fastapi import Depends, FastAPI, Form, HTTPException, UploadFile, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededError
 from langchain_core.language_models import BaseChatModel
@@ -147,6 +147,11 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     def show_workspace(workspace_id: str) -> WorkspaceDetail:
         with WorkspaceStore(root) as store:
             return store.get_workspace_detail(workspace_id)
+
+    @app.get("/api/workspaces/{workspace_id}/working-note", response_class=PlainTextResponse)
+    def show_working_note(workspace_id: str) -> str:
+        with WorkspaceStore(root) as store:
+            return store.read_working_note(workspace_id)
 
     @app.put("/api/workspaces/{workspace_id}/preferences")
     @app.put("/api/workspaces/{workspace_id}/research")

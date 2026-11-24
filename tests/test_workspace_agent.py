@@ -68,6 +68,65 @@ class WorkspaceAgentTests(unittest.TestCase):
     # Give each test an independent checkpoint store.
     self.checkpointer = InMemorySaver()
 
+  def test_agent_edits_working_note_and_next_thread_sees_completed_task(self):
+    pending = "- [ ] 核对本季回款。"
+    completed = "- [x] 核对本季回款：已与季报对账。"
+    original = f"# 工作笔记\n\n## 当前进展与下一步\n{pending}\n\n用户备注：保留年报链接。\n"
+    path = self.data / "workspaces" / self.workspace.id / "agent.md"
+    path.write_text(original, encoding="utf-8")
+    model = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[{
+            "id": "complete-note-task", "name": "edit_file",
+            "args": {"file_path": "agent.md", "old_string": pending, "new_string": completed},
+        }]),
+        AIMessage(content="已更新工作笔记。"),
+        AIMessage(content="本季回款已核对。"),
+    ])
+    with WorkspaceStore(self.data) as store:
+      ask_workspace(store, model, self.workspace.id, self.thread.id,
+                    "本季回款已与季报对账，请勾选完成。", self.checkpointer)
+      self.assertEqual(path.read_text(encoding="utf-8"), original.replace(pending, completed))
+      new_thread = store.create_thread(self.workspace.id, "接手核对")
+      ask_workspace(store, model, self.workspace.id, new_thread.id, "核对到哪了？", self.checkpointer)
+
+    self.assertIn(completed, model.requests[-1][0].content)
+    self.assertNotIn(pending, model.requests[-1][0].content)
+    # Inspect instructions separately from the user-authored note included as data.
+    instructions = model.requests[0][0].content.split("当前 Workspace 的已保存研究状态：", 1)[0]
+    self.assertIn("agent.md", instructions)
+    self.assertIn("edit_file", instructions)
+    self.assertIn("进展", instructions)
+    self.assertIn("下一步", instructions)
+
+  def test_each_turn_reads_current_workspace_working_note(self):
+    model = ScriptedModel(responses=[AIMessage(content="已收到")])
+    notes_dir = self.data / "workspaces"
+    first = "优先核对年报披露的应收余额。"
+    revised = "先查季报里的应收账款账龄。"
+    other_note = "先核对乙公司的股权变动。"
+    with WorkspaceStore(self.data) as store:
+      wid = self.workspace.id
+      path = notes_dir / wid / "agent.md"
+      other = store.create_workspace("乙公司")
+      other_thread = store.create_thread(other.id, "跟踪")
+      (notes_dir / other.id / "agent.md").write_text(other_note, encoding="utf-8")
+
+      path.write_text(first, encoding="utf-8")
+      ask_workspace(store, model, wid, self.thread.id, "下一步？", self.checkpointer)
+      path.write_text(revised, encoding="utf-8")
+      ask_workspace(store, model, wid, self.thread.id, "现在呢？", self.checkpointer)
+      new_thread = store.create_thread(wid, "接手")
+      ask_workspace(store, model, wid, new_thread.id, "怎么继续？", self.checkpointer)
+      ask_workspace(store, model, other.id, other_thread.id, "查什么？", self.checkpointer)
+
+    prompts = [request[0].content for request in model.requests]
+    self.assertEqual(len(prompts), 4)
+    for prompt, expected in zip(prompts, [first, revised, revised, other_note]):
+      with self.subTest(expected=expected):
+        self.assertIn(expected, prompt)
+        for absent in {first, revised, other_note} - {expected}:
+          self.assertNotIn(absent, prompt)
+
   def test_concurrent_first_turns_only_instruct_one_research_initialization(self):
     with WorkspaceStore(self.data) as store:
       empty = store.create_workspace("并发首次研究")
@@ -250,6 +309,36 @@ class WorkspaceAgentTests(unittest.TestCase):
         context["other_threads"],
         [{"id": self.thread.id, "title": self.thread.title}],
     )
+
+  def test_over_budget_long_working_note_is_excerpted_only_for_model(self):
+    model = ScriptedModel(responses=[AIMessage(content="收到。")])
+    wid = self.workspace.id
+    question = "下一步查什么？"
+    path = self.data / "workspaces" / wid / "agent.md"
+    start = "优先核对本季回款。"
+    end = "附录末尾：上年数据已复核。"
+    full_note = start + "\n" + "历史核对记录。\n" * 4000 + end
+
+    with WorkspaceStore(self.data) as store:
+      next_thread = store.create_thread(wid, self.thread.title)
+      tools = create_workspace_tools(store.root, wid)
+      path.write_text(start, encoding="utf-8")
+      ask_workspace(store, model, wid, self.thread.id, question, self.checkpointer)
+      # Leave room beyond the observed short request for an excerpt and a file pointer.
+      budget = count_tokens_approximately(model.requests[0], tools=tools) + 128
+      path.write_text(full_note, encoding="utf-8")
+      with patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=str(budget)):
+        ask_workspace(store, model, wid, next_thread.id, question, self.checkpointer)
+
+    request = model.requests[1]
+    prompt = request[0].content
+    self.assertIn(start, prompt)
+    self.assertNotIn(end, prompt)
+    self.assertIn("截断", prompt)
+    self.assertIn("agent.md", prompt)
+    self.assertEqual(request[-1].content, question)
+    self.assertLessEqual(count_tokens_approximately(request, tools=tools), budget)
+    self.assertEqual(path.read_bytes(), full_note.encode("utf-8"))
 
   def test_over_budget_drops_oldest_complete_turn(self):
     first_question = "营收是多少？"

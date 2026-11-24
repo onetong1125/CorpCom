@@ -29,6 +29,35 @@ class ApiTestModel(FakeMessagesListChatModel):
     return self
 
 
+class UserMemoryDirectoryTests(unittest.TestCase):
+  def setUp(self):
+    self.root = Path(self.enterContext(TemporaryDirectory())).resolve() / "data"
+    # Local .env values must not affect the unconfigured case.
+    self.enterContext(patch("corpcom.api.load_dotenv"))
+    self.enterContext(patch.dict(os.environ))
+    os.environ.pop("CORPCOM_USER_MEMORY_DIR", None)
+
+  def test_user_memory_directory_is_resolved_once_per_app(self):
+    default_app = create_app(self.root)
+    for setting, expected in [
+        ("shared/memory", self.root / "shared/memory"),
+        (str(self.root.parent / "notes"), self.root.parent / "notes"),
+        ("~/.corpcom/memory", Path.home() / ".corpcom/memory"),
+    ]:
+      with self.subTest(setting=setting):
+        os.environ["CORPCOM_USER_MEMORY_DIR"] = setting
+        app = create_app(self.root)
+        self.assertEqual(app.state.user_memory_dir, expected.resolve())
+    self.assertEqual(default_app.state.user_memory_dir, self.root / "user/memory")
+
+  def test_user_memory_directory_must_be_separate_from_workspace_storage(self):
+    for setting in ("workspaces", "workspaces/company-a/memory", "."):
+      with self.subTest(setting=setting):
+        os.environ["CORPCOM_USER_MEMORY_DIR"] = setting
+        with self.assertRaises(ValueError):
+          create_app(self.root)
+
+
 class ApiTests(unittest.TestCase):
   def setUp(self):
     temporary = TemporaryDirectory()
@@ -58,6 +87,25 @@ class ApiTests(unittest.TestCase):
     self.assertEqual(result.status_code, 201, result.text)
     self.thread = result.json()
     self.thread_url = self.url + f"/threads/{self.thread['id']}"
+
+  def test_working_note_preview_reads_current_workspace_file_on_every_request(self):
+    workspaces = self.root / "data" / "workspaces"
+    path = workspaces / self.workspace["id"] / "agent.md"
+    url = self.url + "/working-note"
+    initial = "# 工作笔记\n- [ ] 核对季报。\n".encode("utf-8")
+    revised = ("# 工作笔记\r\n" + "核对记录。\r\n" * 4000 + "- [x] 已确认。  ").encode("utf-8")
+    for content in (initial, revised):
+      path.write_bytes(content)
+      response = self.client.get(url)
+      self.assertEqual(response.status_code, 200, response.text[:200])
+      self.assertEqual(response.content, content)
+
+    other = self.client.post("/api/workspaces", json={"title": "另一项研究"}).json()
+    other_note = "下一步核对库存。".encode("utf-8")
+    (workspaces / other["id"] / "agent.md").write_bytes(other_note)
+    response = self.client.get(f"/api/workspaces/{other['id']}/working-note")
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(response.content, other_note)
 
   def test_research_flow_and_restart_through_http(self):
     self.assertEqual(self.client.get("/health").json(), {"status": "ok"})
