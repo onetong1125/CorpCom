@@ -81,6 +81,71 @@ class WorkspaceStoreTests(unittest.TestCase):
       self.store.read_working_note(workspace.id)
     self.assertEqual(outside.read_text(encoding="utf-8"), "私人内容")
 
+  def test_missing_memory_index_is_empty_for_each_scope(self):
+    wid = self.create().id
+    user_dir = self.root / "custom-memory"
+    for scope in ("user", "workspace"):
+      with self.subTest(scope=scope):
+        self.assertEqual(self.store.read_memory_index(wid, scope, user_dir), "")
+
+  def test_memory_index_reads_shared_and_workspace_markdown_from_disk(self):
+    a = self.create("公司 A").id
+    b = self.create("公司 B").id
+    user_dir = self.root / "custom-memory"
+    shared = "- [报告单位](units.md) — 金额注明单位。\n"
+    project_a = "- [回款](cashflow.md) — 按季核对回款。\n"
+    project_b = "- [库存](inventory.md) — 跟踪周转天数。\n"
+    for directory, content in (
+        (user_dir, shared),
+        (self.data / "workspaces" / a / "memory", project_a),
+        (self.data / "workspaces" / b / "memory", project_b),
+    ):
+      directory.mkdir(parents=True, exist_ok=True)
+      (directory / "memory.md").write_text(content, encoding="utf-8")
+
+    for wid, expected in ((a, project_a), (b, project_b)):
+      with self.subTest(workspace=wid):
+        self.assertEqual(self.store.read_memory_index(wid, "user", user_dir), shared)
+        self.assertEqual(self.store.read_memory_index(wid, "workspace", user_dir), expected)
+
+    updated = "- [报告单位](units.md) — 金额与币种均须标注。\n"
+    (user_dir / "memory.md").write_text(updated, encoding="utf-8")
+    self.assertEqual(self.store.read_memory_index(b, "user", user_dir), updated)
+
+  def test_memory_topic_reads_latest_full_markdown_from_selected_scope(self):
+    wid = self.create().id
+    user_dir = self.root / "custom-memory"
+    project_dir = self.data / "workspaces" / wid / "memory"
+    key = "report-style.md"
+    header = "---\nname: 报告格式\ndescription: 金额口径\ntype: feedback\n---\n"
+    shared = header + "所有报告注明币种。\n\n依据：用户明确要求。\n"
+    project = header + "本项目另列原币金额。\n\n依据：项目约定。\n"
+    for directory, body in ((user_dir, shared), (project_dir, project)):
+      directory.mkdir(parents=True, exist_ok=True)
+      (directory / "memory.md").write_text(f"- [报告格式]({key}) — 金额口径\n", encoding="utf-8")
+      (directory / key).write_text(body, encoding="utf-8")
+
+    self.assertEqual(self.store.read_memory_topic(wid, "user", user_dir, key), shared)
+    self.assertEqual(self.store.read_memory_topic(wid, "workspace", user_dir, key), project)
+    revised = project.replace("另列原币金额", "同时列出原币和折算金额")
+    (project_dir / key).write_text(revised, encoding="utf-8")
+    self.assertEqual(self.store.read_memory_topic(wid, "workspace", user_dir, key), revised)
+
+  def test_missing_memory_topic_reports_its_filename(self):
+    wid = self.create().id
+    user_dir = self.root / "custom-memory"
+    user_dir.mkdir()
+    (user_dir / "memory.md").write_text("- [报告单位](units.md) — 单位约定\n", encoding="utf-8")
+    with self.assertRaisesRegex(FileNotFoundError, r"units\.md"):
+      self.store.read_memory_topic(wid, "user", user_dir, "units.md")
+
+  def test_memory_topic_requires_a_markdown_filename_in_the_scope_directory(self):
+    wid = self.create().id
+    user_dir = self.root / "custom-memory"
+    for key in ("notes.txt", "reports/summary.md", str(self.root / "report.md")):
+      with self.subTest(key=key), self.assertRaises(ValueError):
+        self.store.read_memory_topic(wid, "user", user_dir, key)
+
   def test_concurrent_user_messages_have_one_first_message_per_workspace(self):
     workspace = self.create()
     threads = [self.store.create_thread(workspace.id, str(i)) for i in range(2)]

@@ -73,6 +73,10 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     )
     load_dotenv()
     root = (data_dir if data_dir is not None else Path(os.getenv("CORPCOM_DATA_DIR", "data"))).resolve()
+    user_memory_dir = (root / Path(os.getenv("CORPCOM_USER_MEMORY_DIR", "user/memory")).expanduser()).resolve()
+    workspaces_dir = (root / "workspaces").resolve()
+    if user_memory_dir.is_relative_to(workspaces_dir) or workspaces_dir.is_relative_to(user_memory_dir):
+        raise ValueError("用户记忆目录必须独立于工作区目录")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -102,6 +106,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         version="0.1.0",
         lifespan=lifespan
     )
+    app.state.user_memory_dir = user_memory_dir
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[origin.strip() for origin in os.getenv(

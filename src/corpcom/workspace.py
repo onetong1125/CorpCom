@@ -183,6 +183,24 @@ class WorkspaceStore:
     with os.fdopen(descriptor, "r", encoding="utf-8", newline="") as note:
       return note.read()
 
+  def read_memory_index(
+      self, workspace_id: str, scope: Literal["user", "workspace"], user_memory_dir: Path,
+  ) -> str:
+    """Read the scope's UTF-8 index, returning empty text if it is missing."""
+    self.get_workspace(workspace_id)
+    directory = user_memory_dir if scope == "user" else self.root / "workspaces" / workspace_id / "memory"
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    try:
+      directory_fd = os.open(directory, flags | os.O_DIRECTORY)
+      try:
+        index_fd = os.open("memory.md", flags, dir_fd=directory_fd)
+      finally:
+        os.close(directory_fd)
+    except FileNotFoundError:
+      return ""
+    with os.fdopen(index_fd, "r", encoding="utf-8", newline="") as index:
+      return index.read()
+
   def _thread(self, workspace_id: str, thread_id: str) -> Thread:
     # Check ownership before reading or adding messages, not just the thread ID.
     row = self.db.execute(
