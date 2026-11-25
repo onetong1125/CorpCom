@@ -531,6 +531,76 @@ class WorkspaceAgentTests(unittest.TestCase):
             self.assertIn(line, entries[scope])
         self.assertEqual(path.read_bytes(), "\n".join(entries[scope]).encode("utf-8"))
 
+  def test_long_index_leaves_room_for_requested_memory_evidence(self):
+    wid = self.workspace.id
+    directory = self.data / "workspaces" / wid / "memory"
+    directory.mkdir()
+    evidence = "# 回款核查\n一季报第 8 页：本季回款提前了 15 天。\n"
+    (directory / "cashflow.md").write_text(evidence, encoding="utf-8")
+    entry = "- [回款核查](cashflow.md) — 核对回款时间"
+    index = directory / "memory.md"
+    index.write_text(entry, encoding="utf-8")
+    question = "本季回款提前的依据是什么？"
+    model = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[{
+            "id": "read-evidence", "name": "read_memory",
+            "args": {"scope": "workspace", "key": "cashflow.md"},
+        }]),
+        AIMessage(content="已核对季报。"),
+    ])
+    with WorkspaceStore(self.data) as store:
+      second_thread = store.create_thread(wid, self.thread.title)
+      tools = create_workspace_tools(store.root, wid)
+      ask_workspace(store, model, wid, self.thread.id, question, self.checkpointer)
+      budget = count_tokens_approximately(model.requests[-1], tools=tools) + 200
+      extra = [f"- [历史主题 {i}](history_{i}.md) — 其他季度资料" for i in range(200)]
+      index.write_text("\n".join([entry, *extra]), encoding="utf-8")
+      with patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=str(budget)):
+        ask_workspace(store, model, wid, second_thread.id, question, self.checkpointer)
+
+    request = model.requests[-1]
+    self.assertLessEqual(count_tokens_approximately(request, tools=tools), budget)
+    self.assertNotIn(extra[-1], request[0].content)
+    result = next(msg for msg in request if isinstance(msg, ToolMessage))
+    self.assertEqual(result.content, evidence)
+
+  def test_agent_searches_selected_memory_index_beyond_its_prompt_excerpt(self):
+    wid = self.workspace.id
+    shared = self.root / "shared-memory"
+    shared.mkdir()
+    project = self.data / "workspaces" / wid / "memory"
+    project.mkdir()
+    match = "- [报告格式](report_units.md) — 披露金额单位"
+    other_scope = "- [本季调整](quarter.md) — 本项目金额单位"
+    (project / "memory.md").write_text(other_scope, encoding="utf-8")
+    question = "通用记忆里有没有关于金额单位的约定？"
+    model = ScriptedModel(responses=[
+        AIMessage(content="已查看目录。"),
+        AIMessage(content="", tool_calls=[{
+            "id": "find-units", "name": "search_memory",
+            "args": {"scope": "user", "query": "金额单位"},
+        }]),
+        AIMessage(content="找到了报告格式条目。"),
+    ])
+    with WorkspaceStore(self.data) as store:
+      second_thread = store.create_thread(wid, self.thread.title)
+      tools = create_workspace_tools(store.root, wid, user_memory_dir=shared)
+      ask_workspace(store, model, wid, self.thread.id, question, self.checkpointer, user_memory_dir=shared)
+      budget = count_tokens_approximately(model.requests[0], tools=tools) + 200
+      filler = [f"- [历史资料 {i}](history_{i}.md) — 背景说明" for i in range(200)]
+      (shared / "memory.md").write_text("\n".join([*filler, match]), encoding="utf-8")
+      with patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=str(budget)):
+        ask_workspace(store, model, wid, second_thread.id, question, self.checkpointer, user_memory_dir=shared)
+
+    self.assertNotIn("report_units.md", model.requests[1][0].content)
+    request = model.requests[-1]
+    self.assertLessEqual(count_tokens_approximately(request, tools=tools), budget)
+    result = next(msg for msg in request if isinstance(msg, ToolMessage))
+    self.assertEqual(result.status, "success", result.content)
+    self.assertIn(match, result.content)
+    self.assertNotIn(other_scope, result.content)
+    self.assertNotIn(filler[0], result.content)
+
   def test_over_budget_drops_oldest_complete_turn(self):
     first_question = "营收是多少？"
     first_answer = "营收为 100 万元。"

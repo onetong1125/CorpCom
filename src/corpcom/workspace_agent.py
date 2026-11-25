@@ -135,6 +135,35 @@ def compact_model_input_tokens(
           tools=request.tools,
       )
 
+    if count > budget and any(memory_indexes.values()):
+      index_lines = {
+          scope: index.splitlines(keepends=True)
+          for scope, index in memory_indexes.items()
+      }
+      # Try the same line limit for each scope so both can contribute entries.
+      low, high = 1, max(map(len, index_lines.values())) - 1
+      memory_indexes = {}
+      system_message = request.system_message.model_copy(update={
+          "content": render_prompt(working_note, memory_indexes),
+      })
+      count = count_tokens_approximately([system_message, *messages], tools=request.tools)
+      while count <= budget and low <= high:
+        middle = (low + high) // 2
+        candidate_indexes = {
+            scope: "".join(lines[:middle]) for scope, lines in index_lines.items()
+        }
+        candidate = request.system_message.model_copy(update={
+            "content": render_prompt(working_note, candidate_indexes),
+        })
+        candidate_count = count_tokens_approximately([candidate, *messages], tools=request.tools)
+        if candidate_count <= budget:
+          memory_indexes = candidate_indexes
+          system_message = candidate
+          count = candidate_count
+          low = middle + 1
+        else:
+          high = middle - 1
+
     if count > budget:
       messages = list(messages)
       marker = "\n[工具结果已截断]"
@@ -154,7 +183,7 @@ def compact_model_input_tokens(
               update={"content": original[:middle] + marker}
           )
           candidate_count = count_tokens_approximately(
-              [request.system_message, *messages], tools=request.tools,
+              [system_message, *messages], tools=request.tools,
           )
           if candidate_count <= budget:
             low = middle
@@ -164,36 +193,8 @@ def compact_model_input_tokens(
             update={"content": original[:low] + marker}
         )
         count = count_tokens_approximately(
-            [request.system_message, *messages], tools=request.tools,
+            [system_message, *messages], tools=request.tools,
         )
-      if count > budget and any(memory_indexes.values()):
-        index_lines = {
-            scope: index.splitlines(keepends=True)
-            for scope, index in memory_indexes.items()
-        }
-        # Try the same line limit for each scope so both can contribute entries.
-        low, high = 1, max(map(len, index_lines.values())) - 1
-        memory_indexes = {}
-        system_message = request.system_message.model_copy(update={
-            "content": render_prompt(working_note, memory_indexes),
-        })
-        count = count_tokens_approximately([system_message, *messages], tools=request.tools)
-        while count <= budget and low <= high:
-          middle = (low + high) // 2
-          candidate_indexes = {
-              scope: "".join(lines[:middle]) for scope, lines in index_lines.items()
-          }
-          candidate = request.system_message.model_copy(update={
-              "content": render_prompt(working_note, candidate_indexes),
-          })
-          candidate_count = count_tokens_approximately([candidate, *messages], tools=request.tools)
-          if candidate_count <= budget:
-            memory_indexes = candidate_indexes
-            system_message = candidate
-            count = candidate_count
-            low = middle + 1
-          else:
-            high = middle - 1
       if count > budget:
         marker = "\n［工作笔记已截断，可读取 agent.md 查看全文］"
         low, high = 0, len(working_note) - 1
