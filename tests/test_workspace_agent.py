@@ -374,6 +374,112 @@ class WorkspaceAgentTests(unittest.TestCase):
       with self.subTest(scope=scope):
         self.assertEqual(results[scope], markdown)
 
+  def test_agent_creates_user_memory_discoverable_from_another_workspace(self):
+    shared = self.root / "shared-memory"
+    key = "report_units.md"
+    body = "适用于所有项目：金额必须注明币种和单位。\n"
+    model = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[{
+            "id": "save-units", "name": "write_memory",
+            "args": {"scope": "user", "key": key, "name": "报告单位",
+                     "description": "金额披露约定", "memory_type": "feedback", "body": body},
+        }]),
+        AIMessage(content="已记录。"),
+        AIMessage(content="", tool_calls=[{
+            "id": "read-units", "name": "read_memory", "args": {"scope": "user", "key": key},
+        }]),
+        AIMessage(content="已查看约定。"),
+    ])
+    with WorkspaceStore(self.data) as store:
+      ask_workspace(store, model, self.workspace.id, self.thread.id,
+                    "记住：以后所有项目的金额都要注明币种和单位。", self.checkpointer,
+                    user_memory_dir=shared)
+      saved = next(msg for msg in model.requests[1] if isinstance(msg, ToolMessage))
+      self.assertEqual(saved.status, "success", saved.content)
+      markdown = (shared / key).read_text(encoding="utf-8")
+      self.assertTrue(markdown.endswith(body))
+      entry = "- [报告单位](report_units.md) — 金额披露约定"
+      self.assertIn(entry, (shared / "memory.md").read_text(encoding="utf-8").splitlines())
+
+      other = store.create_workspace("另一家公司")
+      thread = store.create_thread(other.id, "新项目的报告")
+      ask_workspace(store, model, other.id, thread.id, "金额披露有什么约定？",
+                    self.checkpointer, user_memory_dir=shared)
+
+    self.assertIn(entry, model.requests[2][0].content)
+    self.assertNotIn(body.strip(), model.requests[2][0].content)
+    result = next(msg for msg in model.requests[3] if isinstance(msg, ToolMessage))
+    self.assertEqual(result.content, markdown)
+
+  def test_agent_revises_project_memory_using_the_markdown_it_read(self):
+    wid = self.workspace.id
+    directory = self.data / "workspaces" / wid / "memory"
+    directory.mkdir()
+    key = "cashflow.md"
+    header = "---\n# 用户备注\nname: 回款\ndescription: 跟踪到账时点\ntype: project\n---\n\n"
+    original = header + "回款改善，原因待核实。\n"
+    revised = "季报第 8 页确认本季回款提前，仍需核对下一季度。\n"
+    topic = directory / key
+    topic.write_text(original, encoding="utf-8")
+    index = directory / "memory.md"
+    entry = "# 用户整理的目录\n\n- [回款](cashflow.md) — 跟踪到账时点\n"
+    index.write_text(entry, encoding="utf-8")
+    args = {"scope": "workspace", "key": key}
+    model = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[{"id": "read", "name": "read_memory", "args": args}]),
+        AIMessage(content="原因待核实。"),
+    ])
+    with WorkspaceStore(self.data) as store:
+      ask_workspace(store, model, wid, self.thread.id, "先核对已有的回款判断。", self.checkpointer)
+      read = next(msg for msg in model.requests[-1] if isinstance(msg, ToolMessage))
+      self.assertEqual(read.content, original)
+      model.responses = [
+          AIMessage(content="", tool_calls=[{
+              "id": "revise", "name": "write_memory",
+              "args": {**args, "expected_markdown": read.content, "body": revised},
+          }]),
+          AIMessage(content="已更新项目判断。"),
+      ]
+      ask_workspace(store, model, wid, self.thread.id, "根据季报第 8 页修订原主题。", self.checkpointer)
+
+    result = next(msg for msg in model.requests[-1] if isinstance(msg, ToolMessage)
+                  and msg.tool_call_id == "revise")
+    self.assertEqual(result.status, "success", result.content)
+    self.assertEqual(topic.read_bytes(), (header + revised).encode("utf-8"))
+    self.assertEqual(index.read_bytes(), entry.encode("utf-8"))
+
+  def test_agent_forgets_only_the_requested_memory_scope(self):
+    wid = self.workspace.id
+    shared = self.root / "shared-memory"
+    project = self.data / "workspaces" / wid / "memory"
+    key = "units.md"
+    keep = "# 手写目录\n\n- [币种](currency.md) — 保留这条约定\n"
+    entry = "- [单位](units.md) — 金额单位约定\n"
+    shared_body = "# 用户偏好\n所有报告使用万元。\n"
+    project_body = "# 项目约定\n按年报原始单位列示。\n"
+    for directory, body in ((shared, shared_body), (project, project_body)):
+      directory.mkdir()
+      (directory / key).write_text(body, encoding="utf-8")
+      (directory / "memory.md").write_text(keep + entry, encoding="utf-8")
+    args = {"scope": "user", "key": key}
+    model = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[{"id": "read", "name": "read_memory", "args": args}]),
+        AIMessage(content="", tool_calls=[{
+            "id": "forget", "name": "forget_memory", "args": {**args, "expected_markdown": shared_body},
+        }]),
+        AIMessage(content="已移除通用单位偏好。"),
+    ])
+    with WorkspaceStore(self.data) as store:
+      ask_workspace(store, model, wid, self.thread.id, "忘记通用单位偏好，保留本项目的约定。",
+                    self.checkpointer, user_memory_dir=shared)
+    results = {msg.tool_call_id: msg for msg in model.requests[-1] if isinstance(msg, ToolMessage)}
+    self.assertEqual(results["read"].content, shared_body)
+    self.assertEqual(results["forget"].status, "success", results["forget"].content)
+    self.assertFalse((shared / key).exists())
+    self.assertEqual((shared / "memory.md").read_bytes(), keep.encode("utf-8"))
+    self.assertEqual((project / key).read_bytes(), project_body.encode("utf-8"))
+    self.assertEqual((project / "memory.md").read_bytes(), (keep + entry).encode("utf-8"))
+
   def test_over_budget_long_memory_indexes_keep_usable_entries_from_both_scopes(self):
     wid = self.workspace.id
     question = "有哪些记忆可以接着查？"

@@ -259,7 +259,7 @@ def create_workspace_agent(
 
   return create_agent(
       model,
-      tools=create_workspace_tools(store.root, workspace_id),
+      tools=create_workspace_tools(store.root, workspace_id, user_memory_dir=user_memory_dir),
       system_prompt=render_prompt(working_note, memory_indexes),
       middleware=[
         ModelCallLimitMiddleware(run_limit=100, exit_behavior="error"),

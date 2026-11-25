@@ -1,6 +1,6 @@
 # Working Memory 与 Long-term Memory
 
-本文记录 CorpCom 已确认的跨会话记忆设计。当前已有 Thread checkpoint、运行历史、工作区研究档案和资料库。工作笔记已接入 Agent 和工作台的「记忆」面板，两级长期记忆已支持存储层的创建、修订、忘记和面板只读预览。Agent 每轮读取两个作用域的索引，超出模型输入预算时按整行截取，磁盘保留全文。按需读写主题的 Agent 工具待接入。[现有存储](workspace-local.md)
+本文记录 CorpCom 已确认的跨会话记忆设计。当前已有 Thread checkpoint、运行历史、工作区研究档案和资料库。工作笔记已接入 Agent 和工作台的「记忆」面板，两级长期记忆已支持存储层的创建、修订、忘记和面板只读预览。Agent 每轮读取两个作用域的索引，超出模型输入预算时按整行截取，磁盘保留全文。Agent 可通过 `read_memory` 读取主题，通过 `write_memory` 创建主题并更新索引，也可凭上次读取的原文修订正文，保留文件头和手写索引。已验证一个 Workspace 保存的用户偏好可在另一个 Workspace 发现并读回。Agent 的忘记工具待接入。[现有存储](workspace-local.md)
 
 | | Working Memory · 工作笔记 | Long-term Memory · 长期记忆 |
 | --- | --- | --- |
