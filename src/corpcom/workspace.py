@@ -259,19 +259,16 @@ class WorkspaceStore:
       finally:
         os.unlink(temporary, dir_fd=directory_fd)
 
-      index_fd = os.open(
-          "memory.md", os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
-          mode=0o600, dir_fd=directory_fd,
-      )
-      with os.fdopen(index_fd, "a+b") as index:
-        index.seek(0)
-        index_content = index.read()
-        destination = b"(" + key.encode("utf-8") + b")"
-        if any(self._memory_index_entry_matches(line, destination) for line in index_content.splitlines()):
-          return
-        if index_content and not index_content.endswith(b"\n"):
-          entry = b"\n" + entry
-        index.write(entry)
+      try:
+        index_content = self._read_memory_file(directory_fd, "memory.md")
+      except FileNotFoundError:
+        index_content = b""
+      destination = b"(" + key.encode("utf-8") + b")"
+      if any(self._memory_index_entry_matches(line, destination) for line in index_content.splitlines()):
+        return
+      if index_content and not index_content.endswith(b"\n"):
+        entry = b"\n" + entry
+      self._replace_memory_file(directory_fd, "memory.md", index_content + entry)
     finally:
       os.close(directory_fd)
 

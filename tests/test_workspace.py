@@ -252,6 +252,35 @@ class WorkspaceStoreTests(unittest.TestCase):
       self.assertEqual(index.read_bytes(), original + link + " — 到账依据\n".encode("utf-8"))
       self.assertEqual(self.store.read_memory_topic(wid, "user", directory, key), topic)
 
+  def test_two_workspaces_concurrently_add_topics_to_the_shared_user_index(self):
+    directory = self.root / "custom-memory"
+    directory.mkdir()
+    original = "# 手写索引\r\n\r\n- [原有约定](existing.md) — 用户备注\r\n"
+    index = directory / "memory.md"
+    index.write_bytes(original.encode())
+    topics = [
+        (self.create("公司 A").id, "units.md", "报告单位", "注明币种"),
+        (self.create("公司 B").id, "sources.md", "引用来源", "注明页码"),
+    ]
+    ready = Barrier(2)
+
+    def save(topic):
+      wid, key, name, description = topic
+      with WorkspaceStore(self.data) as store:
+        ready.wait(timeout=5)
+        store.create_memory_topic(wid, "user", directory, key, name=name,
+                                  description=description, memory_type="feedback", body=description)
+
+    with ThreadPoolExecutor(max_workers=2) as writers:
+      list(writers.map(save, topics))
+
+    saved = index.read_bytes()
+    self.assertTrue(saved.startswith(original.encode()))
+    self.assertCountEqual(saved[len(original.encode()):].decode().splitlines(),
+                          [f"- [{name}]({key}) — {desc}" for _, key, name, desc in topics])
+    for wid, key, _, description in topics:
+      self.assertTrue(self.store.read_memory_topic(wid, "user", directory, key).endswith(description))
+
   def test_retry_memory_topic_repairs_missing_entry_only_once(self):
     wid = self.create().id
     directory = self.root / "custom-memory"
