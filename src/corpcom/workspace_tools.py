@@ -92,6 +92,22 @@ def create_workspace_tools(
                 )
         return f"已保存 {key}"
 
+    @tool
+    def forget_memory(
+        scope: Literal["user", "workspace"], key: str, expected_markdown: str,
+    ) -> str:
+        """Remove a memory topic and its index entry in the selected scope.
+
+        First call read_memory with the same scope and key. Pass the complete
+        Markdown it returned verbatim as expected_markdown. If the topic has
+        changed, read it again before deciding whether to retry.
+        """
+        with WorkspaceStore(data_dir) as store:
+            store.forget_memory_topic(
+                workspace_id, scope, user_memory_dir, key, expected_markdown=expected_markdown,
+            )
+        return f"已移除 {key}"
+
     # 暂停按 Artifact ID 读取的 Agent 工具，工作区文件通过 execute_bash 读取。
     # @tool
     # def read_file(artifact_id: str) -> dict:
@@ -287,6 +303,7 @@ def create_workspace_tools(
       read_thread,
       read_memory,
       write_memory,
+      forget_memory,
       update_research,
       read_function_doc,
       execute_python, execute_bash,

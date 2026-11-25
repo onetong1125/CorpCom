@@ -340,6 +340,18 @@ class WorkspaceAgentTests(unittest.TestCase):
     self.assertLessEqual(count_tokens_approximately(request, tools=tools), budget)
     self.assertEqual(path.read_bytes(), full_note.encode("utf-8"))
 
+  def test_new_thread_receives_scoped_long_term_memory_tool_instructions(self):
+    model = ScriptedModel(responses=[AIMessage(content="先核对已有约定。")])
+    with WorkspaceStore(self.data) as store:
+      ask_workspace(store, model, self.workspace.id, self.thread.id,
+                    "这个项目有哪些可沿用的研究约定？", self.checkpointer)
+
+    # Only inspect instructions, excluding the function catalog and saved user data.
+    instructions = model.requests[0][0].content.split("可用沙箱数据函数：", 1)[0]
+    for term in ("memory_indexes", "user", "workspace", "read_memory", "write_memory", "forget_memory"):
+      with self.subTest(term=term):
+        self.assertRegex(instructions, rf"(?<![/A-Za-z0-9_]){term}(?![/A-Za-z0-9_])")
+
   def test_agent_reads_requested_memory_topic_from_each_scope(self):
     wid = self.workspace.id
     key = "report.md"
