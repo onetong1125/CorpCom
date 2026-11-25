@@ -340,6 +340,40 @@ class WorkspaceAgentTests(unittest.TestCase):
     self.assertLessEqual(count_tokens_approximately(request, tools=tools), budget)
     self.assertEqual(path.read_bytes(), full_note.encode("utf-8"))
 
+  def test_agent_reads_requested_memory_topic_from_each_scope(self):
+    wid = self.workspace.id
+    key = "report.md"
+    shared = self.root / "shared-memory"
+    project = self.data / "workspaces" / wid / "memory"
+    topics = {
+        "user": (shared, "# 报告约定\n所有金额注明单位。\n"),
+        "workspace": (project, "# 项目依据\n现金流改善主要来自本季回款。\n"),
+    }
+    for directory, markdown in topics.values():
+      directory.mkdir()
+      (directory / key).write_text(markdown, encoding="utf-8")
+      (directory / "memory.md").write_text("- [报告](report.md) — 报告说明\n", encoding="utf-8")
+    model = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[
+            {"name": "read_memory", "args": {"scope": scope, "key": key}, "id": scope}
+            for scope in topics
+        ]),
+        AIMessage(content="已核对两份主题。"),
+    ])
+    with WorkspaceStore(self.data) as store:
+      ask_workspace(store, model, wid, self.thread.id, "请查两份报告说明。",
+                    self.checkpointer, user_memory_dir=shared)
+
+    for _, markdown in topics.values():
+      self.assertNotIn(markdown.splitlines()[1], model.requests[0][0].content)
+    results = {
+        message.tool_call_id: message.content for message in model.requests[1]
+        if isinstance(message, ToolMessage)
+    }
+    for scope, (_, markdown) in topics.items():
+      with self.subTest(scope=scope):
+        self.assertEqual(results[scope], markdown)
+
   def test_over_budget_long_memory_indexes_keep_usable_entries_from_both_scopes(self):
     wid = self.workspace.id
     question = "有哪些记忆可以接着查？"

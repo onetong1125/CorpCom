@@ -99,9 +99,10 @@ def compact_model_input_tokens(
     request,
     handler,
     working_note: str,
-    render_prompt: Callable[[str], str]
+    memory_indexes: dict[str, str],
+    render_prompt: Callable[[str, dict[str, str]], str],
 ):
-  """Fit history, tool results and the working note to the model input budget."""
+  """Fit history, tool results, and research memory to the model input budget."""
   system_message = request.system_message
   messages = request.messages
   count = count_tokens_approximately(
@@ -165,13 +166,41 @@ def compact_model_input_tokens(
         count = count_tokens_approximately(
             [request.system_message, *messages], tools=request.tools,
         )
+      if count > budget and any(memory_indexes.values()):
+        index_lines = {
+            scope: index.splitlines(keepends=True)
+            for scope, index in memory_indexes.items()
+        }
+        # Try the same line limit for each scope so both can contribute entries.
+        low, high = 1, max(map(len, index_lines.values())) - 1
+        memory_indexes = {}
+        system_message = request.system_message.model_copy(update={
+            "content": render_prompt(working_note, memory_indexes),
+        })
+        count = count_tokens_approximately([system_message, *messages], tools=request.tools)
+        while count <= budget and low <= high:
+          middle = (low + high) // 2
+          candidate_indexes = {
+              scope: "".join(lines[:middle]) for scope, lines in index_lines.items()
+          }
+          candidate = request.system_message.model_copy(update={
+              "content": render_prompt(working_note, candidate_indexes),
+          })
+          candidate_count = count_tokens_approximately([candidate, *messages], tools=request.tools)
+          if candidate_count <= budget:
+            memory_indexes = candidate_indexes
+            system_message = candidate
+            count = candidate_count
+            low = middle + 1
+          else:
+            high = middle - 1
       if count > budget:
         marker = "\n［工作笔记已截断，可读取 agent.md 查看全文］"
         low, high = 0, len(working_note) - 1
         while low <= high:
           middle = (low + high) // 2
           candidate = request.system_message.model_copy(update={
-              "content": render_prompt(working_note[:middle] + marker),
+              "content": render_prompt(working_note[:middle] + marker, memory_indexes),
           })
           candidate_count = count_tokens_approximately(
               [candidate, *messages], tools=request.tools,
@@ -213,24 +242,25 @@ def create_workspace_agent(
   working_note = store.read_working_note(workspace_id)
   if user_memory_dir is None:
     user_memory_dir = store.root / "user" / "memory"
-  user_index = store.read_memory_index(workspace_id, "user", user_memory_dir)
-  workspace_index = store.read_memory_index(workspace_id, "workspace", user_memory_dir)
-  if user_index or workspace_index:
-    context["memory_indexes"] = {"user": user_index, "workspace": workspace_index}
+  memory_indexes = {
+      "user": store.read_memory_index(workspace_id, "user", user_memory_dir),
+      "workspace": store.read_memory_index(workspace_id, "workspace", user_memory_dir),
+  }
 
-  def render_prompt(note: str) -> str:
-    return build_workspace_prompt(
-        {**context, "working_note": note}, initialize_research=initialize_research,
-    )
+  def render_prompt(note: str, indexes: dict[str, str]) -> str:
+    prompt_context = {**context, "working_note": note}
+    if any(indexes.values()):
+      prompt_context["memory_indexes"] = indexes
+    return build_workspace_prompt(prompt_context, initialize_research=initialize_research)
 
   @wrap_model_call
   def apply_input_budget(request, handler):
-    return compact_model_input_tokens(request, handler, working_note, render_prompt)
+    return compact_model_input_tokens(request, handler, working_note, memory_indexes, render_prompt)
 
   return create_agent(
       model,
       tools=create_workspace_tools(store.root, workspace_id),
-      system_prompt=render_prompt(working_note),
+      system_prompt=render_prompt(working_note, memory_indexes),
       middleware=[
         ModelCallLimitMiddleware(run_limit=100, exit_behavior="error"),
         handle_workspace_tool_error,
