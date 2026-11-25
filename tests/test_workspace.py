@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from textwrap import dedent
 from threading import Barrier
 import unittest
 import sqlite3
@@ -190,6 +191,42 @@ class WorkspaceStoreTests(unittest.TestCase):
           memory_type="feedback", body="依据：用户明确要求。\n",
       )
     self.assertEqual(index.read_text(encoding="utf-8"), "# 手写索引\n")
+
+  def test_retry_create_memory_topic_after_body_write_failure(self):
+    wid = self.create().id
+    directory = self.root / "custom-memory"
+    key = "cashflow.md"
+    fields = dict(name="回款", description="到账依据", memory_type="reference",
+                  body="一季报第八页记录了到账日期。\n" * 100)
+    # Limit only the child writer. The retry uses the same public API without the limit.
+    writer = dedent("""\
+        import errno, json, resource, signal, sys
+        from pathlib import Path
+        from corpcom.workspace import WorkspaceStore
+
+        data, wid, directory, key, fields = sys.argv[1:]
+        with WorkspaceStore(Path(data)) as store:
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            limits = resource.getrlimit(resource.RLIMIT_FSIZE)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (128, limits[1]))
+            try:
+                store.create_memory_topic(wid, "user", Path(directory), key, **json.loads(fields))
+            except OSError as exc:
+                if exc.errno != errno.EFBIG:
+                    raise
+            else:
+                raise AssertionError("Expected the topic write to exceed 128 bytes")
+            finally:
+                resource.setrlimit(resource.RLIMIT_FSIZE, limits)
+        """)
+    subprocess.run([sys.executable, "-c", writer, str(self.data), wid, str(directory), key,
+                    json.dumps(fields)], check=True)
+    self.assertFalse((directory / key).exists(), "失败的写入留下了不完整的正式主题")
+    self.assertEqual(self.store.read_memory_index(wid, "user", directory), "")
+    self.store.create_memory_topic(wid, "user", directory, key, **fields)
+    self.assertTrue(self.store.read_memory_topic(wid, "user", directory, key).endswith(fields["body"]))
+    self.assertEqual(self.store.read_memory_index(wid, "user", directory),
+                     "- [回款](cashflow.md) — 到账依据\n")
 
   def test_retry_memory_topic_repairs_missing_entry_only_once(self):
     wid = self.create().id

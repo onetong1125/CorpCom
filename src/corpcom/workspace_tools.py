@@ -63,6 +63,17 @@ def create_workspace_tools(
             return store.read_memory_topic(workspace_id, scope, user_memory_dir, key)
 
     @tool
+    def search_memory(scope: Literal["user", "workspace"], query: str) -> str:
+        """Search the full memory index in the selected scope for a keyword.
+
+        Use this when a relevant topic is missing from the index preview.
+        Use a filename from the matching lines with read_memory to read the topic.
+        """
+        with WorkspaceStore(data_dir) as store:
+            index = store.read_memory_index(workspace_id, scope, user_memory_dir)
+        return "\n".join(line for line in index.splitlines() if query in line)
+
+    @tool
     def write_memory(
         scope: Literal["user", "workspace"], key: str, body: str,
         name: str | None = None, description: str | None = None,
@@ -302,6 +313,7 @@ def create_workspace_tools(
     return [
       read_thread,
       read_memory,
+      search_memory,
       write_memory,
       forget_memory,
       update_research,
