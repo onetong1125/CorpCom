@@ -340,6 +340,45 @@ class WorkspaceAgentTests(unittest.TestCase):
     self.assertLessEqual(count_tokens_approximately(request, tools=tools), budget)
     self.assertEqual(path.read_bytes(), full_note.encode("utf-8"))
 
+  def test_over_budget_long_memory_indexes_keep_usable_entries_from_both_scopes(self):
+    wid = self.workspace.id
+    question = "有哪些记忆可以接着查？"
+    model = ScriptedModel(responses=[AIMessage(content="已查看目录。")])
+    directory = self.data / "workspaces" / wid
+    paths = {"user": self.data / "user/memory/memory.md", "workspace": directory / "memory/memory.md"}
+    entries = {}
+    for scope, path in paths.items():
+      path.parent.mkdir(parents=True)
+      entries[scope] = [f"- [{scope} 第{i}项]({scope}_{i}.md) — 核查依据。" for i in range(200)]
+      path.write_text(entries[scope][0], encoding="utf-8")
+    note = "下一步先核实季报到账时间。"
+    (directory / "agent.md").write_text(note, encoding="utf-8")
+
+    with WorkspaceStore(self.data) as store:
+      next_thread = store.create_thread(wid, self.thread.title)
+      tools = create_workspace_tools(store.root, wid)
+      ask_workspace(store, model, wid, self.thread.id, question, self.checkpointer)
+      budget = count_tokens_approximately(model.requests[0], tools=tools) + 200
+      for scope, path in paths.items():
+        path.write_text("\n".join(entries[scope]), encoding="utf-8")
+      with patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=str(budget)):
+        ask_workspace(store, model, wid, next_thread.id, question, self.checkpointer)
+
+    request = model.requests[1]
+    self.assertLessEqual(count_tokens_approximately(request, tools=tools), budget)
+    self.assertEqual(request[-1].content, question)
+    state = json.loads(request[0].content.split("当前 Workspace 的已保存研究状态：\n", 1)[1])
+    self.assertEqual(state["working_note"], note)
+    for scope, path in paths.items():
+      with self.subTest(scope=scope):
+        preview = state["memory_indexes"][scope].splitlines()
+        self.assertIn(entries[scope][0], preview)
+        self.assertNotIn(entries[scope][-1], preview)
+        for line in preview:
+          if line.startswith("- ["):
+            self.assertIn(line, entries[scope])
+        self.assertEqual(path.read_bytes(), "\n".join(entries[scope]).encode("utf-8"))
+
   def test_over_budget_drops_oldest_complete_turn(self):
     first_question = "营收是多少？"
     first_answer = "营收为 100 万元。"

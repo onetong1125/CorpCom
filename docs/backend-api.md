@@ -24,6 +24,8 @@ Vite 开发服务代理 `/api`。浏览器直接跨域访问后端时，默认�
 | GET | `/api/workspaces` | 返回 `WorkspaceSummary[]` |
 | GET | `/api/workspaces/{wid}` | 返回 `WorkspaceDetail`，包含会话和文件索引 |
 | GET | `/api/workspaces/{wid}/working-note` | 每次从该工作区读取完整 `agent.md`，返回 UTF-8 纯文本 |
+| GET | `/api/workspaces/{wid}/memory/index?scope=workspace` | 读取所选范围的完整 `memory.md`，返回 UTF-8 纯文本。必填参数 `scope` 可取 `workspace` 或 `user`，索引缺失时正文为空 |
+| GET | `/api/workspaces/{wid}/memory/topics/{key}?scope=workspace` | 按单个 Markdown 文件名返回所选范围的完整 UTF-8 原文，包含 YAML 头部。范围同上，主题缺失返回 404 |
 | PUT | `/api/workspaces/{wid}/research` | 更新提交的研究字段，返回 `Workspace` |
 | PUT | `/api/workspaces/{wid}/preferences` | 保留的兼容路由，支持相同的五类字段；原 `{"preferences": {...}}` 请求仍整体替换偏好 |
 | POST | `/api/workspaces/{wid}/threads` | `{"title":"首次讨论"}` 创建会话，返回 `Thread`，状态码 201 |

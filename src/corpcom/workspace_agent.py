@@ -3,6 +3,7 @@
 import logging
 import os
 from collections.abc import Callable
+from pathlib import Path
 
 from langchain_core.messages.utils import count_tokens_approximately
 from pydantic import env_settings
@@ -190,7 +191,7 @@ def compact_model_input_tokens(
 def create_workspace_agent(
     store: WorkspaceStore, model: BaseChatModel,
     workspace_id: str, thread_id: str, checkpointer: BaseCheckpointSaver,
-    *, is_first_message: bool = False,
+    *, is_first_message: bool = False, user_memory_dir: Path | None = None,
 ):
   """Build the same graph for research execution and checkpoint recovery."""
   detail = store.get_workspace_detail(workspace_id)
@@ -210,6 +211,12 @@ def create_workspace_agent(
     ],
   }
   working_note = store.read_working_note(workspace_id)
+  if user_memory_dir is None:
+    user_memory_dir = store.root / "user" / "memory"
+  user_index = store.read_memory_index(workspace_id, "user", user_memory_dir)
+  workspace_index = store.read_memory_index(workspace_id, "workspace", user_memory_dir)
+  if user_index or workspace_index:
+    context["memory_indexes"] = {"user": user_index, "workspace": workspace_index}
 
   def render_prompt(note: str) -> str:
     return build_workspace_prompt(
@@ -238,6 +245,7 @@ def ask_workspace(
     workspace_id: str, thread_id: str, question: str,
     checkpointer: BaseCheckpointSaver, *,
     on_event: Callable[[AgentEvent], None] | None = None,
+    user_memory_dir: Path | None = None,
 ) -> AIMessage:
   """Save the user's question and generate the answer."""
   logger.info("本轮开始 workspace=%s thread=%s", workspace_id, thread_id)
@@ -246,6 +254,7 @@ def ask_workspace(
               workspace_id, thread_id, question[:20])
   agent = create_workspace_agent(
       store, model, workspace_id, thread_id, checkpointer, is_first_message=is_first,
+      user_memory_dir=user_memory_dir,
   )
   config = {
     "configurable": {

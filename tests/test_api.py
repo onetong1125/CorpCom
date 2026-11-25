@@ -126,6 +126,78 @@ class ApiTests(unittest.TestCase):
     result = self.client.get(self.url + "/memory/index", params={"scope": "other"})
     self.assertEqual(result.status_code, 422)
 
+  def test_memory_topic_preview_reads_same_key_in_selected_scope_and_reloads_edits(self):
+    data = self.root / "data"
+    shared_dir = self.root / "custom-memory"
+    project_dir = data / "workspaces" / self.workspace["id"] / "memory"
+    key = "units.md"
+    header = "---\r\nname: 金额口径\r\ndescription: 报告单位\r\ntype: feedback\r\n---\r\n"
+    shared = (header + "所有报告标明币种。\r\n依据：用户约定。").encode()
+    project = (header + "本项目保留原币金额。\r\n依据：项目档案。").encode()
+    for directory, content in ((shared_dir, shared), (project_dir, project)):
+      directory.mkdir()
+      (directory / key).write_bytes(content)
+    url = self.url + f"/memory/topics/{key}"
+    with patch.dict(os.environ, CORPCOM_USER_MEMORY_DIR=str(shared_dir)), TestClient(create_app(data)) as client:
+      for scope, expected in (("user", shared), ("workspace", project)):
+        result = client.get(url, params={"scope": scope})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.content, expected)
+      edited = project + "\r\n用户补充：同时列出折算金额。".encode()
+      (project_dir / key).write_bytes(edited)
+      self.assertEqual(client.get(url, params={"scope": "workspace"}).content, edited)
+
+  def test_memory_topic_preview_recovers_when_missing_file_is_restored(self):
+    directory = self.root / "data" / "workspaces" / self.workspace["id"] / "memory"
+    directory.mkdir()
+    (directory / "memory.md").write_text("- [回款](cash.md) — 核对季报\n", encoding="utf-8")
+    url = self.url + "/memory/topics/cash.md"
+    self.assertEqual(self.client.get(url, params={"scope": "workspace"}).status_code, 404)
+    (directory / "cash.md").write_text("已恢复的回款记录。\n", encoding="utf-8")
+    restored = self.client.get(url, params={"scope": "workspace"})
+    self.assertEqual(restored.status_code, 200, restored.text)
+    self.assertEqual(restored.text, "已恢复的回款记录。\n")
+
+  def test_memory_topic_preview_rejects_invalid_inputs(self):
+    for key, scope in (("cash.md", "other"), ("cash.txt", "workspace")):
+      with self.subTest(key=key, scope=scope):
+        result = self.client.get(self.url + f"/memory/topics/{key}", params={"scope": scope})
+        self.assertEqual(result.status_code, 422)
+
+  def test_agent_receives_latest_memory_indexes_from_configured_scopes(self):
+    data = self.root / "data"
+    user_dir = self.root / "shared"
+    project_dir = data / "workspaces" / self.workspace["id"] / "memory"
+    user_dir.mkdir()
+    project_dir.mkdir()
+    shared = "- [报告单位](units.md) — 所有报告注明币种。"
+    project = "- [回款](cash.md) — 核对年度披露。"
+    revised = "- [回款](cash.md) — 核对季报到账日期。"
+    private_body = "仅在展开主题后读取的季报第八页原文"
+    (user_dir / "memory.md").write_text(shared, encoding="utf-8")
+    (project_dir / "memory.md").write_text(project, encoding="utf-8")
+    (project_dir / "cash.md").write_text(private_body, encoding="utf-8")
+
+    with patch.dict(os.environ, CORPCOM_USER_MEMORY_DIR=str(user_dir)):
+      app = create_app(data)
+    self.model.responses = [AIMessage(content="先核对年报。"), AIMessage(content="再核对季报。")]
+    app.dependency_overrides[get_model] = lambda: self.model
+    with TestClient(app) as client, patch.object(
+        ApiTestModel, "_generate", autospec=True, side_effect=ApiTestModel._generate,
+    ) as generate:
+      first = client.post(self.thread_url + "/messages", json={"content": "接下来查什么？"})
+      self.assertEqual(first.status_code, 201, first.text)
+      (project_dir / "memory.md").write_text(revised, encoding="utf-8")
+      streamed = client.post(self.thread_url + "/messages/stream", json={"content": "继续核查"})
+      self.assertIn("succeeded", streamed.text)
+    initial, followup = [call.args[1][0].content for call in generate.call_args_list]
+    for prompt in (initial, followup):
+      self.assertIn(shared, prompt)
+      self.assertNotIn(private_body, prompt)
+    self.assertIn(project, initial)
+    self.assertIn(revised, followup)
+    self.assertNotIn(project, followup)
+
   def test_working_note_preview_reads_current_workspace_file_on_every_request(self):
     workspaces = self.root / "data" / "workspaces"
     path = workspaces / self.workspace["id"] / "agent.md"
@@ -396,13 +468,13 @@ class ApiTests(unittest.TestCase):
     release = Event()
 
     def slow_ask(store, model, workspace_id, thread_id, question,
-        checkpointer, *, on_event):
+        checkpointer, *, on_event, user_memory_dir):
       entered[thread_id].set()
       if not release.wait(15):
         raise TimeoutError("Test did not release the Agent")
       return ask_workspace(
           store, model, workspace_id, thread_id, question,
-          checkpointer, on_event=on_event,
+          checkpointer, on_event=on_event, user_memory_dir=user_memory_dir,
       )
 
     requests = [
@@ -498,14 +570,14 @@ class ApiTests(unittest.TestCase):
     release = Event()
 
     def slow_ask(store, model, workspace_id, thread_id, question, checkpointer,
-      *, on_event
+      *, on_event, user_memory_dir,
     ):
       entered[thread_id].set()
       if not release.wait(15):
         raise TimeoutError("Test did not release the Agent")
       return ask_workspace(
           store, model, workspace_id, thread_id, question, checkpointer,
-          on_event=on_event,
+          on_event=on_event, user_memory_dir=user_memory_dir,
       )
 
     with patch(

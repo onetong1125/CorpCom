@@ -1,5 +1,7 @@
 """Persist missing results from the last tool exchange of an interrupted Thread."""
 
+from pathlib import Path
+
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -11,9 +13,12 @@ from corpcom.workspace_agent import create_workspace_agent
 def recover_interrupted_checkpoint(
     store: WorkspaceStore, model: BaseChatModel,
     workspace_id: str, thread_id: str, checkpointer: BaseCheckpointSaver,
+    *, user_memory_dir: Path | None = None,
 ) -> None:
     """Called only after admission returns the previous status 'interrupted'."""
-    agent = create_workspace_agent(store, model, workspace_id, thread_id, checkpointer)
+    agent = create_workspace_agent(
+        store, model, workspace_id, thread_id, checkpointer, user_memory_dir=user_memory_dir,
+    )
     config = {"configurable": {"thread_id": f"{workspace_id}:{thread_id}"}}
     # A process may stop before the first checkpoint. Live state also includes
     # results already recorded by finished tasks in an incomplete graph step.

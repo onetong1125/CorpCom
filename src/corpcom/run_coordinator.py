@@ -1,3 +1,4 @@
+from pathlib import Path
 from uuid import uuid4
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langchain_core.language_models import BaseChatModel
@@ -22,9 +23,11 @@ class RunCoordinator:
       redis_client: Redis,
       *,
       max_concurrent_runs: int,
+      user_memory_dir: Path | None = None,
   ):
     self.checkpointer = checkpointer
     self._redis = redis_client
+    self._user_memory_dir = user_memory_dir
     self._slots = BoundedSemaphore(max_concurrent_runs)
 
   def run(self,
@@ -59,11 +62,12 @@ class RunCoordinator:
         # 恢复中断后的工具结果
         if previous.execution_status == "interrupted":
           recover_interrupted_checkpoint(
-              store, model, workspace_id, thread_id, self.checkpointer
+              store, model, workspace_id, thread_id, self.checkpointer,
+              user_memory_dir=self._user_memory_dir,
           )
         answer = ask_workspace(
             store, model, workspace_id, thread_id, question, self.checkpointer,
-            on_event=recorder.emit
+            on_event=recorder.emit, user_memory_dir=self._user_memory_dir,
         )
         message = store.complete_thread_execution(
             workspace_id, thread_id, answer.text, model_message_id=answer.id,

@@ -17,7 +17,7 @@ import {
 } from "@lucide/vue";
 import { jsonRequest, request } from "./api";
 import MarkdownContent from "./components/MarkdownContent.vue";
-import WorkingNotePanel from "./components/WorkingNotePanel.vue";
+import MemoryPanel from "./components/MemoryPanel.vue";
 import ArtifactPanel from "./components/ArtifactPanel.vue";
 import { useResearchRuns } from "./useResearchRuns";
 
@@ -657,7 +657,7 @@ onMounted(initialize);
         </div>
       </div>
     </main>
-    <WorkingNotePanel v-if="workspace && memoryOpen" :key="`note-${workspace.id}`"
+    <MemoryPanel v-if="workspace && memoryOpen" :key="`note-${workspace.id}`"
       :workspace-id="workspace.id" @close="closeMemory" />
     <ArtifactPanel
       v-if="workspace"

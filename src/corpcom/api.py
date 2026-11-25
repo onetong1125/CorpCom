@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
-from typing import Annotated
+from typing import Annotated, Literal
 from contextlib import asynccontextmanager
 from anyio import create_task_group
 from redis import Redis
@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from collections.abc import AsyncIterator, Mapping
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from fastapi import Depends, FastAPI, Form, HTTPException, UploadFile, Query
+from fastapi import Path as PathParam
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
@@ -94,7 +95,9 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             app.state.redis = redis_client
             app.state.checkpointer = checkpointer
             app.state.coordinator = RunCoordinator(
-                checkpointer, redis_client, max_concurrent_runs=2)
+                checkpointer, redis_client, max_concurrent_runs=2,
+                user_memory_dir=user_memory_dir,
+            )
             with WorkspaceStore(root) as store:
                 store.interrupt_running_executions()
             async with create_task_group() as task_group:
@@ -157,6 +160,20 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     def show_working_note(workspace_id: str) -> str:
         with WorkspaceStore(root) as store:
             return store.read_working_note(workspace_id)
+
+    @app.get("/api/workspaces/{workspace_id}/memory/index", response_class=PlainTextResponse)
+    def show_memory_index(workspace_id: str, scope: Literal["user", "workspace"]) -> str:
+        with WorkspaceStore(root) as store:
+            return store.read_memory_index(workspace_id, scope, app.state.user_memory_dir)
+
+    @app.get("/api/workspaces/{workspace_id}/memory/topics/{key}", response_class=PlainTextResponse)
+    def show_memory_topic(
+        workspace_id: str,
+        key: Annotated[str, PathParam(pattern=r"^[^/\x00]+\.md$")],
+        scope: Literal["user", "workspace"],
+    ) -> str:
+        with WorkspaceStore(root) as store:
+            return store.read_memory_topic(workspace_id, scope, app.state.user_memory_dir, key)
 
     @app.put("/api/workspaces/{workspace_id}/preferences")
     @app.put("/api/workspaces/{workspace_id}/research")
