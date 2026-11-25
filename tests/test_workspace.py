@@ -271,6 +271,66 @@ class WorkspaceStoreTests(unittest.TestCase):
     self.assertEqual(topic.read_bytes(), handwritten)
     self.assertEqual(index.read_bytes(), original_index)
 
+  def test_forget_memory_topic_removes_only_its_file_and_index_entry(self):
+    wid = self.create().id
+    user_dir = self.root / "user-memory"
+    key = "cashflow.md"
+    project_args = (wid, "workspace", user_dir, key)
+    user_args = (wid, "user", user_dir, key)
+    self.store.create_memory_topic(*project_args, name="回款", description="季度核查",
+                                  memory_type="project", body="回款时点待核实。\n")
+    self.store.create_memory_topic(*user_args, name="回款资料", description="公共数据源",
+                                  memory_type="reference", body="参考公开年报。\n")
+    project_dir = self.data / "workspaces" / wid / "memory"
+    index = project_dir / "memory.md"
+    before = "# 项目索引\r\n\r\n"
+    after = "- [库存](stock.md) — 另见[回款](cashflow.md)"
+    index.write_bytes((before + "- [回款 [2025]](cashflow.md) — 季度核查\r\n" + after).encode())
+    original = self.store.read_memory_topic(*project_args)
+    shared = (user_dir / key).read_bytes()
+    shared_index = (user_dir / "memory.md").read_bytes()
+
+    self.store.forget_memory_topic(*project_args, expected_markdown=original)
+
+    self.assertFalse((project_dir / key).exists())
+    self.assertEqual(index.read_bytes(), (before + after).encode())
+    self.assertEqual((user_dir / key).read_bytes(), shared)
+    self.assertEqual((user_dir / "memory.md").read_bytes(), shared_index)
+
+  def test_forget_memory_topic_rejects_stale_read_before_removing_index_entry(self):
+    wid = self.create().id
+    directory = self.root / "user-memory"
+    args = (wid, "user", directory, "units.md")
+    self.store.create_memory_topic(*args, name="报告单位", description="披露币种",
+                                  memory_type="feedback", body="金额标注币种。\n")
+    original = self.store.read_memory_topic(*args)
+    edited = original + "用户补充：同时注明汇率。\n"
+    topic = directory / "units.md"
+    topic.write_bytes(edited.encode())
+    index = directory / "memory.md"
+    original_index = index.read_bytes()
+
+    with self.assertRaises(ValueError):
+      self.store.forget_memory_topic(*args, expected_markdown=original)
+    self.assertEqual(topic.read_bytes(), edited.encode())
+    self.assertEqual(index.read_bytes(), original_index)
+
+  def test_forget_memory_topic_resumes_after_index_entry_was_removed(self):
+    wid = self.create().id
+    directory = self.root / "user-memory"
+    args = (wid, "user", directory, "units.md")
+    self.store.create_memory_topic(*args, name="报告单位", description="披露币种",
+                                  memory_type="feedback", body="金额标注币种。\n")
+    original = self.store.read_memory_topic(*args)
+    # Disk state immediately after replacing the index, before unlinking the topic.
+    index = directory / "memory.md"
+    other_entry = b"- [Period](period.md)\r\n"
+    index.write_bytes(other_entry)
+    with WorkspaceStore(self.data) as reopened:
+      reopened.forget_memory_topic(*args, expected_markdown=original)
+    self.assertFalse((directory / "units.md").exists())
+    self.assertEqual(index.read_bytes(), other_entry)
+
   def test_concurrent_user_messages_have_one_first_message_per_workspace(self):
     workspace = self.create()
     threads = [self.store.create_thread(workspace.id, str(i)) for i in range(2)]

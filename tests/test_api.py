@@ -88,6 +88,44 @@ class ApiTests(unittest.TestCase):
     self.thread = result.json()
     self.thread_url = self.url + f"/threads/{self.thread['id']}"
 
+  def test_memory_index_preview_follows_app_config_and_workspace(self):
+    data = self.root / "data"
+    wid = self.workspace["id"]
+    other = self.client.post("/api/workspaces", json={"title": "库存核查"}).json()["id"]
+    first = "- [回款](cash.md) — 季报核查\r\n".encode()
+    second = "- [库存](stock.md) — 盘点记录\n".encode()
+    for workspace_id, content in ((wid, first), (other, second)):
+      directory = data / "workspaces" / workspace_id / "memory"
+      directory.mkdir()
+      (directory / "memory.md").write_bytes(content)
+
+    for setting, directory, label in (
+        (None, data / "user/memory", "默认偏好"),
+        ("shared", data / "shared", "新目录偏好"),
+    ):
+      if setting is None:
+        os.environ.pop("CORPCOM_USER_MEMORY_DIR", None)
+      else:
+        os.environ["CORPCOM_USER_MEMORY_DIR"] = setting
+      directory.mkdir(parents=True)
+      shared = f"- [{label}](units.md) — 金额单位\n".encode()
+      (directory / "memory.md").write_bytes(shared)
+      with patch("corpcom.api.load_dotenv"), TestClient(create_app(data)) as client:
+        for workspace_id, project_index in ((wid, first), (other, second)):
+          url = f"/api/workspaces/{workspace_id}/memory/index"
+          for scope, expected in (("user", shared), ("workspace", project_index)):
+            result = client.get(url, params={"scope": scope})
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.content, expected)
+        updated = shared + "- [来源](sources.md) — 优先财报\n".encode()
+        (directory / "memory.md").write_bytes(updated)
+        refreshed = client.get(self.url + "/memory/index", params={"scope": "user"})
+        self.assertEqual(refreshed.content, updated)
+
+  def test_memory_index_preview_rejects_unknown_scope(self):
+    result = self.client.get(self.url + "/memory/index", params={"scope": "other"})
+    self.assertEqual(result.status_code, 422)
+
   def test_working_note_preview_reads_current_workspace_file_on_every_request(self):
     workspaces = self.root / "data" / "workspaces"
     path = workspaces / self.workspace["id"] / "agent.md"

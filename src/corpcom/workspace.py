@@ -240,6 +240,8 @@ class WorkspaceStore:
     directory.mkdir(parents=True, exist_ok=True)
     directory_fd = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
     try:
+      # All mutations in a memory scope use the same directory lock.
+      fcntl.flock(directory_fd, fcntl.LOCK_EX)
       try:
         topic_fd = os.open(
             key, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -261,28 +263,110 @@ class WorkspaceStore:
           mode=0o600, dir_fd=directory_fd,
       )
       with os.fdopen(index_fd, "a+b") as index:
-        # Keep the lookup and append together across writers.
-        fcntl.flock(index.fileno(), fcntl.LOCK_EX)
         index.seek(0)
         index_content = index.read()
         destination = b"(" + key.encode("utf-8") + b")"
-        for item in re.finditer(rb"^[ \t]*-[ \t]+\[([^\r\n]*)", index_content, re.MULTILINE):
-          label_and_target = item.group(1)
-          depth = 1
-          for bracket in re.finditer(rb"\\.|[\[\]]", label_and_target):
-            if bracket.group() == b"[":
-              depth += 1
-            elif bracket.group() == b"]":
-              depth -= 1
-              if depth == 0:
-                if label_and_target.startswith(destination, bracket.end()):
-                  return
-                break
+        if any(self._memory_index_entry_matches(line, destination) for line in index_content.splitlines()):
+          return
         if index_content and not index_content.endswith(b"\n"):
           entry = b"\n" + entry
         index.write(entry)
     finally:
       os.close(directory_fd)
+
+  def revise_memory_topic(
+      self,
+      workspace_id: str,
+      scope: Literal["user", "workspace"],
+      user_memory_dir: Path,
+      key: str,
+      *,
+      expected_markdown: str,
+      body: str,
+  ) -> None:
+    """Replace the body if the topic still matches the caller's last read."""
+    self._validate_memory_topic_key(key)
+    if key.casefold() == "memory.md":
+      raise ValueError("memory.md is reserved for the memory index")
+    self.get_workspace(workspace_id)
+
+    directory = self._memory_directory(workspace_id, scope, user_memory_dir)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+      fcntl.flock(directory_fd, fcntl.LOCK_EX)
+      current = self._read_memory_file(directory_fd, key).decode("utf-8")
+      if current != expected_markdown:
+        raise ValueError("memory topic changed; read the latest Markdown and merge your changes")
+
+      header = re.match(
+          r"\A---[ \t]*\r?\n.*?^---[ \t]*(?:\r?\n|\Z)(?:[ \t]*\r?\n)*",
+          current,
+          re.MULTILINE | re.DOTALL,
+      )
+      if header is None:
+        raise ValueError("memory topic is missing its YAML frontmatter")
+      prefix = header.group()
+      if not prefix.endswith("\n") and body:
+        prefix += "\r\n" if "\r\n" in prefix else "\n"
+
+      self._replace_memory_file(directory_fd, key, (prefix + body).encode("utf-8"))
+    finally:
+      os.close(directory_fd)
+
+  def forget_memory_topic(
+      self,
+      workspace_id: str,
+      scope: Literal["user", "workspace"],
+      user_memory_dir: Path,
+      key: str,
+      *,
+      expected_markdown: str,
+  ) -> None:
+    """Remove a topic and its index entries if the topic still matches the last read."""
+    self._validate_memory_topic_key(key)
+    if key.casefold() == "memory.md":
+      raise ValueError("memory.md is reserved for the memory index")
+    self.get_workspace(workspace_id)
+
+    directory = self._memory_directory(workspace_id, scope, user_memory_dir)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+      fcntl.flock(directory_fd, fcntl.LOCK_EX)  # 获取目录排他锁
+      current = self._read_memory_file(directory_fd, key).decode("utf-8")
+      if current != expected_markdown:          # 要求全文精确匹配
+        raise ValueError("memory topic changed; read the latest Markdown before forgetting it")
+
+      try:
+        index = self._read_memory_file(directory_fd, "memory.md")
+      except FileNotFoundError:
+        index = b""                             # 缺少索引视为空索引
+      destination = b"(" + key.encode("utf-8") + b")"
+      remaining = b"".join(
+          line for line in index.splitlines(keepends=True)
+          if not self._memory_index_entry_matches(line, destination)
+      )
+      if remaining != index:
+        self._replace_memory_file(directory_fd, "memory.md", remaining)
+      # Keep the topic available for a retry until the index change is complete.
+      os.unlink(key, dir_fd=directory_fd)
+    finally:
+      os.close(directory_fd)
+
+  @staticmethod
+  def _memory_index_entry_matches(line: bytes, destination: bytes) -> bool:
+    item = re.match(rb"[ \t]*-[ \t]+\[([^\r\n]*)", line)
+    if item is None:
+      return False
+    label_and_target = item.group(1)
+    depth = 1
+    for bracket in re.finditer(rb"\\.|[\[\]]", label_and_target):
+      if bracket.group() == b"[":
+        depth += 1
+      elif bracket.group() == b"]":
+        depth -= 1
+        if depth == 0:
+          return label_and_target.startswith(destination, bracket.end())
+    return False
 
   @staticmethod
   def _validate_memory_topic_key(key: str) -> None:
@@ -306,14 +390,32 @@ class WorkspaceStore:
     Reject symlinks at the memory directory and file. The caller handles missing paths.
     """
     directory = self._memory_directory(workspace_id, scope, user_memory_dir)
-    flags = os.O_RDONLY | os.O_NOFOLLOW
-    directory_fd = os.open(directory, flags | os.O_DIRECTORY)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
     try:
-      file_fd = os.open(filename, flags, dir_fd=directory_fd)
+      return self._read_memory_file(directory_fd, filename).decode("utf-8")
     finally:
       os.close(directory_fd)
-    with os.fdopen(file_fd, "r", encoding="utf-8", newline="") as memory_file:
+
+  @staticmethod
+  def _read_memory_file(directory_fd: int, filename: str) -> bytes:
+    file_fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    with os.fdopen(file_fd, "rb") as memory_file:
       return memory_file.read()
+
+  @staticmethod
+  def _replace_memory_file(directory_fd: int, filename: str, content: bytes) -> None:
+    temporary = f".{uuid4().hex}.tmp"
+    temporary_fd = os.open(
+        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        mode=0o600, dir_fd=directory_fd,
+    )
+    try:
+      with os.fdopen(temporary_fd, "wb") as memory_file:
+        memory_file.write(content)
+      os.replace(temporary, filename, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    except BaseException:
+      os.unlink(temporary, dir_fd=directory_fd)
+      raise
 
   def _thread(self, workspace_id: str, thread_id: str) -> Thread:
     # Check ownership before reading or adding messages, not just the thread ID.
