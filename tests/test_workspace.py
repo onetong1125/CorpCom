@@ -192,12 +192,7 @@ class WorkspaceStoreTests(unittest.TestCase):
       )
     self.assertEqual(index.read_text(encoding="utf-8"), "# 手写索引\n")
 
-  def test_retry_create_memory_topic_after_body_write_failure(self):
-    wid = self.create().id
-    directory = self.root / "custom-memory"
-    key = "cashflow.md"
-    fields = dict(name="回款", description="到账依据", memory_type="reference",
-                  body="一季报第八页记录了到账日期。\n" * 100)
+  def _create_memory_topic_with_file_limit(self, wid, directory, key, fields):
     # Limit only the child writer. The retry uses the same public API without the limit.
     writer = dedent("""\
         import errno, json, resource, signal, sys
@@ -215,18 +210,47 @@ class WorkspaceStoreTests(unittest.TestCase):
                 if exc.errno != errno.EFBIG:
                     raise
             else:
-                raise AssertionError("Expected the topic write to exceed 128 bytes")
+                raise AssertionError("Expected a write to exceed 128 bytes")
             finally:
                 resource.setrlimit(resource.RLIMIT_FSIZE, limits)
         """)
     subprocess.run([sys.executable, "-c", writer, str(self.data), wid, str(directory), key,
                     json.dumps(fields)], check=True)
+
+  def test_retry_create_memory_topic_after_body_write_failure(self):
+    wid = self.create().id
+    directory = self.root / "custom-memory"
+    key = "cashflow.md"
+    fields = dict(name="回款", description="到账依据", memory_type="reference",
+                  body="一季报第八页记录了到账日期。\n" * 100)
+    self._create_memory_topic_with_file_limit(wid, directory, key, fields)
     self.assertFalse((directory / key).exists(), "失败的写入留下了不完整的正式主题")
     self.assertEqual(self.store.read_memory_index(wid, "user", directory), "")
     self.store.create_memory_topic(wid, "user", directory, key, **fields)
     self.assertTrue(self.store.read_memory_topic(wid, "user", directory, key).endswith(fields["body"]))
     self.assertEqual(self.store.read_memory_index(wid, "user", directory),
                      "- [回款](cashflow.md) — 到账依据\n")
+
+  def test_retry_memory_topic_after_partial_index_write(self):
+    wid = self.create().id
+    directory = self.root / "custom-memory"
+    directory.mkdir()
+    key = "cashflow.md"
+    fields = dict(name="回款", description="到账依据", memory_type="reference", body="见季报。\n")
+    link = "- [回款](cashflow.md)".encode("utf-8")
+    # Leave room for the link but not its description.
+    original = "# 手写索引".encode("utf-8").ljust(128 - len(link) - 2, b" ") + b"\r\n"
+    index = directory / "memory.md"
+    index.write_bytes(original)
+    self._create_memory_topic_with_file_limit(wid, directory, key, fields)
+    topic = self.store.read_memory_topic(wid, "user", directory, key)
+    self.assertTrue(topic.endswith(fields["body"]))
+    with self.subTest(stage="after failure"):
+      self.assertEqual(index.read_bytes(), original)
+    self.store.create_memory_topic(wid, "user", directory, key, **fields)
+    with self.subTest(stage="after retry"):
+      self.assertEqual(index.read_bytes(), original + link + " — 到账依据\n".encode("utf-8"))
+      self.assertEqual(self.store.read_memory_topic(wid, "user", directory, key), topic)
 
   def test_retry_memory_topic_repairs_missing_entry_only_once(self):
     wid = self.create().id

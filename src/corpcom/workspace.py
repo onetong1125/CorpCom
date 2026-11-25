@@ -242,21 +242,22 @@ class WorkspaceStore:
     try:
       # All mutations in a memory scope use the same directory lock.
       fcntl.flock(directory_fd, fcntl.LOCK_EX)
+      temporary = f".{uuid4().hex}.tmp"
+      temporary_fd = os.open(
+          temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+          mode=0o600, dir_fd=directory_fd,
+      )
       try:
-        topic_fd = os.open(
-            key, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            mode=0o600, dir_fd=directory_fd,
-        )
-      except FileExistsError:
-        topic_fd = os.open(key, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-        with os.fdopen(topic_fd, "rb") as topic:
-          if topic.read() != markdown:
-            # 非重试请求，抛出异常
-            raise
-          # 相同重试请求，继续处理索引
-      else:
-        with os.fdopen(topic_fd, "wb") as topic:
+        with os.fdopen(temporary_fd, "wb") as topic:
           topic.write(markdown)
+        # Publish only after the temporary file has been written and closed.
+        try:
+          os.link(temporary, key, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        except FileExistsError:
+          if self._read_memory_file(directory_fd, key) != markdown:
+            raise
+      finally:
+        os.unlink(temporary, dir_fd=directory_fd)
 
       index_fd = os.open(
           "memory.md", os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
