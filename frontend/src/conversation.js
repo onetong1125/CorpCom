@@ -15,9 +15,10 @@ export function pendingText(thread, run) {
 }
 
 export function conversationEntries(messages, pending, allRuns, currentRun) {
-  const entries = messages.map((message) => ({
-    type: "message", key: `message:${message.id}`, message,
-  }));
+  // Tool calls may persist an assistant message even when the model sent no prose.
+  const entries = messages
+    .filter((message) => message.role !== "assistant" || message.content.trim())
+    .map((message) => ({ type: "message", key: `message:${message.id}`, message }));
   if (pending) entries.push({ type: "pending", key: "pending" });
   for (const run of allRuns) {
     // Preserve event order around saved messages, including a final answer received
@@ -29,15 +30,25 @@ export function conversationEntries(messages, pending, allRuns, currentRun) {
       entry.message.id === run.userMessageId);
     let insertAt = firstSaved !== -1 ? firstSaved : question !== -1 ? question + 1 : entries.length;
     let progress = null;
-    for (const item of run.items) {
+    const lastTool = run.items.findLastIndex((item) => item.type === "tool");
+    const completed = run.executionStatus === "succeeded" || run.legacy;
+    for (const [index, item] of run.items.entries()) {
       if (item.type === "text") {
         const saved = entries.findIndex((entry) => entry.type === "message" &&
           (entry.message.model_message_id === item.id || entry.message.id === item.savedMessageId));
         if (saved !== -1) {
+          // Keep a saved plan between tool calls in its chronological position
+          // inside the completed run's disclosure.
+          if (completed && progress && index < lastTool) {
+            const [plan] = entries.splice(saved, 1);
+            progress.items.push({ ...item, text: plan.message.content });
+            continue;
+          }
           insertAt = saved + 1;
           progress = null;
           continue;
         }
+        if (!item.text.trim()) continue;
       }
       if (!progress) {
         progress = { type: "progress", key: `progress:${run.runId ?? run.userMessageId}:${item.type}:${item.id}`, items: [], run };
