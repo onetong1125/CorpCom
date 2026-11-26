@@ -102,6 +102,12 @@ def _require_text(**fields: str) -> None:
     if not value.strip():
       raise ValueError(f"{name} must not be empty")
 
+def _encode_run_events(events: list[RunProgressEvent] | None) -> str | None:
+  if events is None:
+    return None
+  return json.dumps(events, ensure_ascii=False, allow_nan=False)
+
+
 def _message_from_row(row: sqlite3.Row) -> Message:
   """Decode stored tool calls before building a message."""
   data = dict(row)
@@ -566,6 +572,32 @@ class WorkspaceStore:
 
       return previous
 
+  def _write_execution_result(
+      self, workspace_id: str, thread_id: str, *,
+      status: Literal["succeeded", "failed"], error: str | None, encoded_events: str | None,
+  ) -> None:
+    """Update the thread and its active run within the caller's transaction."""
+    self.db.execute(
+        """
+        UPDATE threads SET execution_status = ?,
+        execution_finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+        execution_error = ?
+        WHERE workspace_id = ? AND id = ?
+        """,
+        (status, error, workspace_id, thread_id),
+    )
+    self.db.execute(
+        """
+        UPDATE research_runs
+        SET status = ?,
+            finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            error = ?,
+            sse_events = ?
+        WHERE thread_id = ? AND status = 'running'
+        """,
+        (status, error, encoded_events, thread_id),
+    )
+
   def finish_thread_execution(
       self,
       workspace_id: str,
@@ -576,34 +608,11 @@ class WorkspaceStore:
       sse_events: list[RunProgressEvent] | None = None,
   ) -> Thread:
     self._thread(workspace_id, thread_id)
-    # serialize events
-    encoded_events = (
-        None
-        if sse_events is None
-        else json.dumps(sse_events, ensure_ascii=False, allow_nan=False)
-    )
+    encoded_events = _encode_run_events(sse_events)
     with self.db:
-      self.db.execute(
-          """
-          UPDATE threads SET execution_status = ?,
-          execution_finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-          execution_error = ?
-          WHERE workspace_id = ? AND id = ?
-          """,
-          (status, error, workspace_id, thread_id),
+      self._write_execution_result(
+          workspace_id, thread_id, status=status, error=error, encoded_events=encoded_events,
       )
-      self.db.execute(
-          """
-          UPDATE research_runs
-          SET status = ?,
-              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-              error = ?,
-              sse_events = ?
-          WHERE thread_id = ? AND status = 'running'
-          """,
-          (status, error, encoded_events, thread_id),
-      )
-
       return self._thread(workspace_id, thread_id)
 
 
@@ -641,12 +650,7 @@ class WorkspaceStore:
     self._thread(workspace_id, thread_id)
     _require_text(content=answer)
 
-    # serialize events
-    encoded_events = (
-      None
-      if sse_events is None
-      else json.dumps(sse_events, ensure_ascii=False, allow_nan=False)
-    )
+    encoded_events = _encode_run_events(sse_events)
     with self.db:
       cursor = self.db.execute(
           """
@@ -657,28 +661,9 @@ class WorkspaceStore:
       )
       message_id = cursor.lastrowid
 
-      self.db.execute(
-          """
-          UPDATE threads
-          SET execution_status = 'succeeded',
-              execution_finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-              execution_error = NULL
-          WHERE workspace_id = ? AND id = ?;
-          """,
-          (workspace_id, thread_id),
+      self._write_execution_result(
+          workspace_id, thread_id, status="succeeded", error=None, encoded_events=encoded_events,
       )
-      self.db.execute(
-          """
-          UPDATE research_runs
-          SET status = 'succeeded',
-              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-              error = NULL,
-              sse_events = ?
-          WHERE thread_id = ? AND status = 'running'
-          """,
-          (encoded_events, thread_id),
-      )
-
       self._touch(workspace_id)
 
       return _message_from_row(self.db.execute(
