@@ -12,7 +12,7 @@ Vite 开发服务代理 `/api`。浏览器直接跨域访问后端时，默认�
 
 每轮研究根据最新档案、工作笔记、两级记忆索引及其他会话索引渲染系统提示词。角色默认值和提示词正文分别位于 [prompts.yaml](../src/corpcom/agent/template/prompts.yaml) 和 [system.md.j2](../src/corpcom/agent/template/system.md.j2)。
 
-可选变量 `CORPCOM_MODEL_INPUT_TOKEN_BUDGET` 接受正整数。应按模型上下文窗口扣除回答所需空间后设置。系统提示词、工具声明和对话消息一起估算 token 数。未设置时使用完整输入。超出预算时依次移除最早的完整对话轮次、按整行缩短两级记忆索引、截短本轮成功工具的文本结果，最后截短工作笔记。仍然超限则本轮报错。裁剪只作用于本次模型请求，磁盘文件和 checkpoint 保留原文。[输入压缩逻辑](../src/corpcom/agent/runtime.py)
+可选变量 `CORPCOM_MODEL_INPUT_TOKEN_BUDGET` 接受正整数。应按模型上下文窗口扣除回答所需空间后设置。系统提示词、工具声明和对话消息一起估算 token 数。未设置时使用完整输入。超出预算时依次移除最早的完整对话轮次、按整行缩短两级记忆索引、截短本轮成功工具的文本结果，最后截短工作笔记。仍然超限则本轮报错。裁剪只作用于本次模型请求，磁盘文件和 checkpoint 保留原文。[输入压缩逻辑](../src/corpcom/agent/input_budget.py)
 
 `CORPCOM_USER_MEMORY_DIR` 设置用户级长期记忆的目录，默认是数据目录下的 `user/memory/`。相对路径以数据目录为基准，也支持绝对路径和 `~`。服务启动时解析配置，修改后需重启。该目录与 `workspaces/` 必须相互独立，重叠时服务启动报错。
 
