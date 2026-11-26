@@ -416,7 +416,7 @@ class ApiTests(unittest.TestCase):
         raise TimeoutError("Test did not release the model request")
       return ask_workspace(*args, **kwargs)
 
-    with patch("corpcom.run_coordinator.ask_workspace", side_effect=slow_ask):
+    with patch("corpcom.runs.coordinator.ask_workspace", side_effect=slow_ask):
       with ThreadPoolExecutor(max_workers=1) as executor:
         first = executor.submit(self.client.post, self.thread_url + "/messages", json={"content": "第一条"})
         try:
@@ -483,7 +483,7 @@ class ApiTests(unittest.TestCase):
     ]
 
     with patch(
-        "corpcom.run_coordinator.ask_workspace",
+        "corpcom.runs.coordinator.ask_workspace",
         side_effect=slow_ask,
     ):
       with ThreadPoolExecutor(max_workers=2) as executor:
@@ -581,7 +581,7 @@ class ApiTests(unittest.TestCase):
       )
 
     with patch(
-        "corpcom.run_coordinator.ask_workspace",
+        "corpcom.runs.coordinator.ask_workspace",
         side_effect=slow_ask,
     ):
       with ThreadPoolExecutor(max_workers=2) as executor:

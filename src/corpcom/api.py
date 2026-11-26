@@ -25,15 +25,15 @@ from langchain_openai import ChatOpenAI
 from openai import APIError
 from pydantic import BaseModel, ConfigDict, Field
 
-from corpcom.run_replay import replay_events
-from corpcom.run_history import read_run_history, read_thread_history
+from corpcom.runs.replay import replay_events
+from corpcom.runs.history import read_run_history, read_thread_history
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore, ThreadBusyError
 from corpcom.workspace_models import (
     Artifact, Message, Thread, ThreadDetail, Workspace, WorkspaceDetail,
     WorkspaceResearchInfo, WorkspaceSummary, ResearchRunSummary,
 )
-from corpcom.run_coordinator import RunCoordinator, ExecutionCapacityError
-from corpcom.workspace_stream import research_events
+from corpcom.runs.coordinator import RunCoordinator, ExecutionCapacityError
+from corpcom.runs.stream import research_events
 
 logger = logging.getLogger(__name__)
 RequiredText = Annotated[str, Field(min_length=1, pattern=r"\S")]

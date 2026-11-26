@@ -10,7 +10,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver, empty_checkpoint
 from langgraph.checkpoint.sqlite import SqliteSaver
 from redis import Redis
 
-from corpcom.run_history import (
+from corpcom.runs.history import (
     project_run_messages,
     read_thread_messages,
     select_run_messages, project_archived_events,

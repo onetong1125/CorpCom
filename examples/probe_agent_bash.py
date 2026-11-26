@@ -18,7 +18,7 @@ from pydantic import Field
 
 from corpcom.sandbox import ensure_workspace_container
 from corpcom.workspace import WorkspaceStore
-from corpcom.run_coordinator import RunCoordinator
+from corpcom.runs.coordinator import RunCoordinator
 
 
 class ScriptedModel(FakeMessagesListChatModel):

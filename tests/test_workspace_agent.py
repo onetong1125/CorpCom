@@ -24,7 +24,7 @@ from pydantic import Field
 from langchain_core.tools import tool
 from langchain_core.outputs import ChatGeneration, ChatResult
 
-from corpcom.run_coordinator import RunCoordinator
+from corpcom.runs.coordinator import RunCoordinator
 from corpcom.workspace import WorkspaceStore
 from corpcom.agent.runtime import ask_workspace
 from corpcom.workspace_models import WorkspaceResearchInfo

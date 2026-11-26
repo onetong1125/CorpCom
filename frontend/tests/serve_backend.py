@@ -73,5 +73,5 @@ if __name__ == "__main__":
         app.dependency_overrides[get_model] = lambda: FakeMessagesListChatModel(
             responses=[AIMessage(content="unused")]
         )
-        with patch("corpcom.run_coordinator.ask_workspace", side_effect=scripted_research):
+        with patch("corpcom.runs.coordinator.ask_workspace", side_effect=scripted_research):
             uvicorn.run(app, host="127.0.0.1", port=8012)
