@@ -191,7 +191,7 @@ class WorkspaceStore:
       return note.read()
 
   def _memory_directory(
-      self, workspace_id: str, scope: Literal["user", "workspace"], user_memory_dir: Path,
+      self, workspace_id: str, scope: memory.MemoryScope, user_memory_dir: Path,
   ) -> Path:
     self.get_workspace(workspace_id)
     if scope == "user":
@@ -199,7 +199,7 @@ class WorkspaceStore:
     return self.root / "workspaces" / workspace_id / "memory"
 
   def read_memory_index(
-      self, workspace_id: str, scope: Literal["user", "workspace"], user_memory_dir: Path,
+      self, workspace_id: str, scope: memory.MemoryScope, user_memory_dir: Path,
   ) -> str:
     """Read the scope's UTF-8 index, returning empty text if it is missing."""
     directory = self._memory_directory(workspace_id, scope, user_memory_dir)
@@ -208,7 +208,7 @@ class WorkspaceStore:
   def read_memory_topic(
       self,
       workspace_id: str,
-      scope: Literal["user", "workspace"],
+      scope: memory.MemoryScope,
       user_memory_dir: Path,
       key: str,
   ) -> str:
@@ -220,13 +220,13 @@ class WorkspaceStore:
   def create_memory_topic(
       self,
       workspace_id: str,
-      scope: Literal["user", "workspace"],
+      scope: memory.MemoryScope,
       user_memory_dir: Path,
       key: str,
       *,
       name: str,
       description: str,
-      memory_type: Literal["user", "feedback", "project", "reference"],
+      memory_type: memory.MemoryType,
       body: str,
   ) -> None:
     """Create or retry a topic and ensure it is indexed in the selected scope."""
@@ -237,7 +237,7 @@ class WorkspaceStore:
   def revise_memory_topic(
       self,
       workspace_id: str,
-      scope: Literal["user", "workspace"],
+      scope: memory.MemoryScope,
       user_memory_dir: Path,
       key: str,
       *,
@@ -252,7 +252,7 @@ class WorkspaceStore:
   def forget_memory_topic(
       self,
       workspace_id: str,
-      scope: Literal["user", "workspace"],
+      scope: memory.MemoryScope,
       user_memory_dir: Path,
       key: str,
       *,

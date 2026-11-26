@@ -1,9 +1,9 @@
 from pathlib import Path
-from typing import Literal
 
 from langchain.tools import tool
 from langchain_core.tools import BaseTool, ToolException
 
+from corpcom.memory import MemoryScope, MemoryType
 from corpcom.workspace import WorkspaceStore
 
 
@@ -14,7 +14,7 @@ def create_memory_tools(
         user_memory_dir = data_dir / "user" / "memory"
 
     @tool
-    def read_memory(scope: Literal["user", "workspace"], key: str) -> str:
+    def read_memory(scope: MemoryScope, key: str) -> str:
         """Read the full Markdown of a memory topic by its .md filename.
 
         Use scope "user" for shared memory or "workspace" for this workspace's memory.
@@ -23,7 +23,7 @@ def create_memory_tools(
             return store.read_memory_topic(workspace_id, scope, user_memory_dir, key)
 
     @tool
-    def search_memory(scope: Literal["user", "workspace"], query: str) -> str:
+    def search_memory(scope: MemoryScope, query: str) -> str:
         """Search the full memory index in the selected scope for a keyword.
 
         Use this when a relevant topic is missing from the index preview.
@@ -35,9 +35,9 @@ def create_memory_tools(
 
     @tool
     def write_memory(
-        scope: Literal["user", "workspace"], key: str, body: str,
+        scope: MemoryScope, key: str, body: str,
         name: str | None = None, description: str | None = None,
-        memory_type: Literal["user", "feedback", "project", "reference"] | None = None,
+        memory_type: MemoryType | None = None,
         expected_markdown: str | None = None,
     ) -> str:
         """Create a memory topic or revise its body in the selected scope.
@@ -65,7 +65,7 @@ def create_memory_tools(
 
     @tool
     def forget_memory(
-        scope: Literal["user", "workspace"], key: str, expected_markdown: str,
+        scope: MemoryScope, key: str, expected_markdown: str,
     ) -> str:
         """Remove a memory topic and its index entry in the selected scope.
 

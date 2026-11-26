@@ -10,6 +10,9 @@ from uuid import uuid4
 
 import yaml
 
+MemoryScope = Literal["user", "workspace"]
+MemoryType = Literal["user", "feedback", "project", "reference"]
+
 
 def read_index(directory: Path) -> str:
   """Read the scope's UTF-8 index, returning empty text if it is missing."""
@@ -36,7 +39,7 @@ def create_topic(
     *,
     name: str,
     description: str,
-    memory_type: Literal["user", "feedback", "project", "reference"],
+    memory_type: MemoryType,
     body: str,
 ) -> None:
   """Create or retry a topic and ensure it is indexed in the selected scope."""
