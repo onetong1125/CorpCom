@@ -328,7 +328,34 @@ it("streams text and tool events into the original thread and replaces the final
   ]);
 });
 
-it("places each tool exchange after its own saved plan", async () => {
+it("keeps three tool exchanges in one disclosure after reloading a completed answer", async () => {
+  const calls = ["update_research", "read_file", "edit_file"];
+  const events = [];
+  threads.a.messages = [message(1, "user", "年报核查")];
+  for (const [i, name] of calls.entries()) {
+    const saved = message(i + 2, "assistant", i === 1 ? "核对笔记" : "");
+    saved.tool_calls = [{ id: name, name, args: {} }];
+    threads.a.messages.push(saved);
+    events.push({ type: "assistant_message", message_id: saved.model_message_id, text: saved.content, tool_calls: saved.tool_calls },
+      { type: "tool_result", tool_call_id: name, content: name + " 已完成", status: "success" });
+  }
+  threads.a.messages.push(message(5, "assistant", "已更新工作笔记"));
+  events.push({ type: "assistant_message", message_id: "model-5", text: "已更新工作笔记", tool_calls: [] });
+  const run = { id: "r1", thread_id: "a", user_message_id: 1, status: "succeeded" };
+  readHandler = (url) => {
+    if (url.endsWith("/threads/a/runs")) return response([run]);
+    if (url.endsWith("/runs/r1/history")) return response({ run, events });
+  };
+  await openApp();
+  const panels = wrapper.findAll(".research-progress");
+  expect(panels).toHaveLength(1);
+  expect(panels[0].element.open).toBe(false);
+  expect(panels[0].findAll(".tool-event > span:first-child").map((node) => node.text())).toEqual(calls);
+  expect(panels[0].text()).toContain("核对笔记");
+  expect(wrapper.findAll(".message.assistant").map((node) => node.text())).toEqual(["已更新工作笔记"]);
+});
+
+it("keeps saved plans and tools in order within one completed run", async () => {
   const stream = controlledStream();
   writeHandler = () => stream.response;
   await openApp();
@@ -354,9 +381,10 @@ it("places each tool exchange after its own saved plan", async () => {
     expect.stringContaining("问题 A"),
     expect.stringContaining("读取年报"),
     expect.stringContaining("read_report"),
-    expect.stringContaining("计算比率"),
-    expect.stringContaining("calculate"),
     expect.stringContaining("最终结论"),
+  ]);
+  expect(wrapper.get(".research-progress").findAll(".progress-item").map((item) => item.text())).toEqual([
+    expect.stringContaining("read_report"), "计算比率", expect.stringContaining("calculate"),
   ]);
 });
 

@@ -97,6 +97,104 @@ describe("research workbench", () => {
     expect(window.location.search).toBe("?workspace=w1&thread=t1");
   });
 
+  it("reopens working notes from disk and preserves the current draft and library", async () => {
+    messages = [savedUser];
+    await openApp();
+    const draft = wrapper.get('textarea[aria-label="研究问题"]');
+    await draft.setValue("尚未发送");
+    const toggle = wrapper.get('button[aria-controls="memory-panel"]');
+    const library = wrapper.get('[aria-label="研究产物"]');
+    for (const [source, expected] of [
+      ["- [ ] 核对季报", "☐ 核对季报"], ["- [x] 核对季报", "☑ 核对季报"],
+    ]) {
+      fetch.mockResolvedValueOnce(response(source, 200, true));
+      await toggle.trigger("click");
+      await flushPromises();
+      expect(fetch.mock.calls.at(-1)[0]).toBe("/api/workspaces/w1/working-note");
+      expect(wrapper.get("#memory-panel li").text()).toBe(expected);
+      expect(library.isVisible()).toBe(false);
+      await wrapper.get('[aria-label="关闭记忆"]').trigger("click");
+      expect(library.isVisible()).toBe(true);
+      expect(document.activeElement).toBe(toggle.element);
+      expect(draft.element.value).toBe("尚未发送");
+      expect(wrapper.get(".user-content").text()).toBe(savedUser.content);
+    }
+  });
+
+  it("retries a failed note preview, shows an empty template, and refreshes handwritten changes", async () => {
+    await openApp();
+    fetch.mockResolvedValueOnce(response({ detail: "读取失败" }, 500));
+    await wrapper.get('button[aria-controls="memory-panel"]').trigger("click");
+    await flushPromises();
+    const panel = wrapper.get("#memory-panel");
+    expect(panel.get('[role="alert"]').text()).toContain("读取失败");
+    const template = "# 工作笔记\n\n## 当前进展与下一步\n\n## 会话与关键发现\n\n## 资料与产物\n";
+    fetch.mockResolvedValueOnce(response(template, 200, true));
+    await panel.get('[role="alert"] button').trigger("click");
+    await flushPromises();
+    expect(panel.text()).toContain("暂无工作笔记");
+    fetch.mockResolvedValueOnce(response("## 新发现\n\n已核对", 200, true));
+    await panel.get('[aria-label="刷新工作笔记"]').trigger("click");
+    await flushPromises();
+    expect(panel.get(".markdown h2").text()).toBe("新发现");
+  });
+
+  it("reads scoped memory topics on expansion and retries missing files in place", async () => {
+    await openApp();
+    async function click(text) {
+      await wrapper.findAll("#memory-panel button").find(button => button.text() === text).trigger("click");
+      await flushPromises();
+    }
+    fetch.mockResolvedValueOnce(response("", 200, true));
+    await wrapper.get('button[aria-controls="memory-panel"]').trigger("click");
+    await flushPromises();
+    const index = "- [回款 [2025]](cash.md) — 季报核查\n";
+    fetch.mockResolvedValueOnce(response(index, 200, true));
+    await click("长期记忆");
+    expect(fetch.mock.calls.at(-1)[0]).toBe("/api/workspaces/w1/memory/index?scope=workspace");
+    fetch.mockResolvedValueOnce(response({ detail: "missing" }, 404));
+    await click("回款 [2025]");
+    expect(wrapper.get("#memory-panel [role=alert]").text()).toContain("cash.md");
+    fetch.mockResolvedValueOnce(response("---\nname: 回款\n---\n## 依据\n季报第八页。", 200, true));
+    await click("重新读取");
+    expect(fetch.mock.calls.at(-1)[0]).toBe("/api/workspaces/w1/memory/topics/cash.md?scope=workspace");
+    expect(wrapper.get("#memory-panel .markdown h2").text()).toBe("依据");
+    expect(wrapper.get("#memory-panel .markdown").text()).not.toContain("name:");
+    fetch.mockResolvedValueOnce(response(index, 200, true));
+    await click("我的全局记忆");
+    expect(wrapper.text()).not.toContain("季报第八页");
+    fetch.mockResolvedValueOnce(response("用户要求标注币种", 200, true));
+    await click("回款 [2025]");
+    expect(fetch.mock.calls.at(-1)[0]).toBe("/api/workspaces/w1/memory/topics/cash.md?scope=user");
+    expect(wrapper.get("#memory-panel .markdown").text()).toBe("用户要求标注币种");
+    fetch.mockResolvedValueOnce(response("", 200, true));
+    await click("当前工作区");
+    expect(wrapper.get("#memory-panel").text()).toContain("当前工作区暂无长期记忆");
+  });
+
+  it("retains the selected scope after an index error and ignores a late response", async () => {
+    await openApp();
+    fetch.mockResolvedValueOnce(response("", 200, true));
+    await wrapper.get('button[aria-controls="memory-panel"]').trigger("click");
+    await flushPromises();
+    const button = label => wrapper.findAll("#memory-panel button").find(item => item.text() === label);
+    let finish;
+    fetch.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    await button("长期记忆").trigger("click");
+    fetch.mockResolvedValueOnce(response({ detail: "目录读取失败" }, 500));
+    await button("我的全局记忆").trigger("click");
+    await flushPromises();
+    finish(response("- [旧项目](old.md) — 旧结论", 200, true));
+    await flushPromises();
+    expect(wrapper.get("#memory-panel [role=alert]").text()).toContain("目录读取失败");
+    expect(wrapper.text()).not.toContain("旧项目");
+    fetch.mockResolvedValueOnce(response("", 200, true));
+    await button("重新读取").trigger("click");
+    await flushPromises();
+    expect(fetch.mock.calls.at(-1)[0]).toBe("/api/workspaces/w1/memory/index?scope=user");
+    expect(wrapper.text()).toContain("我的全局记忆暂无主题");
+  });
+
   it("disables duplicate sends but allows navigation while pending, then refreshes messages and artifacts", async () => {
     let finish;
     postHandler = () =>

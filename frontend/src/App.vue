@@ -17,6 +17,7 @@ import {
 } from "@lucide/vue";
 import { jsonRequest, request } from "./api";
 import MarkdownContent from "./components/MarkdownContent.vue";
+import MemoryPanel from "./components/MemoryPanel.vue";
 import ArtifactPanel from "./components/ArtifactPanel.vue";
 import { useResearchRuns } from "./useResearchRuns";
 
@@ -36,6 +37,13 @@ const {
   executionError, pollError, executionLabel,
   send, loadHistory, reconcileThread, reconcileWorkspace,
 } = useResearchRuns({ workspace, thread, refreshResearch });
+const memoryOpen = ref(false);
+const memoryToggle = ref(null);
+async function closeMemory() {
+  memoryOpen.value = false;
+  await nextTick();
+  memoryToggle.value?.focus();
+}
 const sidebarOpen = ref(false);
 const messageEnd = ref(null);
 const modal = ref(null);
@@ -338,7 +346,7 @@ onMounted(initialize);
 </script>
 
 <template>
-  <div class="workbench">
+  <div class="workbench" :class="{ 'memory-open': memoryOpen && workspace }">
     <button
       v-if="sidebarOpen"
       class="sidebar-backdrop"
@@ -488,6 +496,10 @@ onMounted(initialize);
               @click="openModal('details')"
             >
               <BookOpen :size="14" />研究档案<ArrowUpRight :size="13" />
+            </button>
+            <button ref="memoryToggle" class="meta-button" aria-controls="memory-panel"
+              :aria-expanded="memoryOpen" @click="memoryOpen ? closeMemory() : memoryOpen = true">
+              记忆
             </button>
           </div>
         </section>
@@ -645,8 +657,11 @@ onMounted(initialize);
         </div>
       </div>
     </main>
+    <MemoryPanel v-if="workspace && memoryOpen" :key="`note-${workspace.id}`"
+      :workspace-id="workspace.id" @close="closeMemory" />
     <ArtifactPanel
       v-if="workspace"
+      v-show="!memoryOpen"
       :key="workspace.id"
       :workspace="workspace"
       :busy="Boolean(uploads[workspace.id]?.pending)"

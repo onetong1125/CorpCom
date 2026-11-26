@@ -19,7 +19,10 @@ from openai import APIConnectionError
 from corpcom.api import create_app, get_model
 
 
-def scripted_research(store, model, workspace_id, thread_id, question, checkpointer, *, on_event=None):
+def scripted_research(
+    store, model, workspace_id, thread_id, question, checkpointer,
+    *, on_event=None, user_memory_dir=None,
+):
     """Exercise HTTP, persistence and file archival while replacing Agent execution."""
     store.add_user_message(workspace_id, thread_id, question)
     plan = AIMessage(id=uuid4().hex, content="正在核对本次研究资料。")

@@ -68,6 +68,65 @@ class WorkspaceAgentTests(unittest.TestCase):
     # Give each test an independent checkpoint store.
     self.checkpointer = InMemorySaver()
 
+  def test_agent_edits_working_note_and_next_thread_sees_completed_task(self):
+    pending = "- [ ] 核对本季回款。"
+    completed = "- [x] 核对本季回款：已与季报对账。"
+    original = f"# 工作笔记\n\n## 当前进展与下一步\n{pending}\n\n用户备注：保留年报链接。\n"
+    path = self.data / "workspaces" / self.workspace.id / "agent.md"
+    path.write_text(original, encoding="utf-8")
+    model = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[{
+            "id": "complete-note-task", "name": "edit_file",
+            "args": {"file_path": "agent.md", "old_string": pending, "new_string": completed},
+        }]),
+        AIMessage(content="已更新工作笔记。"),
+        AIMessage(content="本季回款已核对。"),
+    ])
+    with WorkspaceStore(self.data) as store:
+      ask_workspace(store, model, self.workspace.id, self.thread.id,
+                    "本季回款已与季报对账，请勾选完成。", self.checkpointer)
+      self.assertEqual(path.read_text(encoding="utf-8"), original.replace(pending, completed))
+      new_thread = store.create_thread(self.workspace.id, "接手核对")
+      ask_workspace(store, model, self.workspace.id, new_thread.id, "核对到哪了？", self.checkpointer)
+
+    self.assertIn(completed, model.requests[-1][0].content)
+    self.assertNotIn(pending, model.requests[-1][0].content)
+    # Inspect instructions separately from the user-authored note included as data.
+    instructions = model.requests[0][0].content.split("当前 Workspace 的已保存研究状态：", 1)[0]
+    self.assertIn("agent.md", instructions)
+    self.assertIn("edit_file", instructions)
+    self.assertIn("进展", instructions)
+    self.assertIn("下一步", instructions)
+
+  def test_each_turn_reads_current_workspace_working_note(self):
+    model = ScriptedModel(responses=[AIMessage(content="已收到")])
+    notes_dir = self.data / "workspaces"
+    first = "优先核对年报披露的应收余额。"
+    revised = "先查季报里的应收账款账龄。"
+    other_note = "先核对乙公司的股权变动。"
+    with WorkspaceStore(self.data) as store:
+      wid = self.workspace.id
+      path = notes_dir / wid / "agent.md"
+      other = store.create_workspace("乙公司")
+      other_thread = store.create_thread(other.id, "跟踪")
+      (notes_dir / other.id / "agent.md").write_text(other_note, encoding="utf-8")
+
+      path.write_text(first, encoding="utf-8")
+      ask_workspace(store, model, wid, self.thread.id, "下一步？", self.checkpointer)
+      path.write_text(revised, encoding="utf-8")
+      ask_workspace(store, model, wid, self.thread.id, "现在呢？", self.checkpointer)
+      new_thread = store.create_thread(wid, "接手")
+      ask_workspace(store, model, wid, new_thread.id, "怎么继续？", self.checkpointer)
+      ask_workspace(store, model, other.id, other_thread.id, "查什么？", self.checkpointer)
+
+    prompts = [request[0].content for request in model.requests]
+    self.assertEqual(len(prompts), 4)
+    for prompt, expected in zip(prompts, [first, revised, revised, other_note]):
+      with self.subTest(expected=expected):
+        self.assertIn(expected, prompt)
+        for absent in {first, revised, other_note} - {expected}:
+          self.assertNotIn(absent, prompt)
+
   def test_concurrent_first_turns_only_instruct_one_research_initialization(self):
     with WorkspaceStore(self.data) as store:
       empty = store.create_workspace("并发首次研究")
@@ -250,6 +309,297 @@ class WorkspaceAgentTests(unittest.TestCase):
         context["other_threads"],
         [{"id": self.thread.id, "title": self.thread.title}],
     )
+
+  def test_over_budget_long_working_note_is_excerpted_only_for_model(self):
+    model = ScriptedModel(responses=[AIMessage(content="收到。")])
+    wid = self.workspace.id
+    question = "下一步查什么？"
+    path = self.data / "workspaces" / wid / "agent.md"
+    start = "优先核对本季回款。"
+    end = "附录末尾：上年数据已复核。"
+    full_note = start + "\n" + "历史核对记录。\n" * 4000 + end
+
+    with WorkspaceStore(self.data) as store:
+      next_thread = store.create_thread(wid, self.thread.title)
+      tools = create_workspace_tools(store.root, wid)
+      path.write_text(start, encoding="utf-8")
+      ask_workspace(store, model, wid, self.thread.id, question, self.checkpointer)
+      # Leave room beyond the observed short request for an excerpt and a file pointer.
+      budget = count_tokens_approximately(model.requests[0], tools=tools) + 128
+      path.write_text(full_note, encoding="utf-8")
+      with patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=str(budget)):
+        ask_workspace(store, model, wid, next_thread.id, question, self.checkpointer)
+
+    request = model.requests[1]
+    prompt = request[0].content
+    self.assertIn(start, prompt)
+    self.assertNotIn(end, prompt)
+    self.assertIn("截断", prompt)
+    self.assertIn("agent.md", prompt)
+    self.assertEqual(request[-1].content, question)
+    self.assertLessEqual(count_tokens_approximately(request, tools=tools), budget)
+    self.assertEqual(path.read_bytes(), full_note.encode("utf-8"))
+
+  def test_new_thread_receives_scoped_long_term_memory_tool_instructions(self):
+    model = ScriptedModel(responses=[AIMessage(content="先核对已有约定。")])
+    with WorkspaceStore(self.data) as store:
+      ask_workspace(store, model, self.workspace.id, self.thread.id,
+                    "这个项目有哪些可沿用的研究约定？", self.checkpointer)
+
+    # Only inspect instructions, excluding the function catalog and saved user data.
+    instructions = model.requests[0][0].content.split("可用沙箱数据函数：", 1)[0]
+    for term in ("memory_indexes", "user", "workspace", "read_memory", "write_memory", "forget_memory"):
+      with self.subTest(term=term):
+        self.assertRegex(instructions, rf"(?<![/A-Za-z0-9_]){term}(?![/A-Za-z0-9_])")
+
+  def test_agent_reads_requested_memory_topic_from_each_scope(self):
+    wid = self.workspace.id
+    key = "report.md"
+    shared = self.root / "shared-memory"
+    project = self.data / "workspaces" / wid / "memory"
+    topics = {
+        "user": (shared, "# 报告约定\n所有金额注明单位。\n"),
+        "workspace": (project, "# 项目依据\n现金流改善主要来自本季回款。\n"),
+    }
+    for directory, markdown in topics.values():
+      directory.mkdir()
+      (directory / key).write_text(markdown, encoding="utf-8")
+      (directory / "memory.md").write_text("- [报告](report.md) — 报告说明\n", encoding="utf-8")
+    model = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[
+            {"name": "read_memory", "args": {"scope": scope, "key": key}, "id": scope}
+            for scope in topics
+        ]),
+        AIMessage(content="已核对两份主题。"),
+    ])
+    with WorkspaceStore(self.data) as store:
+      ask_workspace(store, model, wid, self.thread.id, "请查两份报告说明。",
+                    self.checkpointer, user_memory_dir=shared)
+
+    for _, markdown in topics.values():
+      self.assertNotIn(markdown.splitlines()[1], model.requests[0][0].content)
+    results = {
+        message.tool_call_id: message.content for message in model.requests[1]
+        if isinstance(message, ToolMessage)
+    }
+    for scope, (_, markdown) in topics.items():
+      with self.subTest(scope=scope):
+        self.assertEqual(results[scope], markdown)
+
+  def test_agent_creates_user_memory_discoverable_from_another_workspace(self):
+    shared = self.root / "shared-memory"
+    key = "report_units.md"
+    body = "适用于所有项目：金额必须注明币种和单位。\n"
+    model = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[{
+            "id": "save-units", "name": "write_memory",
+            "args": {"scope": "user", "key": key, "name": "报告单位",
+                     "description": "金额披露约定", "memory_type": "feedback", "body": body},
+        }]),
+        AIMessage(content="已记录。"),
+        AIMessage(content="", tool_calls=[{
+            "id": "read-units", "name": "read_memory", "args": {"scope": "user", "key": key},
+        }]),
+        AIMessage(content="已查看约定。"),
+    ])
+    with WorkspaceStore(self.data) as store:
+      ask_workspace(store, model, self.workspace.id, self.thread.id,
+                    "记住：以后所有项目的金额都要注明币种和单位。", self.checkpointer,
+                    user_memory_dir=shared)
+      saved = next(msg for msg in model.requests[1] if isinstance(msg, ToolMessage))
+      self.assertEqual(saved.status, "success", saved.content)
+      markdown = (shared / key).read_text(encoding="utf-8")
+      self.assertTrue(markdown.endswith(body))
+      entry = "- [报告单位](report_units.md) — 金额披露约定"
+      self.assertIn(entry, (shared / "memory.md").read_text(encoding="utf-8").splitlines())
+
+      other = store.create_workspace("另一家公司")
+      thread = store.create_thread(other.id, "新项目的报告")
+      ask_workspace(store, model, other.id, thread.id, "金额披露有什么约定？",
+                    self.checkpointer, user_memory_dir=shared)
+
+    self.assertIn(entry, model.requests[2][0].content)
+    self.assertNotIn(body.strip(), model.requests[2][0].content)
+    result = next(msg for msg in model.requests[3] if isinstance(msg, ToolMessage))
+    self.assertEqual(result.content, markdown)
+
+  def test_agent_revises_project_memory_using_the_markdown_it_read(self):
+    wid = self.workspace.id
+    directory = self.data / "workspaces" / wid / "memory"
+    directory.mkdir()
+    key = "cashflow.md"
+    header = "---\n# 用户备注\nname: 回款\ndescription: 跟踪到账时点\ntype: project\n---\n\n"
+    original = header + "回款改善，原因待核实。\n"
+    revised = "季报第 8 页确认本季回款提前，仍需核对下一季度。\n"
+    topic = directory / key
+    topic.write_text(original, encoding="utf-8")
+    index = directory / "memory.md"
+    entry = "# 用户整理的目录\n\n- [回款](cashflow.md) — 跟踪到账时点\n"
+    index.write_text(entry, encoding="utf-8")
+    args = {"scope": "workspace", "key": key}
+    model = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[{"id": "read", "name": "read_memory", "args": args}]),
+        AIMessage(content="原因待核实。"),
+    ])
+    with WorkspaceStore(self.data) as store:
+      ask_workspace(store, model, wid, self.thread.id, "先核对已有的回款判断。", self.checkpointer)
+      read = next(msg for msg in model.requests[-1] if isinstance(msg, ToolMessage))
+      self.assertEqual(read.content, original)
+      model.responses = [
+          AIMessage(content="", tool_calls=[{
+              "id": "revise", "name": "write_memory",
+              "args": {**args, "expected_markdown": read.content, "body": revised},
+          }]),
+          AIMessage(content="已更新项目判断。"),
+      ]
+      ask_workspace(store, model, wid, self.thread.id, "根据季报第 8 页修订原主题。", self.checkpointer)
+
+    result = next(msg for msg in model.requests[-1] if isinstance(msg, ToolMessage)
+                  and msg.tool_call_id == "revise")
+    self.assertEqual(result.status, "success", result.content)
+    self.assertEqual(topic.read_bytes(), (header + revised).encode("utf-8"))
+    self.assertEqual(index.read_bytes(), entry.encode("utf-8"))
+
+  def test_agent_forgets_only_the_requested_memory_scope(self):
+    wid = self.workspace.id
+    shared = self.root / "shared-memory"
+    project = self.data / "workspaces" / wid / "memory"
+    key = "units.md"
+    keep = "# 手写目录\n\n- [币种](currency.md) — 保留这条约定\n"
+    entry = "- [单位](units.md) — 金额单位约定\n"
+    shared_body = "# 用户偏好\n所有报告使用万元。\n"
+    project_body = "# 项目约定\n按年报原始单位列示。\n"
+    for directory, body in ((shared, shared_body), (project, project_body)):
+      directory.mkdir()
+      (directory / key).write_text(body, encoding="utf-8")
+      (directory / "memory.md").write_text(keep + entry, encoding="utf-8")
+    args = {"scope": "user", "key": key}
+    model = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[{"id": "read", "name": "read_memory", "args": args}]),
+        AIMessage(content="", tool_calls=[{
+            "id": "forget", "name": "forget_memory", "args": {**args, "expected_markdown": shared_body},
+        }]),
+        AIMessage(content="已移除通用单位偏好。"),
+    ])
+    with WorkspaceStore(self.data) as store:
+      ask_workspace(store, model, wid, self.thread.id, "忘记通用单位偏好，保留本项目的约定。",
+                    self.checkpointer, user_memory_dir=shared)
+    results = {msg.tool_call_id: msg for msg in model.requests[-1] if isinstance(msg, ToolMessage)}
+    self.assertEqual(results["read"].content, shared_body)
+    self.assertEqual(results["forget"].status, "success", results["forget"].content)
+    self.assertFalse((shared / key).exists())
+    self.assertEqual((shared / "memory.md").read_bytes(), keep.encode("utf-8"))
+    self.assertEqual((project / key).read_bytes(), project_body.encode("utf-8"))
+    self.assertEqual((project / "memory.md").read_bytes(), (keep + entry).encode("utf-8"))
+
+  def test_over_budget_long_memory_indexes_keep_usable_entries_from_both_scopes(self):
+    wid = self.workspace.id
+    question = "有哪些记忆可以接着查？"
+    model = ScriptedModel(responses=[AIMessage(content="已查看目录。")])
+    directory = self.data / "workspaces" / wid
+    paths = {"user": self.data / "user/memory/memory.md", "workspace": directory / "memory/memory.md"}
+    entries = {}
+    for scope, path in paths.items():
+      path.parent.mkdir(parents=True)
+      entries[scope] = [f"- [{scope} 第{i}项]({scope}_{i}.md) — 核查依据。" for i in range(200)]
+      path.write_text(entries[scope][0], encoding="utf-8")
+    note = "下一步先核实季报到账时间。"
+    (directory / "agent.md").write_text(note, encoding="utf-8")
+
+    with WorkspaceStore(self.data) as store:
+      next_thread = store.create_thread(wid, self.thread.title)
+      tools = create_workspace_tools(store.root, wid)
+      ask_workspace(store, model, wid, self.thread.id, question, self.checkpointer)
+      budget = count_tokens_approximately(model.requests[0], tools=tools) + 200
+      for scope, path in paths.items():
+        path.write_text("\n".join(entries[scope]), encoding="utf-8")
+      with patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=str(budget)):
+        ask_workspace(store, model, wid, next_thread.id, question, self.checkpointer)
+
+    request = model.requests[1]
+    self.assertLessEqual(count_tokens_approximately(request, tools=tools), budget)
+    self.assertEqual(request[-1].content, question)
+    state = json.loads(request[0].content.split("当前 Workspace 的已保存研究状态：\n", 1)[1])
+    self.assertEqual(state["working_note"], note)
+    for scope, path in paths.items():
+      with self.subTest(scope=scope):
+        preview = state["memory_indexes"][scope].splitlines()
+        self.assertIn(entries[scope][0], preview)
+        self.assertNotIn(entries[scope][-1], preview)
+        for line in preview:
+          if line.startswith("- ["):
+            self.assertIn(line, entries[scope])
+        self.assertEqual(path.read_bytes(), "\n".join(entries[scope]).encode("utf-8"))
+
+  def test_long_index_leaves_room_for_requested_memory_evidence(self):
+    wid = self.workspace.id
+    directory = self.data / "workspaces" / wid / "memory"
+    directory.mkdir()
+    evidence = "# 回款核查\n一季报第 8 页：本季回款提前了 15 天。\n"
+    (directory / "cashflow.md").write_text(evidence, encoding="utf-8")
+    entry = "- [回款核查](cashflow.md) — 核对回款时间"
+    index = directory / "memory.md"
+    index.write_text(entry, encoding="utf-8")
+    question = "本季回款提前的依据是什么？"
+    model = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[{
+            "id": "read-evidence", "name": "read_memory",
+            "args": {"scope": "workspace", "key": "cashflow.md"},
+        }]),
+        AIMessage(content="已核对季报。"),
+    ])
+    with WorkspaceStore(self.data) as store:
+      second_thread = store.create_thread(wid, self.thread.title)
+      tools = create_workspace_tools(store.root, wid)
+      ask_workspace(store, model, wid, self.thread.id, question, self.checkpointer)
+      budget = count_tokens_approximately(model.requests[-1], tools=tools) + 200
+      extra = [f"- [历史主题 {i}](history_{i}.md) — 其他季度资料" for i in range(200)]
+      index.write_text("\n".join([entry, *extra]), encoding="utf-8")
+      with patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=str(budget)):
+        ask_workspace(store, model, wid, second_thread.id, question, self.checkpointer)
+
+    request = model.requests[-1]
+    self.assertLessEqual(count_tokens_approximately(request, tools=tools), budget)
+    self.assertNotIn(extra[-1], request[0].content)
+    result = next(msg for msg in request if isinstance(msg, ToolMessage))
+    self.assertEqual(result.content, evidence)
+
+  def test_agent_searches_selected_memory_index_beyond_its_prompt_excerpt(self):
+    wid = self.workspace.id
+    shared = self.root / "shared-memory"
+    shared.mkdir()
+    project = self.data / "workspaces" / wid / "memory"
+    project.mkdir()
+    match = "- [报告格式](report_units.md) — 披露金额单位"
+    other_scope = "- [本季调整](quarter.md) — 本项目金额单位"
+    (project / "memory.md").write_text(other_scope, encoding="utf-8")
+    question = "通用记忆里有没有关于金额单位的约定？"
+    model = ScriptedModel(responses=[
+        AIMessage(content="已查看目录。"),
+        AIMessage(content="", tool_calls=[{
+            "id": "find-units", "name": "search_memory",
+            "args": {"scope": "user", "query": "金额单位"},
+        }]),
+        AIMessage(content="找到了报告格式条目。"),
+    ])
+    with WorkspaceStore(self.data) as store:
+      second_thread = store.create_thread(wid, self.thread.title)
+      tools = create_workspace_tools(store.root, wid, user_memory_dir=shared)
+      ask_workspace(store, model, wid, self.thread.id, question, self.checkpointer, user_memory_dir=shared)
+      budget = count_tokens_approximately(model.requests[0], tools=tools) + 200
+      filler = [f"- [历史资料 {i}](history_{i}.md) — 背景说明" for i in range(200)]
+      (shared / "memory.md").write_text("\n".join([*filler, match]), encoding="utf-8")
+      with patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=str(budget)):
+        ask_workspace(store, model, wid, second_thread.id, question, self.checkpointer, user_memory_dir=shared)
+
+    self.assertNotIn("report_units.md", model.requests[1][0].content)
+    request = model.requests[-1]
+    self.assertLessEqual(count_tokens_approximately(request, tools=tools), budget)
+    result = next(msg for msg in request if isinstance(msg, ToolMessage))
+    self.assertEqual(result.status, "success", result.content)
+    self.assertIn(match, result.content)
+    self.assertNotIn(other_scope, result.content)
+    self.assertNotIn(filler[0], result.content)
 
   def test_over_budget_drops_oldest_complete_turn(self):
     first_question = "营收是多少？"

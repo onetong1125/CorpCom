@@ -3,6 +3,7 @@
 import logging
 import os
 from collections.abc import Callable
+from pathlib import Path
 
 from langchain_core.messages.utils import count_tokens_approximately
 from pydantic import env_settings
@@ -94,9 +95,15 @@ def handle_workspace_tool_error(request, handler):
         status="error",
     )
 
-@wrap_model_call
-def compact_model_input_tokens(request, handler):
-  """Estimate model input and trim complete old turns when over budget."""
+def compact_model_input_tokens(
+    request,
+    handler,
+    working_note: str,
+    memory_indexes: dict[str, str],
+    render_prompt: Callable[[str, dict[str, str]], str],
+):
+  """Fit history, tool results, and research memory to the model input budget."""
+  system_message = request.system_message
   messages = request.messages
   count = count_tokens_approximately(
       [request.system_message, *messages],
@@ -128,6 +135,35 @@ def compact_model_input_tokens(request, handler):
           tools=request.tools,
       )
 
+    if count > budget and any(memory_indexes.values()):
+      index_lines = {
+          scope: index.splitlines(keepends=True)
+          for scope, index in memory_indexes.items()
+      }
+      # Try the same line limit for each scope so both can contribute entries.
+      low, high = 1, max(map(len, index_lines.values())) - 1
+      memory_indexes = {}
+      system_message = request.system_message.model_copy(update={
+          "content": render_prompt(working_note, memory_indexes),
+      })
+      count = count_tokens_approximately([system_message, *messages], tools=request.tools)
+      while count <= budget and low <= high:
+        middle = (low + high) // 2
+        candidate_indexes = {
+            scope: "".join(lines[:middle]) for scope, lines in index_lines.items()
+        }
+        candidate = request.system_message.model_copy(update={
+            "content": render_prompt(working_note, candidate_indexes),
+        })
+        candidate_count = count_tokens_approximately([candidate, *messages], tools=request.tools)
+        if candidate_count <= budget:
+          memory_indexes = candidate_indexes
+          system_message = candidate
+          count = candidate_count
+          low = middle + 1
+        else:
+          high = middle - 1
+
     if count > budget:
       messages = list(messages)
       marker = "\n[工具结果已截断]"
@@ -147,7 +183,7 @@ def compact_model_input_tokens(request, handler):
               update={"content": original[:middle] + marker}
           )
           candidate_count = count_tokens_approximately(
-              [request.system_message, *messages], tools=request.tools,
+              [system_message, *messages], tools=request.tools,
           )
           if candidate_count <= budget:
             low = middle
@@ -157,18 +193,35 @@ def compact_model_input_tokens(request, handler):
             update={"content": original[:low] + marker}
         )
         count = count_tokens_approximately(
-            [request.system_message, *messages], tools=request.tools,
+            [system_message, *messages], tools=request.tools,
         )
+      if count > budget:
+        marker = "\n［工作笔记已截断，可读取 agent.md 查看全文］"
+        low, high = 0, len(working_note) - 1
+        while low <= high:
+          middle = (low + high) // 2
+          candidate = request.system_message.model_copy(update={
+              "content": render_prompt(working_note[:middle] + marker, memory_indexes),
+          })
+          candidate_count = count_tokens_approximately(
+              [candidate, *messages], tools=request.tools,
+          )
+          if candidate_count <= budget:
+            system_message = candidate
+            count = candidate_count
+            low = middle + 1
+          else:
+            high = middle - 1
       if count > budget:
         raise RuntimeError("模型输入超过预算，无法缩短到预算范围内")
 
   logger.info("模型输入估算 tokens=%d", count)
-  return handler(request.override(messages=messages))
+  return handler(request.override(system_message=system_message, messages=messages))
 
 def create_workspace_agent(
     store: WorkspaceStore, model: BaseChatModel,
     workspace_id: str, thread_id: str, checkpointer: BaseCheckpointSaver,
-    *, is_first_message: bool = False,
+    *, is_first_message: bool = False, user_memory_dir: Path | None = None,
 ):
   """Build the same graph for research execution and checkpoint recovery."""
   detail = store.get_workspace_detail(workspace_id)
@@ -187,16 +240,32 @@ def create_workspace_agent(
       for item in detail.threads if item.id != thread_id
     ],
   }
+  working_note = store.read_working_note(workspace_id)
+  if user_memory_dir is None:
+    user_memory_dir = store.root / "user" / "memory"
+  memory_indexes = {
+      "user": store.read_memory_index(workspace_id, "user", user_memory_dir),
+      "workspace": store.read_memory_index(workspace_id, "workspace", user_memory_dir),
+  }
+
+  def render_prompt(note: str, indexes: dict[str, str]) -> str:
+    prompt_context = {**context, "working_note": note}
+    if any(indexes.values()):
+      prompt_context["memory_indexes"] = indexes
+    return build_workspace_prompt(prompt_context, initialize_research=initialize_research)
+
+  @wrap_model_call
+  def apply_input_budget(request, handler):
+    return compact_model_input_tokens(request, handler, working_note, memory_indexes, render_prompt)
+
   return create_agent(
       model,
-      tools=create_workspace_tools(store.root, workspace_id),
-      system_prompt=build_workspace_prompt(
-          context, initialize_research=initialize_research
-      ),
+      tools=create_workspace_tools(store.root, workspace_id, user_memory_dir=user_memory_dir),
+      system_prompt=render_prompt(working_note, memory_indexes),
       middleware=[
         ModelCallLimitMiddleware(run_limit=100, exit_behavior="error"),
         handle_workspace_tool_error,
-        compact_model_input_tokens,
+        apply_input_budget,
       ],
       checkpointer=checkpointer,
   )
@@ -207,6 +276,7 @@ def ask_workspace(
     workspace_id: str, thread_id: str, question: str,
     checkpointer: BaseCheckpointSaver, *,
     on_event: Callable[[AgentEvent], None] | None = None,
+    user_memory_dir: Path | None = None,
 ) -> AIMessage:
   """Save the user's question and generate the answer."""
   logger.info("本轮开始 workspace=%s thread=%s", workspace_id, thread_id)
@@ -215,6 +285,7 @@ def ask_workspace(
               workspace_id, thread_id, question[:20])
   agent = create_workspace_agent(
       store, model, workspace_id, thread_id, checkpointer, is_first_message=is_first,
+      user_memory_dir=user_memory_dir,
   )
   config = {
     "configurable": {
