@@ -20,8 +20,8 @@ from langgraph.errors import GraphBubbleUp
 
 from corpcom.event_types import ToolEvent, AgentEvent
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore
-from corpcom.workspace_prompt import build_workspace_prompt
-from corpcom.workspace_tools import create_workspace_tools
+from corpcom.agent.prompt import build_workspace_prompt
+from corpcom.agent.tools import create_workspace_tools
 
 logger = logging.getLogger(__name__)
 

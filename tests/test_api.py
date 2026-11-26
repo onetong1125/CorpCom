@@ -17,7 +17,7 @@ from langchain_core.messages import AIMessage
 from openai import APIConnectionError
 
 from corpcom.api import create_app, get_model
-from corpcom.workspace_agent import ask_workspace
+from corpcom.agent.runtime import ask_workspace
 from corpcom.workspace import WorkspaceStore
 from corpcom.workspace_models import Thread
 

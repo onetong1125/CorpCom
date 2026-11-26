@@ -15,7 +15,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from corpcom.run_coordinator import RunCoordinator
 from corpcom.workspace import WorkspaceStore
-from corpcom.workspace_agent import ask_workspace
+from corpcom.agent.runtime import ask_workspace
 
 
 class ProtocolCheckingModel(FakeMessagesListChatModel):
@@ -56,7 +56,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
             with (
                 WorkspaceStore(root) as store,
                 SqliteSaver.from_conn_string(checkpoint_path) as saver,
-                patch("corpcom.workspace_agent.create_workspace_tools", return_value=[action]),
+                patch("corpcom.agent.runtime.create_workspace_tools", return_value=[action]),
             ):
                 workspace = store.create_workspace("全部结果待提交", goal="保存 pending writes")
                 thread = store.create_thread(workspace.id, "C")
@@ -120,7 +120,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
             with (
                 WorkspaceStore(root) as store,
                 SqliteSaver.from_conn_string(str(root / "checkpoints.sqlite")) as saver,
-                patch("corpcom.workspace_agent.create_workspace_tools", return_value=tools),
+                patch("corpcom.agent.runtime.create_workspace_tools", return_value=tools),
             ):
                 workspace = store.create_workspace("部分结果恢复", goal="保留已有工具结果")
                 thread = store.create_thread(workspace.id, "C")
@@ -192,7 +192,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
             with (
                 WorkspaceStore(root) as store,
                 SqliteSaver.from_conn_string(checkpoint_path) as saver,
-                patch("corpcom.workspace_agent.create_workspace_tools", return_value=tools),
+                patch("corpcom.agent.runtime.create_workspace_tools", return_value=tools),
             ):
                 workspace = store.create_workspace("恢复验收", goal="验证中断恢复")
                 thread = store.create_thread(workspace.id, "C")
@@ -206,7 +206,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
             with (
                 WorkspaceStore(root) as store,
                 SqliteSaver.from_conn_string(checkpoint_path) as saver,
-                patch("corpcom.workspace_agent.create_workspace_tools", return_value=tools),
+                patch("corpcom.agent.runtime.create_workspace_tools", return_value=tools),
             ):
                 store.interrupt_running_executions()
                 recovery = ProtocolCheckingModel(responses=[AIMessage(content="恢复正常")])
@@ -264,7 +264,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
             with (
                 WorkspaceStore(root) as store,
                 SqliteSaver.from_conn_string(str(root / "checkpoints.sqlite")) as saver,
-                patch("corpcom.workspace_agent.create_workspace_tools", return_value=[broken_action]),
+                patch("corpcom.agent.runtime.create_workspace_tools", return_value=[broken_action]),
                 patch("corpcom.run_coordinator.recover_interrupted_checkpoint") as recover,
             ):
                 workspace = store.create_workspace("异常不可掩盖", goal="验证工具错误")

@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from corpcom.workspace import WorkspaceStore
-from corpcom.workspace_tools import create_workspace_tools
+from corpcom.agent.tools import create_workspace_tools
 
 
 class WorkspaceFileToolTests(unittest.TestCase):

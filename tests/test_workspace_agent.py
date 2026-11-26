@@ -26,10 +26,10 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 
 from corpcom.run_coordinator import RunCoordinator
 from corpcom.workspace import WorkspaceStore
-from corpcom.workspace_agent import ask_workspace
+from corpcom.agent.runtime import ask_workspace
 from corpcom.workspace_models import WorkspaceResearchInfo
-from corpcom.workspace_prompt import build_workspace_prompt
-from corpcom.workspace_tools import create_workspace_tools
+from corpcom.agent.prompt import build_workspace_prompt
+from corpcom.agent.tools import create_workspace_tools
 
 
 class ScriptedModel(FakeMessagesListChatModel):
@@ -1294,7 +1294,7 @@ class WorkspaceAgentTests(unittest.TestCase):
     with (
       WorkspaceStore(self.data) as store,
       patch(
-          "corpcom.workspace_agent.create_workspace_tools",
+          "corpcom.agent.runtime.create_workspace_tools",
           return_value=[inspect_record],
       ),
     ):
@@ -1352,7 +1352,7 @@ class WorkspaceAgentTests(unittest.TestCase):
     with (
       WorkspaceStore(self.data) as store,
       patch(
-          "corpcom.workspace_agent.create_workspace_tools",
+          "corpcom.agent.runtime.create_workspace_tools",
           return_value=[inspect_record],
       ),
       patch.object(
@@ -1473,7 +1473,7 @@ class WorkspaceAgentTests(unittest.TestCase):
       )
 
       with (
-        patch("corpcom.workspace_agent.create_workspace_tools", return_value=tools),
+        patch("corpcom.agent.runtime.create_workspace_tools", return_value=tools),
         patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=str(budget)),
       ):
         ask_workspace(
@@ -1518,7 +1518,7 @@ class WorkspaceAgentTests(unittest.TestCase):
     ])
     with (
       WorkspaceStore(self.data) as store,
-      patch("corpcom.workspace_agent.create_workspace_tools", return_value=tools),
+      patch("corpcom.agent.runtime.create_workspace_tools", return_value=tools),
     ):
       with patch.dict(os.environ, CORPCOM_MODEL_INPUT_TOKEN_BUDGET=str(full_budget)):
         ask_workspace(store, follow_model, self.workspace.id, self.thread.id,

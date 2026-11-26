@@ -1,7 +1,6 @@
 """Define research tools bound to one workspace and its data directory."""
 
 from pathlib import Path
-from typing import Literal
 import inspect
 from pydantic import BaseModel, ConfigDict, JsonValue
 
@@ -12,7 +11,8 @@ from corpcom.function_catalog import FUNCTIONS
 from corpcom.errors import ArtifactRegistrationError
 from corpcom.workspace import WorkspaceStore
 from corpcom.workspace_models import WorkspaceResearchInfo
-from corpcom.workspace_file_tools import create_file_tools
+from corpcom.agent.file_tools import create_file_tools
+from corpcom.agent.memory_tools import create_memory_tools
 from corpcom.sandbox import run_python, run_bash
 
 class SandboxOutput(BaseModel):
@@ -36,9 +36,6 @@ def create_workspace_tools(
     data_dir: Path, workspace_id: str, *, user_memory_dir: Path | None = None,
 ) -> list[BaseTool]:
     """Bind workspace ownership without exposing it as a model-supplied argument."""
-    if user_memory_dir is None:
-        user_memory_dir = data_dir / "user" / "memory"
-
     # Tools run in worker threads, so each read owns a connection created in that worker.
     @tool
     def read_thread(thread_id: str) -> dict:
@@ -52,72 +49,6 @@ def create_workspace_tools(
                 for item in history.messages
             ],
         }
-
-    @tool
-    def read_memory(scope: Literal["user", "workspace"], key: str) -> str:
-        """Read the full Markdown of a memory topic by its .md filename.
-
-        Use scope "user" for shared memory or "workspace" for this workspace's memory.
-        """
-        with WorkspaceStore(data_dir) as store:
-            return store.read_memory_topic(workspace_id, scope, user_memory_dir, key)
-
-    @tool
-    def search_memory(scope: Literal["user", "workspace"], query: str) -> str:
-        """Search the full memory index in the selected scope for a keyword.
-
-        Use this when a relevant topic is missing from the index preview.
-        Use a filename from the matching lines with read_memory to read the topic.
-        """
-        with WorkspaceStore(data_dir) as store:
-            index = store.read_memory_index(workspace_id, scope, user_memory_dir)
-        return "\n".join(line for line in index.splitlines() if query in line)
-
-    @tool
-    def write_memory(
-        scope: Literal["user", "workspace"], key: str, body: str,
-        name: str | None = None, description: str | None = None,
-        memory_type: Literal["user", "feedback", "project", "reference"] | None = None,
-        expected_markdown: str | None = None,
-    ) -> str:
-        """Create a memory topic or revise its body in the selected scope.
-
-        To create a topic, supply name, description, and memory_type.
-        To revise a topic, first call read_memory with the same scope and key.
-        Pass its complete Markdown verbatim as expected_markdown and the revised
-        body without frontmatter as body. If the topic changed, read it again
-        and merge the changes before retrying.
-        """
-        with WorkspaceStore(data_dir) as store:
-            if expected_markdown is not None:
-                store.revise_memory_topic(
-                    workspace_id, scope, user_memory_dir, key,
-                    expected_markdown=expected_markdown, body=body,
-                )
-            else:
-                if name is None or description is None or memory_type is None:
-                    raise ToolException("Creating a memory topic requires name, description, and memory_type")
-                store.create_memory_topic(
-                    workspace_id, scope, user_memory_dir, key,
-                    name=name, description=description, memory_type=memory_type, body=body,
-                )
-        return f"已保存 {key}"
-
-    @tool
-    def forget_memory(
-        scope: Literal["user", "workspace"], key: str, expected_markdown: str,
-    ) -> str:
-        """Remove a memory topic and its index entry in the selected scope.
-
-        First call read_memory with the same scope and key. Pass the complete
-        Markdown it returned verbatim as expected_markdown. If the topic has
-        changed, read it again before deciding whether to retry.
-        """
-        with WorkspaceStore(data_dir) as store:
-            store.forget_memory_topic(
-                workspace_id, scope, user_memory_dir, key, expected_markdown=expected_markdown,
-            )
-        return f"已移除 {key}"
 
     # 暂停按 Artifact ID 读取的 Agent 工具，工作区文件通过 execute_bash 读取。
     # @tool
@@ -312,10 +243,7 @@ def create_workspace_tools(
 
     return [
       read_thread,
-      read_memory,
-      search_memory,
-      write_memory,
-      forget_memory,
+      *create_memory_tools(data_dir, workspace_id, user_memory_dir=user_memory_dir),
       update_research,
       read_function_doc,
       execute_python, execute_bash,
