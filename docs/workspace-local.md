@@ -6,15 +6,17 @@
 data/
   corpcom.db
   checkpoints.sqlite
+  user/memory/                 # 跨工作区的主题和 memory.md 索引
   workspaces/<workspace_id>/
+    memory/                    # 当前项目的主题和 memory.md 索引
     research.json
     agent.md
     files/<artifact_id>/<原文件名>
     tasks/<任务名>/<代码、数据或报告>
-    .runs/<旧 execute_python 执行编号>/
+    .runs/<execute_python 执行编号>/
 ```
 
-默认使用服务启动目录下的 `data/`，可通过 `CORPCOM_DATA_DIR` 指定已有数据目录。停止服务后，备份需要同时保留 corpcom.db、checkpoints.sqlite 和文件目录；若还需保留未归档的过程事件，应同时保留 Redis 数据卷。Redis 使用独立的 Compose `redis-data` 卷，不在上述 data 目录内。Workspace 的 `execute_python` 使用 `workspaces/<workspace_id>/.runs/<执行编号>/`，将声明的产物复制到 `workspaces/<workspace_id>/tasks/<任务路径与版本>/` 并登记索引；独立 PTC 命令仍使用根目录 `runs/`。
+默认使用服务启动目录下的 `data/`，可通过 `CORPCOM_DATA_DIR` 指定已有数据目录。停止服务后，备份需要同时保留 corpcom.db、checkpoints.sqlite 和文件目录；若还需保留未归档的过程事件，应同时保留 Redis 数据卷。如果单独配置了用户记忆目录，也要备份该目录。Redis 使用独立的 Compose `redis-data` 卷，不在上述 data 目录内。Workspace 的 `execute_python` 使用 `workspaces/<workspace_id>/.runs/<执行编号>/`，将声明的产物复制到 `workspaces/<workspace_id>/tasks/<任务路径与版本>/` 并登记索引；独立 PTC 命令仍使用根目录 `runs/`。
 
 `research.json` 是研究目标、初始假设、自由文本范围、观察周期和偏好的统一存储来源：
 
@@ -38,15 +40,19 @@ data/
 
 所有会话和文件操作都检查所属 Workspace ID，跨 Workspace 读取会话、写消息或获取文件会失败。这是单用户应用的数据归属检查；同一操作系统用户仍可直接访问磁盘文件。
 
-### 工作笔记
+## 跨会话记忆
 
-每个 Workspace 根目录下的 `agent.md` 是该工作区所有会话共享的 UTF-8 Markdown。新建工作区时生成空模板，已有工作区首次读取时补建。每轮提问会读取磁盘上的最新正文。研究取得实质进展或用户指定下一步时，Agent 可用 `edit_file` 更新对应事项。
+| 想保留什么 | 保存位置（相对数据目录） | 例子 |
+| --- | --- | --- |
+| 下一次打开这个项目要接着做的事 | `workspaces/<workspace_id>/agent.md` | 年报金额已核对，下一步查季报中的回款时点。 |
+| 这个项目会反复引用的判断与依据 | `workspaces/<workspace_id>/memory/` | 记录对经营现金流变化的解释，并附底稿路径和报告期。 |
+| 用户明确要求所有项目沿用的偏好 | `user/memory/` | “以后比较财报时，表头都写明金额单位。” |
 
-点击「研究档案」旁的「记忆」查看工作笔记。用本地编辑器保存修改后，点击「刷新工作笔记」或重新打开面板即可查看完整正文。关闭面板可继续当前对话和草稿。
+每轮提问时，Agent 从磁盘读取工作笔记和两个记忆目录的 `memory.md` 索引。研究有实质进展时，Agent 用 `edit_file` 更新笔记。用户也可以直接编辑 Markdown，或在工作台「记忆」面板查看工作笔记、项目记忆和全局记忆。自定义全局目录见[服务配置](backend-api.md#服务配置)。
 
-### 长期记忆预览
+每个长期主题是一份 Markdown 文件，文件头包含 `name`、`description`、`type`。索引每行用相对链接指向一个主题。Agent 用 `search_memory` 在选定作用域的完整索引中查找关键词，再用 `read_memory` 读取正文。当模型输入中的索引被截短时，这条路径仍可查到其余条目。
 
-打开「记忆 → 长期记忆」，在「当前工作区」和「我的全局记忆」间切换。面板按所选目录的 `memory.md` 列出主题。点击标题会从磁盘读取该主题，展示文件名、正文及其中记录的依据。用编辑器保存后，收起再展开可查看最新正文。若索引引用的文件缺失，面板会显示文件名，补回文件后可点击「重新读取」。
+`write_memory` 创建主题时一并登记索引。修订正文或调用 `forget_memory` 删除主题前，Agent 先读回文件，提交读到的完整原文供保存时比对。如果另一个会话或用户已修改文件，需要重新读取。忘记操作会移除指定作用域的主题及索引条目。[记忆工具](../src/corpcom/workspace_tools.py)
 
 ## 会话与运行
 

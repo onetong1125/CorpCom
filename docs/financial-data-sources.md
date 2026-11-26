@@ -4,13 +4,9 @@
 
 ## 接口取舍
 
-| 接口 | 文档或源码能确认的结构 | 对三个目标金额的适用性 | 日期限制 |
-| --- | --- | --- | --- |
-| [`stock_financial_abstract_new_ths`](https://akshare.akfamily.xyz/data/stock/stock.html#id226) | 同花顺新接口，已替换旧的 `stock_financial_abstract_ths`；按报告期返回 `report_date`、`metric_name`、`value`、`single`、`yoy` 等长表列。源码把上游 `date` 写入 `report_date`，逐个展开 `index_list`。见 [AKShare 源码](https://github.com/akfamily/akshare/blob/main/akshare/stock_fundamental/stock_finance_ths.py#L194-L280)。 | 文档只列通用字段，**没有保证具体指标齐全**。本批探针已见 `operating_income_total`（营业总收入）及每股经营现金流；二者不能分别冒充营业收入和经营现金流量净额。归母净利润与其他指标须按实际 `metric_name` 核实。 | 无公告／首次披露日期。`report_date` 是财务报告期末。 |
-| [`stock_financial_abstract`](https://akshare.akfamily.xyz/data/stock/stock.html#id225) | 新浪关键指标宽表：`选项`、`指标`、各报告期列。文档样例有“归母净利润”“营业总收入”；[源码](https://github.com/akfamily/akshare/blob/main/akshare/stock_fundamental/stock_finance_sina.py#L94-L180)从 `report_list` 拼接 `item_title` 和 `item_value`，不保留公告日期。 | 可作辅助交叉检查，但不能仅凭文档样例断言有“营业收入”或经营现金流净额。源码请求参数 `paperCode=f"sh{symbol}"`，用于五粮液时需实测，不能假设深市代码已正确适配。 | 报告期是列名；无公告／首次披露日期。 |
-| [`stock_financial_report_sina`](https://akshare.akfamily.xyz/data/stock/stock.html#id205) | 新浪三大报表；`stock="sh600519"` 或 `"sz000858"`，`symbol="利润表"`／`"现金流量表"`。文档列 `报告日`、报表项目、`类型`、`更新日期`；[源码](https://github.com/akfamily/akshare/blob/main/akshare/stock_fundamental/stock_finance_sina.py#L22-L91)另将上游 `publish_date`、`update_time`、`rCurrency`、`rType` 写成 `公告日期`、`更新日期`、`币种`、`类型`。 | 本批数据探针的优先来源：利润表取精确营业收入、归母净利润；现金流量表取经营活动产生的现金流量净额。必须用原始年报核对字段名称、数值及合并口径。 | `公告日期`是**上游当前记录的字段值**，尚未证明是首次公开日期。主探针在茅台 2024 年行观察到 `公告日期=20260417`、`更新日期=2025-04-02`，存在明显不适合直接作为首次可见日的冲突；保留原值及来源，历史回放另取首次披露公告证据。 |
+`get_annual_financials` 使用 AKShare 的 `stock_financial_report_sina`。股票参数带交易所前缀，例如 `sh600519`、`sz000858`。按报告日选出年末合并报表，核对币种后，从利润表取“营业收入”和“归属于母公司所有者的净利润”，从现金流量表取“经营活动产生的现金流量净额”。[函数实现](../src/corpcom/fundamentals.py) · [新浪报表接口](https://akshare.akfamily.xyz/data/stock/stock.html#id205)
 
-以上“本批探针观察”来自项目本批实际运行。AKShare 文档明确记录新版同花顺接口替换旧版；不要沿用旧版的宽表列名或字段映射。在线文档和 main 分支源码会变化，复跑时应同时记录本机版本。[官方文档](https://akshare.akfamily.xyz/data/stock/stock.html#id226)
+核查中也读取了同花顺和新浪的财务摘要。其中的“营业总收入”包含目标字段之外的收入，每股现金流也与现金流净额口径不同。下表用年报中的合并金额直接对账。
 
 ## 原始年报对账基准
 
@@ -29,8 +25,5 @@
 
 ## 口径与历史回放限制
 
-1. **单位和字段**：年报表内金额为人民币**元**，同比列为**百分数**；AKShare 同花顺长表文档仅写 `value`／`yoy` 等类型，没有给具体指标的单位或 `yoy` 缩放定义。实际接口金额和同比须与上表逐项比较，再确定换算规则。新浪三表需核对返回的 `币种`、`类型` 及合并报表行，不能把母公司口径、营业总收入、每股现金流混入目标字段。[同花顺文档](https://akshare.akfamily.xyz/data/stock/stock.html#id226)、[新浪三表源码](https://github.com/akfamily/akshare/blob/main/akshare/stock_fundamental/stock_finance_sina.py#L22-L91)
-2. **累计和同比**：年报的 2024 数是全年 1—12 月，2023 是全年比较数；季度／半年／三季度财务报表的利润、现金流通常为年初至报告期末累计，单季值须由同年相邻累计值相减后另行标识。2024 年同比应与 **2023 年同口径期间**比较；负基数、零基数和上游重述需单独说明。不要把同花顺 `single`、`yoy` 当作已定义好的百分数或金额。[贵州茅台年报，第 5—6 页](https://www.moutai.com.cn/mtgf/articleFileDir/2025-04/08/8055b7bed7db41bdbc617f4c9b9ec591.pdf)、[五粮液年报，第 7—8 页](https://disc.static.szse.cn/disc/disk03/finalpage/2025-04-26/e366c663-84d0-4700-a59a-00a7d6412d48.PDF)
-3. **可见时间**：`报告日=20241231` 只标识会计期间结束；不能让历史回放在 2024-12-31 看见 2024 年报。新浪三表的 `公告日期` 来自可更新的上游记录，当前观察值甚至晚于 `更新日期`，不能无证据地当作首次披露日。回放在补齐公司／交易所原公告的披露时间及版本之前，只能做事后分析，不应声明为当时可用的无未来信息回测。[新浪三表源码](https://github.com/akfamily/akshare/blob/main/akshare/stock_fundamental/stock_finance_sina.py#L22-L91)、[贵州茅台财务报告列表](https://www.moutai.com.cn/mtgf/tzzgx/cwbg/index.html)
-
-验收时逐公司逐期记录：AKShare 版本、接口与请求参数、原始列名、报告日、报表类型／币种、三个金额原值及单位、同比原值及缩放、`公告日期`／`更新日期`原值、年报对账差额；保留不一致，不以自动替换或猜测字段补齐。
+- **同期与单位**　表中两列金额均为全年累计人民币元。同比按 `(本期 / 上年同期 - 1) × 100%` 计算，本样本的上年基数均为正。
+- **历史可见性**　报告日标识会计期间结束。2026-10-06 的探针在茅台 2024 年报行读到上游公告日期 `20260417`、更新日期 `2025-04-02`。函数保留上游原值，返回 `first_publication_verified=false`。要还原历史时点可见的数据，还需要原始公告的披露时间和当时的报表版本。

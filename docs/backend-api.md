@@ -10,7 +10,9 @@
 
 Vite 开发服务代理 `/api`。浏览器直接跨域访问后端时，默认允许 `http://localhost:5173` 和 `http://127.0.0.1:5173`，其他来源通过逗号分隔的 `CORPCOM_CORS_ORIGINS` 配置。
 
-可选环境变量 `CORPCOM_MODEL_INPUT_TOKEN_BUDGET` 接受正整数，表示为回答预留空间后，每次请求可用的估算输入 token 上限。系统提示词、工具声明和对话消息都计入估算。省略此变量时保留完整输入。设置额度后，超限请求先移除旧轮，再按需缩短成功工具结果。仍超限时，工作笔记可缩为前段摘录，并提示从 `agent.md` 读取全文。必需输入仍超限时，本轮报错。
+每轮研究根据最新档案、工作笔记、两级记忆索引及其他会话索引渲染系统提示词。角色默认值和提示词正文分别位于 [prompts.yaml](../src/corpcom/template/prompts.yaml) 和 [system.md.j2](../src/corpcom/template/system.md.j2)。
+
+可选变量 `CORPCOM_MODEL_INPUT_TOKEN_BUDGET` 接受正整数。应按模型上下文窗口扣除回答所需空间后设置。系统提示词、工具声明和对话消息一起估算 token 数。未设置时使用完整输入。超出预算时依次移除最早的完整对话轮次、按整行缩短两级记忆索引、截短本轮成功工具的文本结果，最后截短工作笔记。仍然超限则本轮报错。裁剪只作用于本次模型请求，磁盘文件和 checkpoint 保留原文。[输入压缩逻辑](../src/corpcom/workspace_agent.py)
 
 `CORPCOM_USER_MEMORY_DIR` 设置用户级长期记忆的目录，默认是数据目录下的 `user/memory/`。相对路径以数据目录为基准，也支持绝对路径和 `~`。服务启动时解析配置，修改后需重启。该目录与 `workspaces/` 必须相互独立，重叠时服务启动报错。
 
@@ -40,7 +42,7 @@ Vite 开发服务代理 `/api`。浏览器直接跨域访问后端时，默认�
 | GET | `/api/workspaces/{wid}/files/{aid}` | 返回 `Artifact` 文件元信息 |
 | GET | `/api/workspaces/{wid}/files/{aid}/content` | 下载已保存文件的内容 |
 
-消息接口接收本轮用户文本。当前 thread 尚无 checkpoint 时，后端从业务库导入完整问答历史；已有 checkpoint 时，由框架恢复历史，仅输入本轮用户消息。模型生成回答后，协调器在同一业务库事务中保存最终回答和 succeeded 状态。前端无需传入历史、角色或模型配置。`/messages` 保留一次返回完整回答的用法，页面使用 `/messages/stream` 接收流式事件。完整的中间助手消息（包括工具声明）也会保存，最终回答与成功状态原子提交。
+消息接口接收本轮用户文本。当前 thread 尚无 checkpoint 时，后端从业务库导入完整问答历史；已有 checkpoint 时，由框架恢复历史，仅输入本轮用户消息。模型生成回答后，协调器在同一业务库事务中保存最终回答和 succeeded 状态。前端无需传入历史、角色或模型配置。`/messages` 保留一次返回完整回答的用法，页面使用 `/messages/stream` 接收流式事件。完整的中间助手消息（包括工具调用声明）也会保存。
 
 协调器在同一业务库写事务中取得 Thread 执行资格并保留更新前的状态。仅旧状态为 `interrupted` 时，才检查 checkpoint 末尾的工具调用，为缺失结果补入 `status="error"` 的 ToolMessage，说明后端中断、实际执行结果未知。写回时将 live state 中的原始消息（包括 pending writes 中已有的工具结果）沿用消息 ID 一并保存，再加入缺失结果，避免只保存补充消息而丢失已完成结果。恢复独立保存 checkpoint 后，再调用 `ask_workspace` 保存新问题并执行研究，不自动重放旧工具。`failed` 等其他状态不进入恢复，不修补更早的异常历史。恢复本身失败时记录 failed、释放额度，且不进入 Agent 执行。
 
@@ -119,7 +121,7 @@ curl -X POST "http://127.0.0.1:8001/api/workspaces/$workspace_id/files" \
   -F 'file=@docs/research-workspace.md' -F 'kind=plan'
 ```
 
-上传后生成独立副本；同名文件再次上传得到新的文件 ID。接口接收文件内容，文件名必须是普通文件名，不能包含目录。文件响应不返回服务器绝对路径，通过 `/content` 下载。文件内容可以是二进制；Agent 的 `read_file` 工具已暂时停用，工作区文件通过 `execute_bash` 按路径读取，上传与下载接口不受影响。
+上传后生成独立副本；同名文件再次上传得到新的文件 ID。接口接收文件内容，文件名必须是普通文件名，不能包含目录。文件响应不返回服务器绝对路径，通过 `/content` 下载。支持二进制上传和下载。Agent 可通过 `execute_bash` 按工作区路径读取文件。
 
 ## 错误与执行行为
 
