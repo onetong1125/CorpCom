@@ -13,7 +13,7 @@ def build_workspace_prompt(
   """Build a workspace prompt."""
   config_path = Path(__file__).parent / "template" / "prompts.yaml"
   config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-  env = Environment(loader=PackageLoader("corpcom", "template"))
+  env = Environment(loader=PackageLoader("corpcom.agent", "template"))
   return env.get_template("system.md.j2").render(
       initialize_research=initialize_research,
       function_summaries_json=json.dumps(list_function_summaries(), ensure_ascii=False),

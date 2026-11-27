@@ -7,9 +7,9 @@ from threading import BoundedSemaphore
 
 from corpcom.workspace import WorkspaceStore
 from corpcom.workspace_models import Message
-from corpcom.workspace_agent import ask_workspace
-from corpcom.workspace_recovery import recover_interrupted_checkpoint
-from corpcom.run_events import RunEventRecorder, RunEventStream
+from corpcom.agent.runtime import ask_workspace
+from corpcom.runs.recovery import recover_interrupted_checkpoint
+from corpcom.runs.events import RunEventRecorder, RunEventStream
 from corpcom.event_types import StartedEvent, RunFailedEvent, RunSucceededEvent, RunEventSink
 
 

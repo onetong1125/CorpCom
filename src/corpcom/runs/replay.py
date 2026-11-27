@@ -5,7 +5,7 @@ from pathlib import Path
 from anyio import to_thread
 from redis import Redis
 
-from corpcom.run_events import RunEventStream
+from corpcom.runs.events import RunEventStream
 from corpcom.event_types import RunFinishedEvent
 from corpcom.workspace import WorkspaceStore
 from corpcom.workspace_models import ResearchRun

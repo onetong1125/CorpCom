@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
-from typing import Annotated, Literal
+from typing import Annotated
 from contextlib import asynccontextmanager
 from anyio import create_task_group
 from redis import Redis
@@ -25,15 +25,16 @@ from langchain_openai import ChatOpenAI
 from openai import APIError
 from pydantic import BaseModel, ConfigDict, Field
 
-from corpcom.run_replay import replay_events
-from corpcom.run_history import read_run_history, read_thread_history
+from corpcom.memory import MemoryScope
+from corpcom.runs.replay import replay_events
+from corpcom.runs.history import read_run_history, read_thread_history
 from corpcom.workspace import RecordNotFoundError, WorkspaceStore, ThreadBusyError
 from corpcom.workspace_models import (
     Artifact, Message, Thread, ThreadDetail, Workspace, WorkspaceDetail,
     WorkspaceResearchInfo, WorkspaceSummary, ResearchRunSummary,
 )
-from corpcom.run_coordinator import RunCoordinator, ExecutionCapacityError
-from corpcom.workspace_stream import research_events
+from corpcom.runs.coordinator import RunCoordinator, ExecutionCapacityError
+from corpcom.runs.stream import research_events
 
 logger = logging.getLogger(__name__)
 RequiredText = Annotated[str, Field(min_length=1, pattern=r"\S")]
@@ -162,7 +163,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             return store.read_working_note(workspace_id)
 
     @app.get("/api/workspaces/{workspace_id}/memory/index", response_class=PlainTextResponse)
-    def show_memory_index(workspace_id: str, scope: Literal["user", "workspace"]) -> str:
+    def show_memory_index(workspace_id: str, scope: MemoryScope) -> str:
         with WorkspaceStore(root) as store:
             return store.read_memory_index(workspace_id, scope, app.state.user_memory_dir)
 
@@ -170,7 +171,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     def show_memory_topic(
         workspace_id: str,
         key: Annotated[str, PathParam(pattern=r"^[^/\x00]+\.md$")],
-        scope: Literal["user", "workspace"],
+        scope: MemoryScope,
     ) -> str:
         with WorkspaceStore(root) as store:
             return store.read_memory_topic(workspace_id, scope, app.state.user_memory_dir, key)

@@ -52,7 +52,7 @@ data/
 
 每个长期主题是一份 Markdown 文件，文件头包含 `name`、`description`、`type`。索引每行用相对链接指向一个主题。Agent 用 `search_memory` 在选定作用域的完整索引中查找关键词，再用 `read_memory` 读取正文。当模型输入中的索引被截短时，这条路径仍可查到其余条目。
 
-`write_memory` 创建主题时一并登记索引。修订正文或调用 `forget_memory` 删除主题前，Agent 先读回文件，提交读到的完整原文供保存时比对。如果另一个会话或用户已修改文件，需要重新读取。忘记操作会移除指定作用域的主题及索引条目。[记忆工具](../src/corpcom/workspace_tools.py)
+`write_memory` 创建主题时一并登记索引。修订正文或调用 `forget_memory` 删除主题前，Agent 先读回文件，提交读到的完整原文供保存时比对。如果另一个会话或用户已修改文件，需要重新读取。忘记操作会移除指定作用域的主题及索引条目。[记忆工具](../src/corpcom/agent/memory_tools.py)
 
 ## 会话与运行
 

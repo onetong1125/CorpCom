@@ -9,7 +9,7 @@ from anyio.abc import TaskGroup
 from langchain_core.language_models import BaseChatModel
 
 from corpcom.event_types import RunEventSink
-from corpcom.run_coordinator import RunCoordinator, ExecutionCapacityError
+from corpcom.runs.coordinator import RunCoordinator, ExecutionCapacityError
 from corpcom.workspace import WorkspaceStore, RecordNotFoundError, \
   ThreadBusyError
 from corpcom.workspace_models import Message

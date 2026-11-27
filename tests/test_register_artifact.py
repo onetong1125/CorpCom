@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from corpcom.api import create_app
 from corpcom.workspace import WorkspaceStore
-from corpcom.workspace_tools import create_workspace_tools
+from corpcom.agent.tools import create_workspace_tools
 
 
 class RegisterArtifactTests(unittest.TestCase):

@@ -7,7 +7,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from corpcom.workspace import WorkspaceStore
-from corpcom.workspace_agent import create_workspace_agent
+from corpcom.agent.runtime import create_workspace_agent
 
 
 def recover_interrupted_checkpoint(

@@ -10,7 +10,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.message import add_messages
 from redis import Redis
 
-from corpcom.run_events import RunEventStream
+from corpcom.runs.events import RunEventStream
 from corpcom.workspace import WorkspaceStore
 from corpcom.event_types import CheckpointEvent
 

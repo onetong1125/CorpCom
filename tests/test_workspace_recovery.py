@@ -13,9 +13,9 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from corpcom.run_coordinator import RunCoordinator
+from corpcom.runs.coordinator import RunCoordinator
 from corpcom.workspace import WorkspaceStore
-from corpcom.workspace_agent import ask_workspace
+from corpcom.agent.runtime import ask_workspace
 
 
 class ProtocolCheckingModel(FakeMessagesListChatModel):
@@ -56,7 +56,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
             with (
                 WorkspaceStore(root) as store,
                 SqliteSaver.from_conn_string(checkpoint_path) as saver,
-                patch("corpcom.workspace_agent.create_workspace_tools", return_value=[action]),
+                patch("corpcom.agent.runtime.create_workspace_tools", return_value=[action]),
             ):
                 workspace = store.create_workspace("全部结果待提交", goal="保存 pending writes")
                 thread = store.create_thread(workspace.id, "C")
@@ -94,7 +94,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                     AIMessage(content="恢复正常"), AIMessage(content="续聊正常"),
                 ])
                 coordinator = RunCoordinator(saver, Mock(spec=Redis), max_concurrent_runs=2)
-                with patch("corpcom.run_coordinator.ask_workspace", side_effect=check_before_ask):
+                with patch("corpcom.runs.coordinator.ask_workspace", side_effect=check_before_ask):
                     coordinator.run(store, recovery, workspace.id, thread.id, "直接回复")
                 coordinator.run(store, recovery, workspace.id, thread.id, "下一轮也不调用工具")
                 saved = saver.get_tuple(config).checkpoint["channel_values"]["messages"]
@@ -120,7 +120,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
             with (
                 WorkspaceStore(root) as store,
                 SqliteSaver.from_conn_string(str(root / "checkpoints.sqlite")) as saver,
-                patch("corpcom.workspace_agent.create_workspace_tools", return_value=tools),
+                patch("corpcom.agent.runtime.create_workspace_tools", return_value=tools),
             ):
                 workspace = store.create_workspace("部分结果恢复", goal="保留已有工具结果")
                 thread = store.create_thread(workspace.id, "C")
@@ -156,7 +156,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                     return ask_workspace(*args, **kwargs)
 
                 coordinator = RunCoordinator(saver, Mock(spec=Redis), max_concurrent_runs=2)
-                with patch("corpcom.run_coordinator.ask_workspace", side_effect=check_before_ask):
+                with patch("corpcom.runs.coordinator.ask_workspace", side_effect=check_before_ask):
                     coordinator.run(store, recovery, workspace.id, thread.id, "不再调用工具")
                 saved = saver.get_tuple(config).checkpoint["channel_values"]["messages"]
                 results = [m for m in saved if m.type == "tool"]
@@ -192,7 +192,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
             with (
                 WorkspaceStore(root) as store,
                 SqliteSaver.from_conn_string(checkpoint_path) as saver,
-                patch("corpcom.workspace_agent.create_workspace_tools", return_value=tools),
+                patch("corpcom.agent.runtime.create_workspace_tools", return_value=tools),
             ):
                 workspace = store.create_workspace("恢复验收", goal="验证中断恢复")
                 thread = store.create_thread(workspace.id, "C")
@@ -206,7 +206,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
             with (
                 WorkspaceStore(root) as store,
                 SqliteSaver.from_conn_string(checkpoint_path) as saver,
-                patch("corpcom.workspace_agent.create_workspace_tools", return_value=tools),
+                patch("corpcom.agent.runtime.create_workspace_tools", return_value=tools),
             ):
                 store.interrupt_running_executions()
                 recovery = ProtocolCheckingModel(responses=[AIMessage(content="恢复正常")])
@@ -226,7 +226,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                     return ask_workspace(*args, **kwargs)
 
                 coordinator = RunCoordinator(saver, Mock(spec=Redis), max_concurrent_runs=2)
-                with patch("corpcom.run_coordinator.ask_workspace", side_effect=check_before_ask):
+                with patch("corpcom.runs.coordinator.ask_workspace", side_effect=check_before_ask):
                     answer = coordinator.run(store, recovery, workspace.id, thread.id, "直接回复恢复正常")
                 self.assertEqual(answer.content, "恢复正常")
                 self.assertEqual(effects, ["performed"])
@@ -236,7 +236,7 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                 self.assertEqual([m.content for m in detail.messages if m.role == "assistant"],
                                  ["已有回答", "", "恢复正常"])
 
-                with patch("corpcom.run_coordinator.recover_interrupted_checkpoint") as recover:
+                with patch("corpcom.runs.coordinator.recover_interrupted_checkpoint") as recover:
                     coordinator.run(store, recovery, workspace.id, thread.id, "再确认一次")
                     recover.assert_not_called()
                 saved = saver.get_tuple(config).checkpoint["channel_values"]["messages"]
@@ -264,8 +264,8 @@ class WorkspaceRecoveryTests(unittest.TestCase):
             with (
                 WorkspaceStore(root) as store,
                 SqliteSaver.from_conn_string(str(root / "checkpoints.sqlite")) as saver,
-                patch("corpcom.workspace_agent.create_workspace_tools", return_value=[broken_action]),
-                patch("corpcom.run_coordinator.recover_interrupted_checkpoint") as recover,
+                patch("corpcom.agent.runtime.create_workspace_tools", return_value=[broken_action]),
+                patch("corpcom.runs.coordinator.recover_interrupted_checkpoint") as recover,
             ):
                 workspace = store.create_workspace("异常不可掩盖", goal="验证工具错误")
                 thread = store.create_thread(workspace.id, "C")
@@ -321,9 +321,9 @@ class WorkspaceRecoveryTests(unittest.TestCase):
                 coordinator = RunCoordinator(saver, Mock(spec=Redis), max_concurrent_runs=1)
                 model = ProtocolCheckingModel(responses=[AIMessage(content="正常回答")])
                 with (
-                    patch("corpcom.run_coordinator.recover_interrupted_checkpoint",
+                    patch("corpcom.runs.coordinator.recover_interrupted_checkpoint",
                           side_effect=OSError("checkpoint unavailable")),
-                    patch("corpcom.run_coordinator.ask_workspace") as ask,
+                    patch("corpcom.runs.coordinator.ask_workspace") as ask,
                 ):
                     with self.assertRaisesRegex(OSError, "checkpoint unavailable"):
                         coordinator.run(store, model, workspace.id, thread.id, "恢复")

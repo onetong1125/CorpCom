@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 
 from corpcom.workspace import WorkspaceStore
 from corpcom.function_catalog import FUNCTIONS, list_function_summaries
-from corpcom.workspace_tools import create_workspace_tools
+from corpcom.agent.tools import create_workspace_tools
 
 
 def sample_function(symbol: str) -> dict:
@@ -84,7 +84,7 @@ class WorkspaceToolTests(unittest.TestCase):
 
     execution = {"exit_code": 7, "stdout": "output", "stderr": "failure"}
     with patch(
-        "corpcom.workspace_tools.run_bash", return_value=execution,
+        "corpcom.agent.sandbox_tools.run_bash", return_value=execution,
     ) as run_bash:
       result = bash.invoke({"command": "exit 7"})
       run_bash.assert_called_once_with(
@@ -126,7 +126,7 @@ class WorkspaceToolTests(unittest.TestCase):
       },
     }
     with patch(
-        "corpcom.workspace_tools.run_python", return_value=execution,
+        "corpcom.agent.sandbox_tools.run_python", return_value=execution,
     ) as run_python:
       result = tools["execute_python"].invoke({
         "code": "# test",
@@ -206,7 +206,7 @@ class WorkspaceToolTests(unittest.TestCase):
       },
     }
     with patch(
-        "corpcom.workspace_tools.run_python", return_value=execution,
+        "corpcom.agent.sandbox_tools.run_python", return_value=execution,
     ):
       with self.assertRaisesRegex(
           ValueError, "output path must stay within",
