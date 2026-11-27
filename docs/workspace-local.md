@@ -50,7 +50,9 @@ data/
 
 每轮提问时，Agent 从磁盘读取工作笔记和两个记忆目录的 `memory.md` 索引。研究有实质进展时，Agent 用 `edit_file` 更新笔记。用户也可以直接编辑 Markdown，或在工作台「记忆」面板查看工作笔记、项目记忆和全局记忆。自定义全局目录见[服务配置](backend-api.md#服务配置)。
 
-每个长期主题是一份 Markdown 文件，文件头包含 `name`、`description`、`type`。索引每行用相对链接指向一个主题。Agent 用 `search_memory` 在选定作用域的完整索引中查找关键词，再用 `read_memory` 读取正文。当模型输入中的索引被截短时，这条路径仍可查到其余条目。
+记忆工具的 `scope` 决定读写哪个目录，`workspace` 指当前工作区，`user` 指跨工作区共享的用户目录。创建主题时，`write_memory` 还接收 `memory_type`，可取 `user`、`feedback`、`project`、`reference`，与 `name`、`description` 一起保存到 Markdown 文件头，其中分类字段名为 `type`。例如，上表中跨项目沿用的报表格式偏好可以用 `scope="user"`、`memory_type="feedback"` 保存。[记忆类型与文件存储](../src/corpcom/memory.py)
+
+索引每行用相对链接指向一个主题。Agent 用 `search_memory` 在选定作用域的完整索引中查找关键词，再用 `read_memory` 读取正文。当模型输入中的索引被截短时，这条路径仍可查到其余条目。
 
 `write_memory` 创建主题时一并登记索引。修订正文或调用 `forget_memory` 删除主题前，Agent 先读回文件，提交读到的完整原文供保存时比对。如果另一个会话或用户已修改文件，需要重新读取。忘记操作会移除指定作用域的主题及索引条目。[记忆工具](../src/corpcom/agent/memory_tools.py)
 

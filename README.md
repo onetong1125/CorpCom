@@ -59,7 +59,10 @@ FastAPI 后端默认将业务数据、Agent checkpoint 和研究文件保存在�
 
 | 路径 | 内容 |
 | --- | --- |
-| [src/corpcom/](src/corpcom/) | FastAPI 后端、Agent、数据函数和沙箱工具 |
+| [api.py](src/corpcom/api.py) | FastAPI 入口，接收工作区操作、研究提问与历史查询 |
+| [agent/](src/corpcom/agent/) | 组装研究 Agent，渲染提示词、控制输入预算、注册记忆与沙箱工具 |
+| [runs/](src/corpcom/runs/) | 管理每轮研究的执行、事件记录、断线回放和历史读取 |
+| [workspace.py](src/corpcom/workspace.py) · [memory.py](src/corpcom/memory.py) | 前者管理工作区、会话和运行记录，后者读写长期记忆的 Markdown 主题与索引 |
 | [frontend/](frontend/) | Vue 3 工作台、Vite 开发服务和前端测试 |
 | [examples/](examples/) | 可单独运行的取数脚本和沙箱验证示例 |
 | [tests/](tests/) | 后端接口、研究历史、记忆与数据函数测试 |

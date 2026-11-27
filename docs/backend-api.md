@@ -66,7 +66,7 @@ SSE 的 `data` 是带 `type` 的 JSON。`id:` 是 Redis Stream ID，客户端成
 
 `tool_run_id` 是工具回调执行 ID，`tool_call_id` 是模型声明的调用 ID，两者不可互换。终态事件不写入 Redis 过程事件列表，也没有 Redis ID；重连通过运行记录重建终态。
 
-断连且已取得 `run_id` 后，使用 GET `/runs/{rid}/events?after=<最后成功应用的ID>`。`after` 默认为 `0-0`，读取严格晚于游标的事件；每批最多 100 条，运行中有限阻塞等待，结束后排空剩余事件再发送 `run_finished`。该 GET 不创建新问题、不重新执行工具。尚未收到 `started` 时前端无法用 Run ID 重连，会查询已有消息与状态，不自动重发 POST。重连接口只读 Redis，不以 SQLite 归档替代游标流。
+断连且已取得 `run_id` 后，使用 GET `/runs/{rid}/events?after=<最后成功应用的ID>`。`after` 默认为 `0-0`，读取严格晚于游标的事件；每批最多 100 条，运行中有限阻塞等待，结束后排空剩余事件再发送 `run_finished`。该 GET 不创建新问题、不重新执行工具。尚未收到 `started` 时前端无法用 Run ID 重连，会查询已有消息与状态，不自动重发 POST。每批回放先从 SQLite 读取本轮状态，再按游标从 Redis 读取过程事件。终态和错误信息取自 SQLite 的运行记录。[回放实现](../src/corpcom/runs/replay.py)
 
 整页刷新或切换会话时，前端先读取 Run 列表：运行中的 Run 走 Redis SSE，已结束的 Run 走 `/history`。Run 的 `run_index` 在 Thread 内从 0 分配；`user_message_id` 关联本轮问题。历史快照使用下列来源：
 
